@@ -6,20 +6,28 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"rocketTelemetrySim/simulator"
 )
 
 func main() {
+	// Запуск сервера метрик на порту 8086
 	http.Handle("/actuator/prometheus", promhttp.Handler())
+	go startMetricsServer()
 
-	go func() {
-		log.Println("Metrics server listening at 0.0.0.0:8086 v1.6.2")
-		ln, err := net.Listen("tcp", "0.0.0.0:8086")
-		if err != nil {
-			log.Fatal(err)
-		}
-		http.Serve(ln, nil)
-	}()
+	// Запуск REST API сервера на порту 8087
+	go startRESTServer()
 
-	simulator.RunSimulation()
+	// Запуск цикла симуляции, который ждёт команды старта
+	go simulationLoop()
+
+	// Блокировка main(), чтобы приложение не завершилось
+	select {}
+}
+
+func startMetricsServer() {
+	log.Println("Metrics server listening at 0.0.0.0:8086 v1.7")
+	ln, err := net.Listen("tcp", "0.0.0.0:8086")
+	if err != nil {
+		log.Fatal(err)
+	}
+	http.Serve(ln, nil)
 }

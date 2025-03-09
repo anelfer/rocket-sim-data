@@ -2,94 +2,145 @@ package simulator
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
-	"rocketTelemetrySim/metrics"
+	"sync"
 	"time"
+
+	"rocketTelemetrySim/metrics"
 )
 
-var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+var CurrentSimulation *Simulation
 
-func RunSimulation() {
-	dryMass := 250000.0
-	totalMass := 549054.0
-	fuelMass := totalMass - dryMass
-	fuelBurnRate := 400.0
-	velocity := 0.0
-	altitude := 0.0
-	gravity := 9.81
-	area := math.Pi * math.Pow(1.83, 2)
-	dragCoefficient := 0.5
-	airDensitySeaLevel := 1.225
+func SetCurrentSimulation(sim *Simulation) {
+	CurrentSimulation = sim
+}
 
-	engines := initEngines(9, 900000, 1.83)
+type Simulation struct {
+	Engines            []Engine
+	DryMass            float64
+	TotalMass          float64
+	FuelMass           float64
+	FuelBurnRate       float64
+	Velocity           float64
+	Altitude           float64
+	Gravity            float64
+	Area               float64
+	DragCoefficient    float64
+	AirDensitySeaLevel float64
 
-	lowFuelThreshold := fuelMass * 0.1
+	rng *rand.Rand
+	mu  sync.RWMutex
+}
 
-	for altitude >= 0 {
-		if fuelMass <= 0 {
-			fuelMass = 0
-			for i := range engines {
-				if engines[i].Running {
-					engines[i].Running = false
-					fmt.Printf("🚨 Двигатель %d отключён из-за отсутствия топлива на высоте %.2f м\n", i+1, altitude)
-					balanceEngines(engines, i)
+func NewSimulation() *Simulation {
+	s := &Simulation{
+		Engines:            initEngines(9, 900000, 1.83),
+		DryMass:            250000.0,
+		TotalMass:          549054.0,
+		FuelBurnRate:       400.0,
+		Velocity:           0.0,
+		Altitude:           0.0,
+		Gravity:            9.81,
+		DragCoefficient:    0.5,
+		AirDensitySeaLevel: 1.225,
+		rng:                rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	s.FuelMass = s.TotalMass - s.DryMass
+	s.Area = math.Pi * math.Pow(1.83, 2)
+	return s
+}
+
+func (s *Simulation) Reset() {
+	if CurrentSimulation == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Engines = initEngines(9, 900000, 1.83)
+	s.DryMass = 250000.0
+	s.TotalMass = 549054.0
+	s.FuelMass = s.TotalMass - s.DryMass
+	s.FuelBurnRate = 400.0
+	s.Velocity = 0.0
+	s.Altitude = 0.0
+	s.Gravity = 9.81
+	s.Area = math.Pi * math.Pow(1.83, 2)
+	s.DragCoefficient = 0.5
+	s.AirDensitySeaLevel = 1.225
+}
+
+// Run запускает цикл симуляции.
+func (s *Simulation) Run() {
+	s.mu.Lock()
+	lowFuelThreshold := s.FuelMass * 0.1
+	s.mu.Unlock()
+
+	for s.Altitude >= 0 {
+		s.mu.Lock()
+		// Если топлива нет, отключаем все двигатели
+		if s.FuelMass <= 0 {
+			s.FuelMass = 0
+			for i := range s.Engines {
+				if s.Engines[i].Running {
+					s.Engines[i].Running = false
+					log.Printf("🚨 Двигатель %d отключён из-за отсутствия топлива на высоте %.2f м\n", i+1, s.Altitude)
+					balanceEngines(s.Engines, i, s.rng)
 				}
 			}
 		}
 
-		// Если топлива осталось мало, симулируем проблемы с двигателями
-		if fuelMass > 0 && fuelMass < lowFuelThreshold {
-			for idx, engine := range engines {
+		// Если топлива мало, симулируем непредвиденные ситуации
+		if s.FuelMass > 0 && s.FuelMass < lowFuelThreshold {
+			for idx, engine := range s.Engines {
 				if engine.Running {
-					chance := rand.Float64()
-					if chance < 0.2 { // 20% вероятность полного отключения двигателя
-						engines[idx].Running = false
-						fmt.Printf("🚨 Двигатель %d вышел из строя из-за низкого топлива на высоте %.2f м\n", idx+1, altitude)
-						balanceEngines(engines, idx)
-					} else if chance < 0.3 { // Дополнительная 10% вероятность резкого увеличения тяги (сурж)
+					chance := s.rng.Float64()
+					if chance < 0.2 {
+						s.Engines[idx].Running = false
+						log.Printf("🚨 Двигатель %d вышел из строя из-за низкого топлива на высоте %.2f м\n", idx+1, s.Altitude)
+						balanceEngines(s.Engines, idx, s.rng)
+					} else if chance < 0.3 {
 						surgeFactor := 1.5
-						engines[idx].Thrust *= surgeFactor
-						fmt.Printf("⚡ Двигатель %d испытал резкий скачок тяги из-за низкого топлива на высоте %.2f м, новая тяга: %.2f\n", idx+1, altitude, engines[idx].Thrust)
-					} else if chance < 0.4 { // Дополнительная 10% вероятность резкого уменьшения тяги
+						s.Engines[idx].Thrust *= surgeFactor
+						log.Printf("⚡ Двигатель %d испытал резкий скачок тяги, новая тяга: %.2f\n", idx+1, s.Engines[idx].Thrust)
+					} else if chance < 0.4 {
 						reductionFactor := 0.5
-						engines[idx].Thrust *= reductionFactor
-						fmt.Printf("⚠️ Двигатель %d испытал резкое снижение тяги из-за низкого топлива на высоте %.2f м, новая тяга: %.2f\n", idx+1, altitude, engines[idx].Thrust)
+						s.Engines[idx].Thrust *= reductionFactor
+						log.Printf("⚠️ Двигатель %d испытал резкое снижение тяги, новая тяга: %.2f\n", idx+1, s.Engines[idx].Thrust)
 					}
 				}
 			}
 		}
 
-		// Вычисляем суммарную тягу от всех работающих двигателей
-		thrust := totalThrust(engines)
-		airDensity := airDensitySeaLevel * math.Exp(-altitude/8500)
-		drag := 0.5 * dragCoefficient * airDensity * velocity * velocity * area
+		// Вычисляем динамику ракеты
+		thrust := totalThrust(s.Engines)
+		airDensity := s.AirDensitySeaLevel * math.Exp(-s.Altitude/8500)
+		drag := 0.5 * s.DragCoefficient * airDensity * s.Velocity * s.Velocity * s.Area
+		currentMass := s.DryMass + s.FuelMass
+		acceleration := (thrust - currentMass*s.Gravity - drag) / currentMass
+		s.Velocity += acceleration
+		s.Altitude += s.Velocity
 
-		// Текущая масса ракеты = сухая масса + оставшееся топливо
-		currentMass := dryMass + fuelMass
-		acceleration := (thrust - currentMass*gravity - drag) / currentMass
-		velocity += acceleration
-		altitude += velocity
-
-		// Расход топлива происходит только если двигатель работает
-		running := runningEngines(engines)
-		fuelConsumed := fuelBurnRate * float64(running)
-		if fuelMass-fuelConsumed < 0 {
-			fuelConsumed = fuelMass
+		// Расход топлива
+		running := runningEngines(s.Engines)
+		fuelConsumed := s.FuelBurnRate * float64(running)
+		if s.FuelMass-fuelConsumed < 0 {
+			fuelConsumed = s.FuelMass
 		}
-		fuelMass -= fuelConsumed
+		s.FuelMass -= fuelConsumed
 
-		chanceAccident := rand.Float64()
-		if chanceAccident < 0.10 && runningEngines(engines) >= 7 {
-			randomIndex := rand.Intn(len(engines))
-			engines[randomIndex].Running = false
-			fmt.Printf("🚨 Двигатель %d отключён из-за неизвестной аварии на высоте %.2f м\n", randomIndex+1, altitude)
-			balanceEngines(engines, randomIndex)
+		// Случайные аварии
+		if s.rng.Float64() < 0.10 && runningEngines(s.Engines) >= 7 {
+			randomIndex := s.rng.Intn(len(s.Engines))
+			s.Engines[randomIndex].Running = false
+			log.Printf("🚨 Двигатель %d отключён из-за неизвестной аварии на высоте %.2f м\n", randomIndex+1, s.Altitude)
+			balanceEngines(s.Engines, randomIndex, s.rng)
 		}
 
-		metrics.SendBasicMetrics(altitude, velocity, acceleration, currentMass, drag, airDensity, running)
-
-		for idx, engine := range engines {
+		// Отправка метрик
+		metrics.SendBasicMetrics(s.Altitude, s.Velocity, acceleration, currentMass, drag, airDensity, running)
+		for idx, engine := range s.Engines {
 			engineID := fmt.Sprintf("%d", idx+1)
 			if engine.Running {
 				metrics.SetEngineThrust(engineID, engine.Thrust)
@@ -97,72 +148,8 @@ func RunSimulation() {
 				metrics.SetEngineThrust(engineID, 0)
 			}
 		}
+		s.mu.Unlock()
 
 		time.Sleep(1 * time.Second)
 	}
-}
-
-func balanceEngines(engines []Engine, failedIdx int) {
-	failedEngine := engines[failedIdx]
-
-	// Коэффициенты компенсации для утраченной тяги:
-	// Для противоположного двигателя – примерно 30% утраченной тяги (с небольшим случайным разбросом),
-	// для соседнего – около 15% утраченной тяги.
-	baseCompensationOpposite := 0.3
-	baseCompensationNeighbor := 0.15
-
-	for i := range engines {
-		// Рассматриваем только работающие двигатели, кроме отключённого
-		if engines[i].Running && i != failedIdx {
-			if isOpposite(engines[i], failedEngine) {
-				// Противоположный двигатель должен компенсировать потерю большей части тяги
-				// Случайное отклонение в диапазоне ±0.05
-				adjustmentFactor := baseCompensationOpposite + (rand.Float64()*0.1 - 0.05)
-				delta := failedEngine.Thrust * adjustmentFactor
-
-				// Проверка: новая тяга не должна превышать максимальную возможную для двигателя
-				if engines[i].Thrust+delta > engines[i].MaxThrust {
-					delta = engines[i].MaxThrust - engines[i].Thrust
-				}
-				engines[i].Thrust += delta
-				fmt.Printf("⚠️ Engine %d thrust increased by %.2f N (total: %.2f N) for balance\n", i+1, delta, engines[i].Thrust)
-			} else if isNeighbor(engines[i], failedEngine) {
-				// Соседний двигатель немного уменьшает тягу, чтобы избежать избыточного крутящего момента
-				adjustmentFactor := baseCompensationNeighbor + (rand.Float64()*0.05 - 0.025)
-				delta := failedEngine.Thrust * adjustmentFactor
-
-				// Проверка: новая тяга не должна опускаться ниже минимальной рабочей тяги
-				if engines[i].Thrust-delta < engines[i].MinThrust {
-					delta = engines[i].Thrust - engines[i].MinThrust
-				}
-				engines[i].Thrust -= delta
-				fmt.Printf("⚠️ Engine %d thrust decreased by %.2f N (total: %.2f N) for balance\n", i+1, delta, engines[i].Thrust)
-			}
-		}
-	}
-}
-
-func randomThrustAdjustment(min, max float64) float64 {
-	value := min + rng.Float64()*(max-min)
-	if rng.Intn(2) == 0 {
-		return -value
-	}
-	return value
-}
-
-// angleBetweenEngines возвращает угол в градусах между двумя двигателями
-func angleBetweenEngines(e1, e2 Engine) float64 {
-	return math.Atan2(e2.Y-e1.Y, e2.X-e1.X) * (180 / math.Pi)
-}
-
-// Определяет, является ли двигатель противоположным (угол близок к 180°)
-func isOpposite(e1, e2 Engine) bool {
-	angle := math.Abs(angleBetweenEngines(e1, e2))
-	return angle > 150 && angle <= 210
-}
-
-// Определяет, является ли двигатель соседним (угол малый, <90°)
-func isNeighbor(e1, e2 Engine) bool {
-	angle := math.Abs(angleBetweenEngines(e1, e2))
-	return angle <= 90
 }

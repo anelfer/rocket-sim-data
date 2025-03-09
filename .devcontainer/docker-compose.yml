@@ -8,6 +8,7 @@ services:
     container_name: go-app
     ports:
       - "8086:8086"
+      - "8087:8087"
     networks:
       - grafana_monitoring
 

@@ -48,6 +48,16 @@ func SendBasicMetrics(altitude, velocity, acceleration, mass, drag, airDensity f
 	engineStatusGauge.Set(float64(enginesRunning))
 
 	// Координаты места запуска (например, космодром Байконур)
+	lat, lon := GetLatLon(altitude, velocity)
+	alt := altitude // Altitude — текущая высота ракеты
+
+	// Отправляем новые метрики в Prometheus
+	rocketPositionLat.Set(lat)
+	rocketPositionLon.Set(lon)
+	rocketPositionAlt.Set(alt)
+}
+
+func GetLatLon(altitude float64, velocity float64) (float64, float64) {
 	baseLat, baseLon := 45.9647, 63.3050
 
 	h0 := 5000.0 // Высота начала поворота
@@ -72,12 +82,7 @@ func SendBasicMetrics(altitude, velocity, acceleration, mass, drag, airDensity f
 
 	lat := baseLat + (deltaLat * 180 / math.Pi) // Переводим в градусы
 	lon := baseLon + (deltaLon * 180 / math.Pi)
-	alt := altitude // Altitude — текущая высота ракеты
-
-	// Отправляем новые метрики в Prometheus
-	rocketPositionLat.Set(lat)
-	rocketPositionLon.Set(lon)
-	rocketPositionAlt.Set(alt)
+	return lat, lon
 }
 
 func SetEngineThrust(engineID string, thrust float64) {
