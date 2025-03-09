@@ -13,7 +13,7 @@ func main() {
 	http.Handle("/actuator/prometheus", promhttp.Handler())
 
 	go func() {
-		log.Println("Metrics server listening at 0.0.0.0:8086 v1.5.1")
+		log.Println("Metrics server listening at 0.0.0.0:8086 v1.6.2")
 		ln, err := net.Listen("tcp", "0.0.0.0:8086")
 		if err != nil {
 			log.Fatal(err)

@@ -50,29 +50,28 @@ func SendBasicMetrics(altitude, velocity, acceleration, mass, drag, airDensity f
 	// Координаты места запуска (например, космодром Байконур)
 	baseLat, baseLon := 45.9647, 63.3050
 
-	// Высота, на которой ракета начинает горизонтальный манёвр
-	turnStartAltitude := 5000.0
+	h0 := 5000.0 // Высота начала поворота
+	k := 2000.0  // Параметр плавности
 
-	// Горизонтальный угол направления полета ракеты
-	directionAngle := 45.0 // 0 - север, 90 - восток и т.д.
+	turnAngle := 90.0 / (1.0 + math.Exp(-(altitude-h0)/k)) // В градусах
 
-	// Считаем горизонтальное смещение
-	var horizontalDistance float64
+	R := 6371000.0         // Радиус Земли
+	directionAngle := 90.0 // Пусть по умолчанию ракета летит на восток
 
-	if altitude < turnStartAltitude {
-		// сначала почти строго вверх
-		horizontalDistance = altitude * 0.01
-	} else {
-		// затем увеличиваем горизонтальное движение
-		horizontalDistance = (altitude - turnStartAltitude) * 1.5
-	}
+	// Вычисляем горизонтальную скорость с учётом угла атаки
+	horizontalVelocity := velocity * math.Sin(turnAngle*math.Pi/180)
 
-	// Переводим horizontalDistance в реальные координаты lat/lon:
-	deltaLat := (horizontalDistance * math.Cos(directionAngle*math.Pi/180)) / 111000.0
-	deltaLon := (horizontalDistance * math.Sin(directionAngle*math.Pi/180)) / (111000.0 * math.Cos(baseLat*math.Pi/180))
+	earthRotationSpeed := 465 * math.Cos(baseLat*math.Pi/180) // Скорость вращения Земли в м/с
+	initialHorizontalSpeed := earthRotationSpeed
+	// Учитываем вращение Земли
+	horizontalVelocity += initialHorizontalSpeed
 
-	lat := baseLat + deltaLat
-	lon := baseLon + deltaLon
+	// Обновляем координаты
+	deltaLat := (horizontalVelocity * math.Cos(directionAngle*math.Pi/180)) / R
+	deltaLon := (horizontalVelocity * math.Sin(directionAngle*math.Pi/180)) / (R * math.Cos(baseLat*math.Pi/180))
+
+	lat := baseLat + (deltaLat * 180 / math.Pi) // Переводим в градусы
+	lon := baseLon + (deltaLon * 180 / math.Pi)
 	alt := altitude // Altitude — текущая высота ракеты
 
 	// Отправляем новые метрики в Prometheus

@@ -38,15 +38,6 @@ func RunSimulation() {
 			}
 		}
 
-		chanceAccident := rand.Float64()
-		if chanceAccident < 0.25 {
-			randomIndex := rand.Intn(len(engines))
-			randomEngine := engines[randomIndex]
-			fmt.Printf("🚨 Двигатель %d отключён из-за неизвестной аварии на высоте %.2f м\n", randomIndex+1, altitude)
-			randomEngine.Running = false
-			balanceEngines(engines, randomIndex)
-		}
-
 		// Если топлива осталось мало, симулируем проблемы с двигателями
 		if fuelMass > 0 && fuelMass < lowFuelThreshold {
 			for idx, engine := range engines {
@@ -87,6 +78,14 @@ func RunSimulation() {
 			fuelConsumed = fuelMass
 		}
 		fuelMass -= fuelConsumed
+
+		chanceAccident := rand.Float64()
+		if chanceAccident < 0.10 && runningEngines(engines) >= 7 {
+			randomIndex := rand.Intn(len(engines))
+			engines[randomIndex].Running = false
+			fmt.Printf("🚨 Двигатель %d отключён из-за неизвестной аварии на высоте %.2f м\n", randomIndex+1, altitude)
+			balanceEngines(engines, randomIndex)
+		}
 
 		metrics.SendBasicMetrics(altitude, velocity, acceleration, currentMass, drag, airDensity, running)
 
