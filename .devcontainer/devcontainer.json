@@ -1,0 +1,15 @@
+{
+  "name": "Go Dev Container",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "go-app",
+  "workspaceFolder": "/app",
+  "extensions": [
+    "golang.go",
+    "ms-azuretools.vscode-docker"
+  ],
+  "settings": {
+    "go.toolsGopath": "/go/bin"
+  },
+  "postCreateCommand": "go mod tidy",
+  "overrideCommand": true
+}

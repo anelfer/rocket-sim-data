@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  go-app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    container_name: go-app
+    ports:
+      - "8086:8086"
+    networks:
+      - grafana_monitoring
+
+networks:
+  grafana_monitoring:
+    external: true
