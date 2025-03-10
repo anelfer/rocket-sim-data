@@ -74,7 +74,7 @@ func (s *Simulation) Reset() {
 // Run запускает цикл симуляции.
 func (s *Simulation) Run() {
 	s.mu.Lock()
-	lowFuelThreshold := s.FuelMass * 0.1
+	lowFuelThreshold := 1500.0
 	s.mu.Unlock()
 
 	for s.Altitude >= 0 {
