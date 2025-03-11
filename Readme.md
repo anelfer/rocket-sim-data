@@ -1,6 +1,6 @@
 # Rocket Simulator Params
 
-_Version 1.7_
+_Version 1.8.9_
 
 This project simulates a rocket flight using approximate parameters derived from the SpaceX Falcon 9.
 

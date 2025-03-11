@@ -10,9 +10,13 @@ type Engine struct {
 	Thrust, MaxThrust, MinThrust float64
 	Running                      bool
 	X, Y                         float64
+	ChamberTemp                  float64
+	NozzleTemp                   float64
+	WallTemp                     float64
+	TurbineTemp                  float64
 }
 
-func initEngines(count int, thrustPerEngine float64, radius float64) []Engine {
+func initEngines(count int, thrustPerEngine float64, radius float64, ambientTemp float64) []Engine {
 	engines := make([]Engine, count)
 	angleStep := 2 * math.Pi / float64(count)
 
@@ -26,9 +30,77 @@ func initEngines(count int, thrustPerEngine float64, radius float64) []Engine {
 			X:         math.Cos(angle) * radius,
 			Y:         math.Sin(angle) * radius,
 		}
+		engines[i].initializeTemperature(ambientTemp)
 	}
 
 	return engines
+}
+
+// InitializeTemperature устанавливает начальные температуры двигателя равными ambientTemp.
+func (e *Engine) initializeTemperature(ambientTemp float64) {
+	e.ChamberTemp = ambientTemp
+	e.NozzleTemp = ambientTemp
+	e.WallTemp = ambientTemp
+	e.TurbineTemp = ambientTemp
+}
+
+// UpdateThermalState обновляет температурные параметры двигателя согласно простой модели теплового баланса.
+// Если двигатель работает, температура камеры сгорания растёт за счёт теплового потока от сгорания,
+// компенсированного потерями через охлаждение. Если двигатель выключен, температура сходится к ambientTemp.
+// Параметры:
+//
+//	dt                   — шаг симуляции (сек).
+//	ambientTemp          — температура окружающей среды (°C).
+//	cp                   — удельная теплоёмкость (J/(kg*K)).
+//	mChamber             — эффективная масса газовой смеси в камере (кг).
+//	Q_factor             — коэффициент, переводящий тягу в тепловой поток (J/(N·s)).
+//	coolingCoeff         — коэффициент охлаждения (W/°C).
+//	coolingTimeConstant  — временная константа для охлаждения неработающего двигателя (сек).
+func (e *Engine) UpdateThermalState(dt, effectiveAmbientTemp, cp, mChamber, Q_factor, coolingCoeff, coolingTimeConstant, airDensity, velocity, shieldingFactor float64) {
+	if e.Running {
+		// Энергетический баланс: поступающая мощность минус потери охлаждения.
+		Q_in := e.Thrust * Q_factor
+		Q_out := coolingCoeff * (e.ChamberTemp - effectiveAmbientTemp)
+		dT := (Q_in - Q_out) * dt / (mChamber * cp)
+		e.ChamberTemp += dT
+	} else {
+		// Экспоненциальное охлаждение: температура асимптотически стремится к effectiveAmbientTemp.
+		offlineCoolingMultiplier := calculateOfflineCoolingMultiplier(airDensity, velocity, shieldingFactor)
+		decay := math.Exp(-dt / (coolingTimeConstant * offlineCoolingMultiplier))
+		e.ChamberTemp = effectiveAmbientTemp + (e.ChamberTemp-effectiveAmbientTemp)*decay
+	}
+
+	// Вычисление температуры выходящих газов (NozzleTemp).
+	// Здесь используем коэффициент, отражающий эффект изотермического расширения.
+	nozzleFactor := 0.93
+	e.NozzleTemp = effectiveAmbientTemp + (e.ChamberTemp-effectiveAmbientTemp)*nozzleFactor
+
+	effectiveNozzleTemp := e.NozzleTemp * (0.2 + 0.3*shieldingFactor)
+
+	// Расчет температуры стенок (WallTemp) с учетом нагрева от горячих газов и активного охлаждения.
+	// Целевая температура стенок T_targetWall установлена на 1500°C.
+	T_targetWall := 1500.0
+	tauHeating := 5.0 // временная константа нагрева стенок
+	tauCooling := 2.0 // временная константа охлаждения стенок
+	heatTerm := (effectiveNozzleTemp - e.WallTemp) / tauHeating
+	coolTerm := (e.WallTemp - T_targetWall) / tauCooling
+	e.WallTemp += dt * (heatTerm - coolTerm)
+
+	// Температура турбины (TurbineTemp): ниже, чем в камере, из-за дополнительного охлаждения топлива.
+	turbineFactor := 0.3
+	e.TurbineTemp = effectiveAmbientTemp + (e.ChamberTemp-effectiveAmbientTemp)*turbineFactor
+}
+
+func calculateOfflineCoolingMultiplier(airDensity, velocity, shieldingFactor float64) float64 {
+	baseMultiplier := 5.0
+	alpha := 0.01
+	// Применяем shieldingFactor к convectiveFactor
+	convectiveFactor := alpha * airDensity * velocity * shieldingFactor
+	multiplier := baseMultiplier / (1 + convectiveFactor)
+	if multiplier < 1.0 {
+		multiplier = 1.0
+	}
+	return multiplier
 }
 
 func totalThrust(engines []Engine) float64 {
