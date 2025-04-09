@@ -1,26 +1,9 @@
-package simulator
+package utils
 
 import (
 	"math"
 	"math/rand"
 )
-
-// AngleBetweenEngines возвращает угол в градусах между двумя двигателями.
-func AngleBetweenEngines(e1, e2 Engine) float64 {
-	return math.Atan2(e2.Y-e1.Y, e2.X-e1.X) * (180 / math.Pi)
-}
-
-// IsOpposite определяет, является ли двигатель противоположным (угол ~180°).
-func IsOpposite(e1, e2 Engine) bool {
-	angle := math.Abs(AngleBetweenEngines(e1, e2))
-	return angle > 150 && angle <= 210
-}
-
-// IsNeighbor определяет, является ли двигатель соседним (угол <90°).
-func IsNeighbor(e1, e2 Engine) bool {
-	angle := math.Abs(AngleBetweenEngines(e1, e2))
-	return angle <= 90
-}
 
 // RandomThrustAdjustment возвращает случайное отклонение для тяги в указанном диапазоне.
 func RandomThrustAdjustment(rng *rand.Rand, min, max float64) float64 {
@@ -73,22 +56,9 @@ func SpeedOfSound(tempK float64) float64 {
 	return math.Sqrt(gamma * R * tempK)
 }
 
-func TotalThrust(engines []Engine) float64 {
-	total := 0.0
-	for _, e := range engines {
-		if e.Running {
-			total += e.Thrust
-		}
+func CalculateTWR(thrust, mass, gravity float64) float64 {
+	if mass == 0 || gravity == 0 {
+		return 0 // защита от деления на ноль
 	}
-	return total
-}
-
-func MaxTotalThrust(engines []Engine) float64 {
-	total := 0.0
-	for _, e := range engines {
-		if e.Running {
-			total += e.MaxThrust
-		}
-	}
-	return total
+	return thrust / (mass * gravity)
 }

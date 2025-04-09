@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"rocketTelemetrySim/simulator/orbit"
+	"rocketTelemetrySim/utils"
 	"sync"
 	"time"
 
@@ -121,7 +122,7 @@ func (s *Simulation) Run() {
 		}
 	}
 
-	for s.Altitude >= 0 {
+	for {
 		s.mu.Lock()
 
 		effectiveAmbientTemp := calcEffectiveAmbientTemp(s.Altitude, s.AmbientTemp)
@@ -164,11 +165,27 @@ func (s *Simulation) Run() {
 		thrust := TotalThrust(s.Engines)
 
 		currentMass := s.DryMass + s.FuelMass
-		s.Gravity = calcGravityAtAltitude(s.Altitude)
+		// 1. Вычисляем гравитацию на текущей высоте
+		rawGravity := calcGravityAtAltitude(s.Altitude)
+
+		// 2. Центростремительное ускорение (если есть горизонтальная скорость)
+		radius := orbit.EarthRadius + s.Altitude
+		centripetalAccel := (s.HorizontalVelocity * s.HorizontalVelocity) / radius
+
+		// 3. Эффективная гравитация: "чистая" сила, которую ещё надо компенсировать
+		effectiveGravity := rawGravity - centripetalAccel
+
+		// 4. Обнулим при отрицательных значениях (иначе ракета "вылетит в космос")
+		if effectiveGravity < 0 {
+			effectiveGravity = 0
+		}
+
+		// 5. Запоминаем в симуляцию и считаем силу тяжести
+		s.Gravity = effectiveGravity
 		gravityForce := currentMass * s.Gravity
 
 		// Получаем текущий pitch
-		pitch := orbit.ComputePitchByAltitude(s.Altitude, timeV, orbit.OrbitLEO) //s.VerticalVelocity
+		pitch := orbit.ComputePitchSmart(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity, s.LastAccelVertical, s.LastAccelHorizontal, orbit.OrbitLEO) //s.VerticalVelocity
 		pitchRad := pitch * math.Pi / 180
 
 		// 5. Разложим тягу по осям
@@ -179,25 +196,11 @@ func (s *Simulation) Run() {
 		airDensity := CalcAirDensityUSSA(s.Altitude)
 		totalVelocity := math.Hypot(s.HorizontalVelocity, s.VerticalVelocity)
 		totalvelocityRel := math.Hypot(s.HorizontalVelocity-orbit.EarthRotationSpeedAtLatitude(s.Lat), s.VerticalVelocity)
-		//totalvelocityRel :=  s.VerticalVelocity
-		cD := CdByVelocity(totalvelocityRel, CalcEffectiveAmbientTemp(s.Altitude))
+		cD := utils.CdByVelocity(totalvelocityRel, CalcEffectiveAmbientTemp(s.Altitude))
 
 		targetDrag := 0.5 * cD * airDensity * totalvelocityRel * totalvelocityRel * s.Area
-		s.LastDrag += (targetDrag - s.LastDrag) * 0.2
+		s.LastDrag += (targetDrag - s.LastDrag) * 1
 		drag := s.LastDrag
-
-		// Дебаг-лог
-		//fmt.Printf(
-		//	"[Drag Debug] Alt: %.0f m | V: %.2f m/s | ρ: %.4f kg/m³ | Cd: %.3f | A: %.2f m² | RawDrag: %.1f N | Smoothed: %.1f N (%.1f kN)\n",
-		//	s.Altitude,
-		//	totalvelocityRel,
-		//	airDensity,
-		//	cD,
-		//	s.Area,
-		//	targetDrag,
-		//	drag,
-		//	drag/1000.0,
-		//)
 
 		// 7. Направление drag — противоположно вектору скорости
 		var unitX, unitY float64
@@ -216,36 +219,8 @@ func (s *Simulation) Run() {
 		rawAccelHorizontal := forceX / currentMass
 		rawAccelVertical := forceY / currentMass
 
-		//maxJerk := CalculateMaxJerk(thrust, currentMass, s.Altitude)
-
-		// Плавно "догоняем" новое ускорение
-		thrustRatio := 1.0
-		maxThrust := MaxTotalThrust(s.Engines)
-		if maxThrust > 0 {
-			thrustRatio = thrust / maxThrust
-		} else {
-			thrustRatio = 1 // или 1, если хочешь применить полное сглаживание
-		}
-
-		var smoothingFactor float64
-		//if thrustRatio <= 0.1 {
-		//	smoothingFactor = 1.0 // 100% сглаживание
-		//} else if thrustRatio >= 0.2 {
-		//	smoothingFactor = 0.0 // 0% сглаживание, полное мгновенное обновление
-		//} else {
-		//	// Линейная интерполяция от 1 до 0 между 0.1 и 0.2
-		//	smoothingFactor = 1.0 - (thrustRatio-0.1)/(0.2-0.1)
-		//}
-
-		// Вычисляем новый acceleration как смесь сглаженного и мгновенного варианта
-		alpha := getAccelResponseFactor(currentMass, s.Area, cD, s.Altitude, 0.2, deltaT)
-		smoothedAccelVertical := s.LastAccelVertical + (rawAccelVertical-s.LastAccelVertical)*alpha
-		smoothedAccelHorizontal := s.LastAccelHorizontal + (rawAccelHorizontal-s.LastAccelHorizontal)*alpha
-
-		//accelVertical := smoothingFactor*smoothedAccelVertical + (1-smoothingFactor)*rawAccelVertical
 		accelVertical := rawAccelVertical
 		accelHorizontal := rawAccelHorizontal
-		//accelHorizontal := smoothingFactor*smoothedAccelHorizontal + (1-smoothingFactor)*rawAccelHorizontal
 
 		s.LastAccelVertical = accelVertical
 		s.LastAccelHorizontal = accelHorizontal
@@ -253,53 +228,6 @@ func (s *Simulation) Run() {
 		// 10. Обновляем скорости
 		s.VerticalVelocity += accelVertical * deltaT
 		s.HorizontalVelocity += accelHorizontal * deltaT
-
-		fmt.Printf(`[Flight Debug]
-Time: %.2fs | Alt: %.0f m | Mass: %.1f kg | dT: %.2f s
-
-→ Velocities:
-  Vx: %.2f m/s | Vy: %.2f m/s | Vtotal: %.2f m/s
-
-→ Forces:
-  Thrust: %.1f N (X: %.1f, Y: %.1f)
-  Drag:   %.1f N (X: %.1f, Y: %.1f)
-  Gravity: %.1f N
-
-→ Force Sum:
-  FX: %.1f N | FY: %.1f N
-
-→ Accelerations:
-  Raw:     ax: %.3f m/s² | ay: %.3f m/s²
-  Smoothed: ax: %.3f m/s² | ay: %.3f m/s²
-  Final:   ax: %.3f m/s² | ay: %.3f m/s²
-
-→ Ratios & Factors:
-  Thrust Ratio: %.3f | Smoothing Factor: %.3f | Alpha: %.3f
-
-→ Updated Velocities:
-  Vx: %.2f → %.2f m/s | Vy: %.2f → %.2f m/s
-
---------------------------------------------------------------
-`,
-			timeV, s.Altitude, currentMass, deltaT,
-
-			s.HorizontalVelocity, s.VerticalVelocity, totalVelocity,
-
-			thrust, thrustX, thrustY,
-			drag, dragX, dragY,
-			gravityForce,
-
-			forceX, forceY,
-
-			rawAccelHorizontal, rawAccelVertical,
-			smoothedAccelHorizontal, smoothedAccelVertical,
-			accelHorizontal, accelVertical,
-
-			thrustRatio, smoothingFactor, alpha,
-
-			s.HorizontalVelocity, s.HorizontalVelocity+accelHorizontal*deltaT,
-			s.VerticalVelocity, s.VerticalVelocity+accelVertical*deltaT,
-		)
 
 		// 11. Обновляем высоту
 		s.Altitude += s.VerticalVelocity * deltaT
@@ -310,6 +238,26 @@ Time: %.2fs | Alt: %.0f m | Mass: %.1f kg | dT: %.2f s
 				s.Engines[i].Running = false
 			}
 		}
+
+		newThrottle := orbit.ComputeThrottle(s.HorizontalVelocity, s.LastAccelHorizontal, s.VerticalVelocity, s.LastAccelVertical, s.Altitude, pitch, utils.CalculateTWR(thrust, s.TotalMass, s.Gravity), 7670.0, 1)
+		orbit.CurrentThrottle = newThrottle
+		for i, engine := range s.Engines {
+			if engine.Running {
+				// Линейная интерполяция между MinThrust и MaxThrust по throttle
+				thrustNew := engine.MinThrust + newThrottle*(engine.MaxThrust-engine.MinThrust)
+
+				// Обновляем значение в массиве
+				s.Engines[i].Thrust = math.Max(engine.MinThrust, math.Min(thrustNew, engine.MaxThrust))
+			}
+		}
+
+		//if ShouldSECO(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity) {
+		//	for i, engine := range s.Engines {
+		//		if engine.Running {
+		//			s.Engines[i].Running = false
+		//		}
+		//	} // SECO
+		//}
 
 		s.Lat, s.Lon = orbit.GuidanceUpdatePosition(s.Lat, s.Lon, math.Hypot(s.HorizontalVelocity, s.VerticalVelocity), pitch, s.Heading)
 
@@ -326,34 +274,39 @@ Time: %.2fs | Alt: %.0f m | Mass: %.1f kg | dT: %.2f s
 		//	accelHorizontal, accelVertical)
 
 		//stage separation
-		if timeV+1 >= 150 && !stagesSeparated {
+		if timeV+1 >= 180 && !stagesSeparated {
 			stagesSeparated = true
-			s.DryMass = 12300
-			s.FuelMass = 92670
+			s.DryMass = 7300
+			s.FuelMass = 107670
 			s.TotalMass = s.DryMass + s.FuelMass
-			disabledEngines := 0
-			for i, engine := range s.Engines {
-				if engine.Running {
-					if disabledEngines == len(s.Engines)-1 {
-						continue
+			enabled := false
+
+			for i := range s.Engines {
+				if s.Engines[i].Running {
+					if !enabled {
+						// Оставляем включённым и задаём параметры
+						s.Engines[i].ISP = 348
+						s.Engines[i].Thrust = 981000
+						s.Engines[i].MaxThrust = 981000 + 500
+						enabled = true
+					} else {
+						// Выключаем лишние
+						s.Engines[i].Running = false
 					}
-					s.Engines[i].Running = false
-					disabledEngines++
 				}
 			}
 
-			for i, engine := range s.Engines {
-				if engine.Running {
-					engine.ISP = 348
-					engine.Thrust = 981000
-					engine.MaxThrust = 981000 + 15000
-					s.Engines[i] = engine
-				}
+			// Если все были выключены — включаем один и задаём параметры
+			if !enabled && len(s.Engines) > 0 {
+				s.Engines[0].Running = true
+				s.Engines[0].ISP = 348
+				s.Engines[0].Thrust = 981000
+				s.Engines[0].MaxThrust = 981000 + 500
 			}
 			fmt.Println("Rocket stage was separated!")
 		}
 
-		if timeV+1 >= 185 && !noseFairingDestack {
+		if timeV+1 >= 195 && !noseFairingDestack {
 			noseFairingDestack = true
 			s.DryMass = s.DryMass - 1750
 			fmt.Println("Nose fairing was destacked!")
@@ -374,52 +327,19 @@ Time: %.2fs | Alt: %.0f m | Mass: %.1f kg | dT: %.2f s
 		}
 		s.FuelMass -= totalFuelUsed
 
-		if timeV > 29.0 && timeV < 31.0 { // Печатаем в районе 30 секунд
-			// Скорость звука (м/с)
-			a := SpeedOfSound(CalcEffectiveAmbientTemp(s.Altitude))
-
-			// Число Маха
-			mach := totalVelocity / a
-			fmt.Println("--------------------")
-			fmt.Printf("Time: %.2f s\n", timeV)
-			fmt.Printf("DEBUG: Current Mass: %.2f kg\n", currentMass)
-			fmt.Printf("DEBUG: Total Thrust: %.2f N\n", thrust)
-			fmt.Printf("DEBUG: Pitch Rad: %.3f, Sin(Pitch): %.3f\n", pitchRad, math.Sin(pitchRad))
-			fmt.Printf("DEBUG: ThrustY: %.2f N\n", thrustY)
-			fmt.Printf("DEBUG: Gravity Force: %.2f N\n", gravityForce)
-			fmt.Printf("DEBUG: --- Drag Params ---\n")
-			fmt.Printf("DEBUG: Total Velocity: %.2f m/s\n", totalVelocity)
-			fmt.Printf("DEBUG: Vertical Velocity: %.2f m/s\n", s.VerticalVelocity)
-			fmt.Printf("DEBUG: Mach: %.3f\n", mach)
-			fmt.Printf("DEBUG: Cd: %.3f\n", cD)
-			fmt.Printf("DEBUG: Air Density: %.4f kg/m^3\n", airDensity)
-			fmt.Printf("DEBUG: Drag Force Magnitude: %.2f N\n", drag)
-			fmt.Printf("DEBUG: Drag Force Magnitude METHOD: %.2f N\n", DragForce(s.Altitude, totalVelocity, s.Area))
-			fmt.Printf("DEBUG: UnitY: %.3f\n", unitY)                        // unitY = s.VerticalVelocity / totalVelocity
-			fmt.Printf("DEBUG: DragY (Vertical Component): %.2f N\n", dragY) // dragY = -dragForce * unitY
-			fmt.Printf("DEBUG: --- Forces & Accel ---\n")
-			fmt.Printf("DEBUG: ForceY (ThrustY + DragY - GravityF): %.2f N\n", forceY) // Проверьте формулу здесь!
-			fmt.Printf("DEBUG: RawAccelVertical (ForceY / Mass): %.3f m/s^2\n", rawAccelVertical)
-			fmt.Printf("DEBUG: Final AccelVertical Used: %.3f m/s^2\n", accelVertical) // Должно совпадать с RawAccelVertical
-			fmt.Println("--------------------")
-		}
-
 		running := runningEngines(s.Engines)
 		// Случайные аварии
-		if s.rng.Float64() < 0.00015 && runningEngines(s.Engines) >= 7 {
+		if s.rng.Float64() < 0.00015 && runningEngines(s.Engines) >= 7 && !stagesSeparated {
 			randomIndex := s.rng.Intn(len(s.Engines))
 			s.Engines[randomIndex].Running = false
 			log.Printf("🚨 Двигатель %d отключён из-за неизвестной аварии на высоте %.2f м\n", randomIndex+1, s.Altitude)
 			balanceEngines(s.Engines, randomIndex, s.rng)
 		}
 
-		for i := range s.Engines {
-			s.Engines[i].UpdateThermalState(s.Dt, effectiveAmbientTemp, s.Cp, s.MChamber, s.QFactor, s.CoolingCoeff, s.CoolingTimeConstant, airDensity, totalVelocity, 0.5)
-		}
-
 		// Отправка метрик
-		metrics.SendBasicMetrics(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity, accelHorizontal, accelVertical, currentMass, drag, airDensity, running, effectiveAmbientTemp, pitch, s.Gravity, thrust, timeV, s.Lat, s.Lon)
+		metrics.SendBasicMetrics(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity, accelHorizontal, accelVertical, currentMass, drag, airDensity, running, effectiveAmbientTemp, pitch, s.Gravity, TotalThrust(s.Engines), timeV, s.Lat, s.Lon)
 		for idx, engine := range s.Engines {
+			s.Engines[idx].UpdateThermalState(s.Dt, effectiveAmbientTemp, s.Cp, s.MChamber, s.QFactor, s.CoolingCoeff, s.CoolingTimeConstant, airDensity, totalVelocity, 0.5)
 			engineID := fmt.Sprintf("%d", idx+1)
 			if engine.Running {
 				metrics.SetEngineThrust(engineID, engine.Thrust, engine.ISP, engine.ChamberTemp, engine.NozzleTemp, engine.WallTemp, engine.TurbineTemp)
@@ -437,7 +357,7 @@ Time: %.2fs | Alt: %.0f m | Mass: %.1f kg | dT: %.2f s
 // calcEffectiveAmbientTemp рассчитывает эффективную температуру окружающей среды (в °C)
 // используется USSA-76
 func calcEffectiveAmbientTemp(altitude, seaLevelTemp float64) float64 {
-	t := KelvinToCelsius(CalcEffectiveAmbientTemp(altitude))
+	t := utils.KelvinToCelsius(CalcEffectiveAmbientTemp(altitude))
 
 	// Добавляем шум: амплитуда зависит от диапазона высот
 	var noiseAmp float64
@@ -540,13 +460,13 @@ func DragForce(altitude, velocity, area float64) float64 {
 	tempK := CalcEffectiveAmbientTemp(altitude)
 
 	// Скорость звука (м/с)
-	a := SpeedOfSound(tempK)
+	a := utils.SpeedOfSound(tempK)
 
 	// Число Маха
 	mach := velocity / a
 
 	// Коэффициент сопротивления в зависимости от числа Маха
-	Cd := CdByMach(mach)
+	Cd := utils.CdByMach(mach)
 
 	// Плотность воздуха (кг/м³)
 	rho := CalcAirDensityUSSA(altitude)
@@ -649,4 +569,14 @@ func AdjustThrustByAltitude(alt float64) float64 {
 	t := alt / maxBoostAltitude
 	eased := 0.5 * (1 - math.Cos(t*math.Pi)) // от 0 до 1
 	return seaLevelThrust + eased*(vacuumThrust-seaLevelThrust)
+}
+
+func ShouldSECO(altitude, vVertical, vHorizontal float64) bool {
+	targetAltitude := 400_000.0 // м
+	requiredVelocity := 7670.0  // м/с
+
+	return altitude >= targetAltitude-5000 && // 5 км допуска
+		altitude <= targetAltitude+5000 &&
+		vHorizontal >= requiredVelocity &&
+		math.Abs(vVertical) < 50 // почти 0
 }

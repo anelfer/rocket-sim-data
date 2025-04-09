@@ -24,7 +24,7 @@ func main() {
 }
 
 func startMetricsServer() {
-	log.Println("Metrics server listening at 0.0.0.0:8086 v1.11.7")
+	log.Println("Metrics server listening at 0.0.0.0:8086 v1.12.1")
 	ln, err := net.Listen("tcp", "0.0.0.0:8086")
 	if err != nil {
 		log.Fatal(err)

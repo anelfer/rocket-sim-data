@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
+	"rocketTelemetrySim/utils"
 )
 
 var (
@@ -97,8 +99,8 @@ var lon = 63.3050
 var heading = 90.0 // восток
 
 func SendBasicMetrics(altitude, verticalVelocity, horizontalVelocity, horizontalAccel, verticalAccel, mass, drag, airDensity float64, enginesRunning int, ambientTemp, pitch, gravity, totalThrust, time, latV, lonV float64) {
-	//fmt.Printf("Time: %.2f s | Altitude: %.2f m | V_Velocity: %.2f m/s | V_Acceleration: %.2f m/s² | Mass: %.2f kg | Drag: %.2f N | Air Density: %.4f kg/m³ | Ambient Temp: %.2f C | Engine: %.d | Pitch: %.3f\n",
-	//	time, altitude, verticalVelocity, verticalAccel, mass, drag, airDensity, ambientTemp, enginesRunning, pitch)
+	fmt.Printf("Time: %.2f s | Altitude: %.2f m | V_Velocity: %.2f m/s | V_Acceleration: %.2f m/s² | Mass: %.2f kg | Drag: %.2f N | Air Density: %.4f kg/m³ | Ambient Temp: %.2f C | Engine: %.d | Pitch: %.3f | Gravity: %.3f\n",
+		time, altitude, verticalVelocity, verticalAccel, mass, drag, airDensity, ambientTemp, enginesRunning, pitch, gravity)
 	altitudeGauge.Set(altitude)
 	verticalVelocityGauge.Set(verticalVelocity)
 	horizontalVelocityGauge.Set(horizontalVelocity)
@@ -118,7 +120,7 @@ func SendBasicMetrics(altitude, verticalVelocity, horizontalVelocity, horizontal
 	rocketPositionLon.Set(lonV)
 	rocketPositionAlt.Set(alt)
 	rocketPitch.Set(pitch)
-	rocketTwr.Set(CalculateTWR(totalThrust, mass, gravity))
+	rocketTwr.Set(utils.CalculateTWR(totalThrust, mass, gravity))
 }
 
 func SetEngineThrust(engineID string, thrust, isp, chamberTemp, nozzleTemp, wallTemp, turbineTemp float64) {
@@ -128,11 +130,4 @@ func SetEngineThrust(engineID string, thrust, isp, chamberTemp, nozzleTemp, wall
 	engineNozzleTempGauge.WithLabelValues(engineID).Set(nozzleTemp)
 	engineWallTempGauge.WithLabelValues(engineID).Set(wallTemp)
 	engineTurbineTempGauge.WithLabelValues(engineID).Set(turbineTemp)
-}
-
-func CalculateTWR(thrust, mass, gravity float64) float64 {
-	if mass == 0 || gravity == 0 {
-		return 0 // защита от деления на ноль
-	}
-	return thrust / (mass * gravity)
 }
