@@ -1,9 +1,7 @@
 package metrics
 
 import (
-	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
-	"rocketTelemetrySim/simulator/orbit"
 )
 
 var (
@@ -52,6 +50,12 @@ var (
 		},
 		[]string{"engine_id"},
 	)
+	engineIspGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "rocket_engine_isp",
+		},
+		[]string{"engine_id"},
+	)
 	engineFuelTempGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "rocket_engine_fuel_temperature_celsius",
@@ -70,6 +74,7 @@ var (
 	rocketPositionLon = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rocket_longitude"})
 	rocketPositionAlt = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rocket_altitude"})
 	rocketPitch       = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rocket_pitch"})
+	rocketTwr         = prometheus.NewGauge(prometheus.GaugeOpts{Name: "rocket_twr"})
 )
 
 func init() {
@@ -80,8 +85,8 @@ func init() {
 		engineStatusGauge, engineThrustGauge,
 		rocketPositionLat, rocketPositionLon, rocketPositionAlt,
 		engineChamberTempGauge, engineNozzleTempGauge, engineWallTempGauge,
-		engineTurbineTempGauge, engineFuelTempGauge, engineOxidizerTempGauge,
-		rocketPitch,
+		engineTurbineTempGauge, engineIspGauge, engineFuelTempGauge,
+		engineOxidizerTempGauge, rocketPitch, rocketTwr,
 	)
 	rocketPositionLat.Set(lat)
 	rocketPositionLon.Set(lon)
@@ -91,9 +96,9 @@ var lat = 45.9647
 var lon = 63.3050
 var heading = 90.0 // восток
 
-func SendBasicMetrics(altitude, verticalVelocity, horizontalVelocity, horizontalAccel, verticalAccel, mass, drag, airDensity float64, enginesRunning int, ambientTemp, pitch float64) {
-	fmt.Printf("Altitude: %.2f m | V_Velocity: %.2f m/s | V_Acceleration: %.2f m/s² | Mass: %.2f kg | Drag: %.2f N | Air Density: %.4f kg/m³ | Ambient Temp: %.2f C | Engine: %.d | Pitch: %.3f\n",
-		altitude, verticalVelocity, verticalAccel, mass, drag, airDensity, ambientTemp, enginesRunning, pitch)
+func SendBasicMetrics(altitude, verticalVelocity, horizontalVelocity, horizontalAccel, verticalAccel, mass, drag, airDensity float64, enginesRunning int, ambientTemp, pitch, gravity, totalThrust, time, latV, lonV float64) {
+	//fmt.Printf("Time: %.2f s | Altitude: %.2f m | V_Velocity: %.2f m/s | V_Acceleration: %.2f m/s² | Mass: %.2f kg | Drag: %.2f N | Air Density: %.4f kg/m³ | Ambient Temp: %.2f C | Engine: %.d | Pitch: %.3f\n",
+	//	time, altitude, verticalVelocity, verticalAccel, mass, drag, airDensity, ambientTemp, enginesRunning, pitch)
 	altitudeGauge.Set(altitude)
 	verticalVelocityGauge.Set(verticalVelocity)
 	horizontalVelocityGauge.Set(horizontalVelocity)
@@ -106,20 +111,28 @@ func SendBasicMetrics(altitude, verticalVelocity, horizontalVelocity, horizontal
 	effectiveAmbientTemp.Set(ambientTemp)
 
 	// Координаты места запуска (например, космодром Байконур)
-	lat, lon = orbit.GuidanceUpdatePosition(lat, lon, altitude, horizontalVelocity, heading, orbit.OrbitLEO)
 	alt := altitude // Altitude — текущая высота ракеты
 
 	// Отправляем новые метрики в Prometheus
-	rocketPositionLat.Set(lat)
-	rocketPositionLon.Set(lon)
+	rocketPositionLat.Set(latV)
+	rocketPositionLon.Set(lonV)
 	rocketPositionAlt.Set(alt)
 	rocketPitch.Set(pitch)
+	rocketTwr.Set(CalculateTWR(totalThrust, mass, gravity))
 }
 
-func SetEngineThrust(engineID string, thrust, chamberTemp, nozzleTemp, wallTemp, turbineTemp float64) {
+func SetEngineThrust(engineID string, thrust, isp, chamberTemp, nozzleTemp, wallTemp, turbineTemp float64) {
 	engineThrustGauge.WithLabelValues(engineID).Set(thrust)
+	engineIspGauge.WithLabelValues(engineID).Set(isp)
 	engineChamberTempGauge.WithLabelValues(engineID).Set(chamberTemp)
 	engineNozzleTempGauge.WithLabelValues(engineID).Set(nozzleTemp)
 	engineWallTempGauge.WithLabelValues(engineID).Set(wallTemp)
 	engineTurbineTempGauge.WithLabelValues(engineID).Set(turbineTemp)
+}
+
+func CalculateTWR(thrust, mass, gravity float64) float64 {
+	if mass == 0 || gravity == 0 {
+		return 0 // защита от деления на ноль
+	}
+	return thrust / (mass * gravity)
 }

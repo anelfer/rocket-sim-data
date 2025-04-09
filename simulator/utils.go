@@ -35,19 +35,34 @@ func KelvinToCelsius(kelvin float64) float64 {
 	return kelvin - 273.15
 }
 
+func CdByVelocity(velocity, tempK float64) float64 {
+	// Скорость звука (м/с)
+	a := SpeedOfSound(tempK)
+
+	// Число Маха
+	mach := velocity / a
+	return CdByMach(mach)
+}
+
 // CdByMach возвращает приближённый коэффициент лобового сопротивления по числу Маха
-func CdByMach(mach float64) float64 {
+func CdByMach(m float64) float64 {
 	switch {
-	case mach < 0.8:
+	case m < 0.8:
 		return 0.2
-	case mach >= 0.8 && mach <= 1.2:
-		return 0.5
-	case mach > 1.2 && mach <= 3.0:
-		return 0.4
-	case mach > 3.0 && mach <= 6.0:
-		return 0.3
+	case m >= 0.8 && m < 1.0:
+		t := (m - 0.8) / (1.0 - 0.8)
+		return 0.2 + t*(0.5-0.2)
+	case m >= 1.0 && m <= 1.2:
+		t := (m - 1.0) / (1.2 - 1.0)
+		return 0.5 - t*(0.5-0.45)
+	case m > 1.2 && m <= 3.0:
+		t := (m - 1.2) / (3.0 - 1.2)
+		return 0.45 - t*(0.45-0.35)
+	case m > 3.0 && m <= 5.0:
+		t := (m - 3.0) / (5.0 - 3.0)
+		return 0.35 - t*(0.35-0.31)
 	default:
-		return 0.25
+		return 0.31
 	}
 }
 
@@ -56,4 +71,24 @@ func SpeedOfSound(tempK float64) float64 {
 	const gamma = 1.4
 	const R = 287.05
 	return math.Sqrt(gamma * R * tempK)
+}
+
+func TotalThrust(engines []Engine) float64 {
+	total := 0.0
+	for _, e := range engines {
+		if e.Running {
+			total += e.Thrust
+		}
+	}
+	return total
+}
+
+func MaxTotalThrust(engines []Engine) float64 {
+	total := 0.0
+	for _, e := range engines {
+		if e.Running {
+			total += e.MaxThrust
+		}
+	}
+	return total
 }

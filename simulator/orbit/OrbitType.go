@@ -12,7 +12,7 @@ const (
 )
 
 // GetTargetOrbitAltitude возвращает целевую высоту орбиты (в метрах)
-func GetTargetOrbitAltitude(orbit OrbitType) float64 {
+func (orbit OrbitType) GetTargetOrbitAltitude() float64 {
 	switch orbit {
 	case OrbitLEO:
 		return 400000.0 // 400 км
@@ -27,33 +27,58 @@ func GetTargetOrbitAltitude(orbit OrbitType) float64 {
 	}
 }
 
+func (orbit OrbitType) GetPitchTurnParams() (float64, float64, float64) {
+	switch orbit {
+	case OrbitLEO:
+		// Старт поворота с 1.5 км, основная фаза до 60 км, потом до орбиты.
+		return 1500.0, 100000.0, 47.0
+	case OrbitSSO:
+		// Начинаем чуть позже, т.к. SSO требует немного большего вертикального компонента.
+		return 2000.0, 120000.0, 55.0
+	case OrbitMEO:
+		// Дальняя орбита — плавный наклон, больше фазы вертикального полёта.
+		return 5000.0, 160000.0, 60.0
+	case OrbitGEO:
+		// GEO — стартуем выше и поворачиваем плавно, больше "вверх".
+		return 8000.0, 200000.0, 65.0
+	default:
+		return 2000.0, 160000.0, 45.0
+	}
+}
+
 // ComputePitchByAltitude — простая сигмоида для наклона тяги
-func ComputePitchByAltitude(altitude float64, mission OrbitType) float64 {
-	targetAlt := GetTargetOrbitAltitude(mission)
+// ComputePitchByAltitude — сигмоида с удержанием наклона после MECO
+func ComputePitchByAltitude(altitude float64, elapsedTime float64, mission OrbitType) float64 {
+	targetAlt := mission.GetTargetOrbitAltitude()
+	start, end, minSafe := mission.GetPitchTurnParams()
 
-	// Настраиваемые параметры
-	pitchoverStart := 0.005 * targetAlt
-	pitchoverEnd := 0.125 * targetAlt
-	initialPitch := 90.0
+	initial := 90.0
+	//holdDuration := 20.0 // удержание в секундах
 
-	// Минимальный допустимый pitch, пока не достигнута нужная высота
-	minSafePitch := 5.0
-
-	if altitude < pitchoverStart {
-		return initialPitch
+	if altitude <= start {
+		return initial
 	}
 
-	if altitude < pitchoverEnd {
-		progress := (altitude - pitchoverStart) / (pitchoverEnd - pitchoverStart)
-		eased := 0.5 * (1 - math.Cos(progress*math.Pi))
-		pitch := initialPitch * (1 - eased)
-		return math.Max(pitch, minSafePitch) // ⬅ НЕ давать упасть ниже safe pitch
+	// Первая фаза: от initial до minSafe
+	if altitude < end {
+		t := (altitude - start) / (end - start)
+		eased := 0.5 * (1 - math.Cos(t*math.Pi)) // от 0 до 1
+		pitch := initial*(1-eased) + minSafe*eased
+		return pitch
 	}
 
-	// Если высота всё ещё ниже цели — держим safe pitch
-	if altitude < 0.95*targetAlt {
-		return minSafePitch
+	// Вторая фаза: удержание наклона
+	// Предположим, что момент входа во вторую фазу — когда altitude >= end
+	// Тогда запомним время начала второй фазы
+	holdEndTime := 150 + 20.0 // должен вернуть время начала второй фазы + holdDuration
+
+	if elapsedTime < holdEndTime {
+		return minSafe
 	}
 
-	return 0.0
+	// Третья фаза: плавный спад до 0
+	t := (altitude - end) / (targetAlt - end)
+	eased := 0.5 * (1 - math.Cos(t*math.Pi))
+	pitch := minSafe * (1 - eased)
+	return pitch
 }

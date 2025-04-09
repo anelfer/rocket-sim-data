@@ -105,16 +105,6 @@ func calculateOfflineCoolingMultiplier(airDensity, velocity, shieldingFactor flo
 	return multiplier
 }
 
-func totalThrust(engines []Engine) float64 {
-	total := 0.0
-	for _, e := range engines {
-		if e.Running {
-			total += e.Thrust
-		}
-	}
-	return total
-}
-
 func runningEngines(engines []Engine) int {
 	count := 0
 	for _, e := range engines {

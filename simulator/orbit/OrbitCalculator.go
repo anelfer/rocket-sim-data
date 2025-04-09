@@ -12,35 +12,28 @@ const (
 // GuidanceUpdatePosition обновляет позицию ракеты за 1 секунду
 func GuidanceUpdatePosition(
 	lat, lon float64, // текущие координаты (градусы)
-	altitude float64, // высота (м)
 	velocity float64, // полная скорость ракеты (м/с)
-	heading float64, // направление (азимут) в градусах
-	mission OrbitType, // тип орбиты
+	pitch float64, // угол к горизонту (градусы), 90 = вверх
+	heading float64, // азимут (градусы), 90 = восток
 ) (float64, float64) {
-
 	latRad := lat * math.Pi / 180
 	lonRad := lon * math.Pi / 180
 	headingRad := heading * math.Pi / 180
+	pitchRad := pitch * math.Pi / 180
 
-	// Вращение Земли
-	//earthRotationSpeed := EarthRotationSpeedAtLatitude(altitude)
+	// Горизонтальная компонента скорости (движение по поверхности)
+	horizontalVelocity := velocity * math.Cos(pitchRad)
 
-	// Питч по высоте
-	//pitchAngle := ComputePitchByAltitude(altitude, mission)
-	//pitchRad := pitchAngle * math.Pi / 180
+	// Расстояние за 1 секунду (горизонтальное перемещение по сфере)
+	d := horizontalVelocity // м/с
 
-	// Делим скорость на вертикальную и горизонтальную
-	//vHoriz := velocity * math.Cos(pitchRad)
-	//totalHorizVelocity := vHoriz + earthRotationSpeed
-
-	// Расстояние по сфере за 1 секунду
-	d := velocity
-
+	// Обновляем широту
 	newLat := math.Asin(
 		math.Sin(latRad)*math.Cos(d/earthRadius) +
 			math.Cos(latRad)*math.Sin(d/earthRadius)*math.Cos(headingRad),
 	)
 
+	// Обновляем долготу
 	newLon := lonRad + math.Atan2(
 		math.Sin(headingRad)*math.Sin(d/earthRadius)*math.Cos(latRad),
 		math.Cos(d/earthRadius)-math.Sin(latRad)*math.Sin(newLat),
