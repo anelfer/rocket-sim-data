@@ -14,6 +14,15 @@ func RandomThrustAdjustment(rng *rand.Rand, min, max float64) float64 {
 	return value
 }
 
+func CalcGravityAtAltitude(altitude float64) float64 {
+	const (
+		g0 = 9.80665   // гравитация на уровне моря (м/с²)
+		R  = 6371000.0 // радиус Земли в метрах
+	)
+
+	return g0 * (R / (R + altitude)) * (R / (R + altitude))
+}
+
 func KelvinToCelsius(kelvin float64) float64 {
 	return kelvin - 273.15
 }

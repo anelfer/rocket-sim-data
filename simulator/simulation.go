@@ -64,7 +64,7 @@ func NewSimulation() *Simulation {
 		VerticalVelocity:   0.0,
 		HorizontalVelocity: orbit.EarthRotationSpeedAtLatitude(45.9647),
 		Altitude:           0.0,
-		Gravity:            calcGravityAtAltitude(0),
+		Gravity:            utils.CalcGravityAtAltitude(0),
 		DragCoefficient:    0.5,
 		AirDensitySeaLevel: 1.225,
 
@@ -100,7 +100,7 @@ func (s *Simulation) Reset() {
 	s.VerticalVelocity = 0.0
 	s.HorizontalVelocity = orbit.EarthRotationSpeedAtLatitude(0)
 	s.Altitude = 0.0
-	s.Gravity = calcGravityAtAltitude(0)
+	s.Gravity = utils.CalcGravityAtAltitude(0)
 	s.Area = math.Pi * math.Pow(1.83, 2)
 	s.DragCoefficient = 0.5
 	s.AirDensitySeaLevel = 1.225
@@ -122,114 +122,120 @@ func (s *Simulation) Run() {
 		}
 	}
 
+	// Предварительно можно определить константы для событий при низком уровне топлива:
+	const (
+		lowFuelFailureProb = 0.2 // вероятность отказа двигателя при низком топливе
+		surgeProb          = 0.3 // вероятность резкого скачка тяги
+		reductionProb      = 0.4 // вероятность резкого снижения тяги
+		smoothingFactor    = 0.1 // коэффициент сглаживания для drag
+	)
+
+	orbitType := orbit.OrbitLEO
+	targetOrbitAltitude := orbitType.GetTargetOrbitAltitude()
+	guidance := orbit.NewGuidanceState(targetOrbitAltitude)
+
 	for {
 		s.mu.Lock()
 
+		// 1. Вычисляем эффективную температуру (единожды на итерацию)
 		effectiveAmbientTemp := calcEffectiveAmbientTemp(s.Altitude, s.AmbientTemp)
 
-		// Если топлива нет, отключаем все двигатели
+		// 2. Обработка ситуаций, связанных с недостатком топлива
 		if s.FuelMass <= 0 {
+			// Если топлива нет, отключаем все двигатели
 			s.FuelMass = 0
 			for i := range s.Engines {
 				if s.Engines[i].Running {
 					s.Engines[i].Running = false
 					log.Printf("🚨 Двигатель %d отключён из-за отсутствия топлива на высоте %.2f м\n", i+1, s.Altitude)
-					balanceEngines(s.Engines, i, s.rng)
 				}
 			}
-		}
-
-		// Если топлива мало, симулируем непредвиденные ситуации
-		if s.FuelMass > 0 && s.FuelMass < lowFuelThreshold {
+			// Можно выполнить балансировку один раз (если balanceEngines умеет обрабатывать группу)
+			balanceEngines(s.Engines, -1, s.rng)
+		} else if s.FuelMass < lowFuelThreshold {
+			// При низком топливе — возможны непредвиденные ситуации у работающих двигателей
 			for idx, engine := range s.Engines {
 				if engine.Running {
 					chance := s.rng.Float64()
-					if chance < 0.2 {
+					if chance < lowFuelFailureProb {
 						s.Engines[idx].Running = false
 						log.Printf("🚨 Двигатель %d вышел из строя из-за низкого топлива на высоте %.2f м\n", idx+1, s.Altitude)
-						balanceEngines(s.Engines, idx, s.rng)
-					} else if chance < 0.3 {
+					} else if chance < surgeProb {
+						// Резкий скачок тяги
 						surgeFactor := 1.5
 						s.Engines[idx].Thrust *= surgeFactor
 						log.Printf("⚡ Двигатель %d испытал резкий скачок тяги, новая тяга: %.2f\n", idx+1, s.Engines[idx].Thrust)
-					} else if chance < 0.4 {
+					} else if chance < reductionProb {
+						// Резкое снижение тяги
 						reductionFactor := 0.5
 						s.Engines[idx].Thrust *= reductionFactor
 						log.Printf("⚠️ Двигатель %d испытал резкое снижение тяги, новая тяга: %.2f\n", idx+1, s.Engines[idx].Thrust)
 					}
 				}
 			}
+			// Балансировка для двигателей, отключённых в результате событий низкого топлива
+			for idx, engine := range s.Engines {
+				if !engine.Running {
+					balanceEngines(s.Engines, idx, s.rng)
+				}
+			}
 		}
 
-		// Вычисляем массу и гравитацию
-		thrust := TotalThrust(s.Engines)
-
+		// 3. Расчёт массы (текущая масса используется для динамических расчётов)
 		currentMass := s.DryMass + s.FuelMass
-		// 1. Вычисляем гравитацию на текущей высоте
-		rawGravity := calcGravityAtAltitude(s.Altitude)
+		s.TotalMass = currentMass
 
-		// 2. Центростремительное ускорение (если есть горизонтальная скорость)
+		// 4. Гравитация и центростремительное ускорение
+		rawGravity := utils.CalcGravityAtAltitude(s.Altitude)
 		radius := orbit.EarthRadius + s.Altitude
 		centripetalAccel := (s.HorizontalVelocity * s.HorizontalVelocity) / radius
-
-		// 3. Эффективная гравитация: "чистая" сила, которую ещё надо компенсировать
 		effectiveGravity := rawGravity - centripetalAccel
-
-		// 4. Обнулим при отрицательных значениях (иначе ракета "вылетит в космос")
 		if effectiveGravity < 0 {
 			effectiveGravity = 0
 		}
-
-		// 5. Запоминаем в симуляцию и считаем силу тяжести
 		s.Gravity = effectiveGravity
 		gravityForce := currentMass * s.Gravity
 
-		// Получаем текущий pitch
-		pitch := orbit.ComputePitchSmart(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity, s.LastAccelVertical, s.LastAccelHorizontal, orbit.OrbitLEO) //s.VerticalVelocity
+		// 5. Определяем текущий угол pitch
+		pitch := guidance.ComputePitchAuto(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity)
 		pitchRad := pitch * math.Pi / 180
 
-		// 5. Разложим тягу по осям
-		thrustX := thrust * math.Cos(pitchRad)
-		thrustY := thrust * math.Sin(pitchRad)
+		// 6. Расчёт суммарной тяги по всем работающим двигателям
+		totalThrust := TotalThrust(s.Engines)
+		thrustX := totalThrust * math.Cos(pitchRad)
+		thrustY := totalThrust * math.Sin(pitchRad)
 
-		// 6. Сопротивление воздуха
+		// 7. Аэродинамические силы
 		airDensity := CalcAirDensityUSSA(s.Altitude)
 		totalVelocity := math.Hypot(s.HorizontalVelocity, s.VerticalVelocity)
-		totalvelocityRel := math.Hypot(s.HorizontalVelocity-orbit.EarthRotationSpeedAtLatitude(s.Lat), s.VerticalVelocity)
-		cD := utils.CdByVelocity(totalvelocityRel, CalcEffectiveAmbientTemp(s.Altitude))
+		// Используем ранее вычисленную эффективную температуру
+		cD := utils.CdByVelocity(totalVelocity, effectiveAmbientTemp)
+		targetDrag := 0.5 * cD * airDensity * totalVelocity * totalVelocity * s.Area
+		// Сглаживаем изменение drag для избежания резких скачков
+		s.LastDrag += (targetDrag - s.LastDrag) * smoothingFactor
+		dragForce := s.LastDrag
 
-		targetDrag := 0.5 * cD * airDensity * totalvelocityRel * totalvelocityRel * s.Area
-		s.LastDrag += (targetDrag - s.LastDrag) * 1
-		drag := s.LastDrag
-
-		// 7. Направление drag — противоположно вектору скорости
 		var unitX, unitY float64
 		if totalVelocity > 0 {
 			unitX = s.HorizontalVelocity / totalVelocity
 			unitY = s.VerticalVelocity / totalVelocity
 		}
-		dragX := -drag * unitX
-		dragY := -drag * unitY
+		dragX := -dragForce * unitX
+		dragY := -dragForce * unitY
 
-		// 8. Суммарные силы
+		// 8. Суммарная сила и вычисление ускорений
 		forceX := thrustX + dragX
 		forceY := thrustY + dragY - gravityForce
-
-		// 9. Ускорения по осям (сырые)
 		rawAccelHorizontal := forceX / currentMass
 		rawAccelVertical := forceY / currentMass
+		s.LastAccelHorizontal = rawAccelHorizontal
+		s.LastAccelVertical = rawAccelVertical
 
-		accelVertical := rawAccelVertical
-		accelHorizontal := rawAccelHorizontal
+		// 9. Интегрирование скорости
+		s.HorizontalVelocity += rawAccelHorizontal * deltaT
+		s.VerticalVelocity += rawAccelVertical * deltaT
 
-		s.LastAccelVertical = accelVertical
-		s.LastAccelHorizontal = accelHorizontal
-
-		// 10. Обновляем скорости
-		s.VerticalVelocity += accelVertical * deltaT
-		s.HorizontalVelocity += accelHorizontal * deltaT
-
-		// 11. Обновляем высоту
+		// 10. Интегрирование положения (высоты)
 		s.Altitude += s.VerticalVelocity * deltaT
 		if s.Altitude < 0 {
 			s.Altitude = 0
@@ -239,65 +245,57 @@ func (s *Simulation) Run() {
 			}
 		}
 
-		newThrottle := orbit.ComputeThrottle(s.HorizontalVelocity, s.LastAccelHorizontal, s.VerticalVelocity, s.LastAccelVertical, s.Altitude, pitch, utils.CalculateTWR(thrust, s.TotalMass, s.Gravity), 7670.0, 1)
-		orbit.CurrentThrottle = newThrottle
+		// Вычисляем новый throttle через Guidance
+		//twr := totalThrust / (currentMass * s.Gravity)
+		//newThrottle := guidance.ComputeThrottle(
+		//	s.HorizontalVelocity, s.LastAccelHorizontal,
+		//	s.VerticalVelocity, s.LastAccelVertical,
+		//	s.Altitude, pitch,
+		//	twr, 7670.0, 1.0,
+		//)
+		newThrottle := guidance.ComputeThrottle(
+			s.HorizontalVelocity,
+			s.VerticalVelocity,
+			s.Altitude, 1.0,
+		)
+		// Применяем throttle к работающим двигателям
 		for i, engine := range s.Engines {
 			if engine.Running {
-				// Линейная интерполяция между MinThrust и MaxThrust по throttle
 				thrustNew := engine.MinThrust + newThrottle*(engine.MaxThrust-engine.MinThrust)
-
-				// Обновляем значение в массиве
-				s.Engines[i].Thrust = math.Max(engine.MinThrust, math.Min(thrustNew, engine.MaxThrust))
+				if !stagesSeparated {
+					s.Engines[i].Thrust = AdjustThrustByAltitude(s.Altitude)
+				} else {
+					s.Engines[i].Thrust = math.Max(engine.MinThrust, math.Min(thrustNew, engine.MaxThrust))
+				}
 			}
 		}
 
-		//if ShouldSECO(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity) {
-		//	for i, engine := range s.Engines {
-		//		if engine.Running {
-		//			s.Engines[i].Running = false
-		//		}
-		//	} // SECO
-		//}
+		// Обновляем позицию (latitude и longitude)
+		s.Lat, s.Lon = orbit.GuidanceUpdatePosition(s.Lat, s.Lon, totalVelocity, pitch, s.Heading)
 
-		s.Lat, s.Lon = orbit.GuidanceUpdatePosition(s.Lat, s.Lon, math.Hypot(s.HorizontalVelocity, s.VerticalVelocity), pitch, s.Heading)
-
-		thrustPerEngine := AdjustThrustByAltitude(s.Altitude)
-		for i, engine := range s.Engines {
-			if engine.Running && !stagesSeparated {
-				engine.Thrust = thrustPerEngine
-				s.Engines[i] = engine
-			}
-		}
-
-		//fmt.Printf("alt=%.0f pitch=%.1f vx=%.1f vy=%.1f aX=%.2f aY=%.2f\n",
-		//	s.Altitude, pitch, s.HorizontalVelocity, s.VerticalVelocity,
-		//	accelHorizontal, accelVertical)
-
-		//stage separation
+		// 13. Обработка событий отделения ступеней и сброса носового обтекателя
 		if timeV+1 >= 180 && !stagesSeparated {
 			stagesSeparated = true
+			// Обновление параметров после отделения
 			s.DryMass = 7300
 			s.FuelMass = 107670
 			s.TotalMass = s.DryMass + s.FuelMass
-			enabled := false
 
+			var engineEnabled bool
 			for i := range s.Engines {
 				if s.Engines[i].Running {
-					if !enabled {
-						// Оставляем включённым и задаём параметры
+					if !engineEnabled {
+						// Оставляем один двигатель работающим с новыми параметрами
 						s.Engines[i].ISP = 348
 						s.Engines[i].Thrust = 981000
 						s.Engines[i].MaxThrust = 981000 + 500
-						enabled = true
+						engineEnabled = true
 					} else {
-						// Выключаем лишние
 						s.Engines[i].Running = false
 					}
 				}
 			}
-
-			// Если все были выключены — включаем один и задаём параметры
-			if !enabled && len(s.Engines) > 0 {
+			if !engineEnabled && len(s.Engines) > 0 {
 				s.Engines[0].Running = true
 				s.Engines[0].ISP = 348
 				s.Engines[0].Thrust = 981000
@@ -308,17 +306,18 @@ func (s *Simulation) Run() {
 
 		if timeV+1 >= 195 && !noseFairingDestack {
 			noseFairingDestack = true
-			s.DryMass = s.DryMass - 1750
+			s.DryMass -= 1750
+			s.TotalMass = s.DryMass + s.FuelMass
 			fmt.Println("Nose fairing was destacked!")
 		}
 
-		// Расход топлива
+		// 14. Расход топлива
 		var totalFuelUsed float64
 		for i, engine := range s.Engines {
-			engine.ISP = calculateISP(s.Altitude)
-			s.Engines[i] = engine
+			// Обновляем ISP для двигателя с учетом высоты
+			s.Engines[i].ISP = calculateISP(s.Altitude)
 			if engine.Running {
-				massFlow := calculateMassFlow(engine, s.Gravity) // кг/с
+				massFlow := calculateMassFlow(engine, s.Gravity)
 				totalFuelUsed += massFlow
 			}
 		}
@@ -326,9 +325,11 @@ func (s *Simulation) Run() {
 			totalFuelUsed = s.FuelMass
 		}
 		s.FuelMass -= totalFuelUsed
+		// Обновляем общую массу после сжигания топлива
+		currentMass = s.DryMass + s.FuelMass
+		s.TotalMass = currentMass
 
-		running := runningEngines(s.Engines)
-		// Случайные аварии
+		// 15. Случайные аварии (если запущено достаточно двигателей и до отделения ступеней)
 		if s.rng.Float64() < 0.00015 && runningEngines(s.Engines) >= 7 && !stagesSeparated {
 			randomIndex := s.rng.Intn(len(s.Engines))
 			s.Engines[randomIndex].Running = false
@@ -336,17 +337,27 @@ func (s *Simulation) Run() {
 			balanceEngines(s.Engines, randomIndex, s.rng)
 		}
 
-		// Отправка метрик
-		metrics.SendBasicMetrics(s.Altitude, s.VerticalVelocity, s.HorizontalVelocity, accelHorizontal, accelVertical, currentMass, drag, airDensity, running, effectiveAmbientTemp, pitch, s.Gravity, TotalThrust(s.Engines), timeV, s.Lat, s.Lon)
+		// 16. Отправка метрик и обновление теплового состояния двигателей
+		metrics.SendBasicMetrics(
+			s.Altitude, s.VerticalVelocity, s.HorizontalVelocity,
+			rawAccelHorizontal, rawAccelVertical, currentMass,
+			dragForce, airDensity, runningEngines(s.Engines),
+			effectiveAmbientTemp, pitch, s.Gravity,
+			totalThrust, timeV, s.Lat, s.Lon,
+		)
 		for idx, engine := range s.Engines {
-			s.Engines[idx].UpdateThermalState(s.Dt, effectiveAmbientTemp, s.Cp, s.MChamber, s.QFactor, s.CoolingCoeff, s.CoolingTimeConstant, airDensity, totalVelocity, 0.5)
+			s.Engines[idx].UpdateThermalState(s.Dt, effectiveAmbientTemp, s.Cp, s.MChamber, s.QFactor,
+				s.CoolingCoeff, s.CoolingTimeConstant, airDensity, totalVelocity, 0.5)
 			engineID := fmt.Sprintf("%d", idx+1)
 			if engine.Running {
-				metrics.SetEngineThrust(engineID, engine.Thrust, engine.ISP, engine.ChamberTemp, engine.NozzleTemp, engine.WallTemp, engine.TurbineTemp)
+				metrics.SetEngineThrust(engineID, engine.Thrust, engine.ISP,
+					engine.ChamberTemp, engine.NozzleTemp, engine.WallTemp, engine.TurbineTemp)
 			} else {
-				metrics.SetEngineThrust(engineID, 0, engine.ISP, engine.ChamberTemp, engine.NozzleTemp, engine.WallTemp, engine.TurbineTemp)
+				metrics.SetEngineThrust(engineID, 0, engine.ISP,
+					engine.ChamberTemp, engine.NozzleTemp, engine.WallTemp, engine.TurbineTemp)
 			}
 		}
+
 		timeV++
 		s.mu.Unlock()
 
@@ -382,15 +393,6 @@ func calcEffectiveAmbientTemp(altitude, seaLevelTemp float64) float64 {
 		t = -273.15
 	}
 	return t
-}
-
-func calcGravityAtAltitude(altitude float64) float64 {
-	const (
-		g0 = 9.80665   // гравитация на уровне моря (м/с²)
-		R  = 6371000.0 // радиус Земли в метрах
-	)
-
-	return g0 * (R / (R + altitude)) * (R / (R + altitude))
 }
 
 // Табличные значения из USSA-76 (высота в м, температура в К, плотность в кг/м³)
