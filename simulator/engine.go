@@ -9,6 +9,7 @@ import (
 type Engine struct {
 	Thrust, MaxThrust, MinThrust float64
 	ISP                          float64 // Удельный импульс (сек)
+	MaxIsp                       float64 // Max Удельный импульс (сек)
 	Running                      bool
 	X, Y                         float64
 	ChamberTemp                  float64
@@ -28,6 +29,7 @@ func initEngines(count int, thrustPerEngine float64, radius float64, ambientTemp
 			MaxThrust: thrustPerEngine + 500,
 			MinThrust: 1000,
 			ISP:       282.0,
+			MaxIsp:    311.0,
 			Running:   true,
 			X:         math.Cos(angle) * radius,
 			Y:         math.Sin(angle) * radius,

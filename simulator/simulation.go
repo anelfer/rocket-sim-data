@@ -151,7 +151,7 @@ func (s *Simulation) Run() {
 				}
 			}
 			// Можно выполнить балансировку один раз (если balanceEngines умеет обрабатывать группу)
-			balanceEngines(s.Engines, -1, s.rng)
+			//balanceEngines(s.Engines, -1, s.rng)
 		} else if s.FuelMass < lowFuelThreshold {
 			// При низком топливе — возможны непредвиденные ситуации у работающих двигателей
 			for idx, engine := range s.Engines {
@@ -246,18 +246,18 @@ func (s *Simulation) Run() {
 		}
 
 		// Вычисляем новый throttle через Guidance
-		//twr := totalThrust / (currentMass * s.Gravity)
-		//newThrottle := guidance.ComputeThrottle(
-		//	s.HorizontalVelocity, s.LastAccelHorizontal,
-		//	s.VerticalVelocity, s.LastAccelVertical,
-		//	s.Altitude, pitch,
-		//	twr, 7670.0, 1.0,
-		//)
+		twr := totalThrust / (currentMass * s.Gravity)
 		newThrottle := guidance.ComputeThrottle(
-			s.HorizontalVelocity,
-			s.VerticalVelocity,
-			s.Altitude, 1.0,
+			s.HorizontalVelocity, s.LastAccelHorizontal,
+			s.VerticalVelocity, s.LastAccelVertical,
+			s.Altitude, pitch,
+			twr, 7670.0, 1.0,
 		)
+		//newThrottle := guidance.ComputeThrottle(
+		//	s.HorizontalVelocity,
+		//	s.VerticalVelocity,
+		//	s.Altitude, 1.0,
+		//)
 		// Применяем throttle к работающим двигателям
 		for i, engine := range s.Engines {
 			if engine.Running {
@@ -274,7 +274,7 @@ func (s *Simulation) Run() {
 		s.Lat, s.Lon = orbit.GuidanceUpdatePosition(s.Lat, s.Lon, totalVelocity, pitch, s.Heading)
 
 		// 13. Обработка событий отделения ступеней и сброса носового обтекателя
-		if timeV+1 >= 180 && !stagesSeparated {
+		if timeV+1 >= 174 && !stagesSeparated {
 			stagesSeparated = true
 			// Обновление параметров после отделения
 			s.DryMass = 7300
@@ -298,6 +298,7 @@ func (s *Simulation) Run() {
 			if !engineEnabled && len(s.Engines) > 0 {
 				s.Engines[0].Running = true
 				s.Engines[0].ISP = 348
+				s.Engines[0].MaxIsp = 348
 				s.Engines[0].Thrust = 981000
 				s.Engines[0].MaxThrust = 981000 + 500
 			}
@@ -315,9 +316,9 @@ func (s *Simulation) Run() {
 		var totalFuelUsed float64
 		for i, engine := range s.Engines {
 			// Обновляем ISP для двигателя с учетом высоты
-			s.Engines[i].ISP = calculateISP(s.Altitude)
+			s.Engines[i].ISP = calculateISP(s.Altitude, s.Engines[i].MaxIsp)
 			if engine.Running {
-				massFlow := calculateMassFlow(engine, s.Gravity)
+				massFlow := calculateMassFlow(engine)
 				totalFuelUsed += massFlow
 			}
 		}
@@ -477,16 +478,15 @@ func DragForce(altitude, velocity, area float64) float64 {
 	return 0.5 * Cd * rho * velocity * velocity * area
 }
 
-func calculateMassFlow(engine Engine, gravity float64) float64 {
+func calculateMassFlow(engine Engine) float64 {
 	if !engine.Running || engine.ISP <= 0 {
 		return 0
 	}
-	return engine.Thrust / (engine.ISP * gravity)
+	return engine.Thrust / (engine.ISP * utils.G0)
 }
 
-func calculateISP(altitude float64) float64 {
+func calculateISP(altitude, maxISP float64) float64 {
 	const ISP_sea = 282.0 // для Merlin Vacuum на старте
-	const ISP_vac = 311.0 // в вакууме
 	const h_max = 77000.0 // после этой высоты считаем ISP = ISP_vac
 
 	// clamp значение от 0 до 1
@@ -497,66 +497,7 @@ func calculateISP(altitude float64) float64 {
 		ratio = 0
 	}
 
-	return ISP_sea + (ISP_vac-ISP_sea)*ratio
-}
-
-// Реалистичный расчёт maxJerk в м/с³
-func CalculateMaxJerk(thrust float64, mass float64, altitude float64) float64 {
-	// 1. Получаем плотность атмосферы
-	airDensity := CalcAirDensityUSSA(altitude)
-
-	// 2. Время отклика системы управления тягой
-	// Чем больше плотность — тем медленнее реакция
-	tau := 0.2 + 5.0*(airDensity/1.225) // от ~0.2с в вакууме до ~5.2с на уровне моря
-
-	// 3. Вычисляем максимально допустимый jerk
-	maxJerk := thrust / (mass * tau)
-
-	return maxJerk
-}
-
-func limitAcceleration(prevAccel, targetAccel, deltaT, maxJerk float64) float64 {
-	deltaA := targetAccel - prevAccel
-	maxDeltaA := maxJerk * deltaT
-
-	if deltaA > maxDeltaA {
-		return prevAccel + maxDeltaA
-	} else if deltaA < -maxDeltaA {
-		return prevAccel - maxDeltaA
-	}
-	return targetAccel
-}
-
-func getAccelResponseFactor(mass, area, Cd, altitude, throttleResponse, deltaT float64) float64 {
-	// 1. Плотность воздуха
-	rho := CalcAirDensityUSSA(altitude) // кг/м³
-
-	// 2. Аэродинамическое демпфирование
-	// F_drag ≈ 0.5 * rho * V² * Cd * A
-	// τ_аэро ~ масса / (0.5 * rho * Cd * A)
-	// пусть V = 1 м/с для нормализации (мы хотим коэффициент)
-	tauAero := mass / (0.5*rho*Cd*area + 1e-5) // +ε чтобы не делить на 0
-
-	// 3. Время отклика двигателя (сек)
-	tauEngine := throttleResponse // обычно 0.1–0.5 сек
-
-	// 4. Примерная задержка конструкции (структура) — эмпирически
-	tauStruct := 0.05 // можно сделать параметром
-
-	// 5. Итоговая tau — реакция всей системы
-	tau := tauAero + tauEngine + tauStruct
-
-	// 6. alpha = Δt / τ
-	alpha := deltaT / tau
-
-	// Ограничим alpha
-	if alpha > 0.25 {
-		alpha = 0.25
-	}
-	if alpha < 0.005 {
-		alpha = 0.005
-	}
-	return alpha
+	return ISP_sea + (maxISP-ISP_sea)*ratio
 }
 
 func AdjustThrustByAltitude(alt float64) float64 {

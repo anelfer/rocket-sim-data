@@ -1,6 +1,7 @@
 package orbit
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -61,6 +62,7 @@ func calcGravityAtAltitude(altitude float64) float64 {
 func (g *GuidanceState) ComputePitchAuto(
 	altitude, vVertical, vHorizontal float64,
 ) float64 {
+	fmt.Printf("altitude: %f, vVertical: %f, vHorizontal: %f\n", altitude, vVertical, vHorizontal)
 	// Для очень низкой высоты (например, ниже 500 м) сохраняем вертикальный взлёт.
 	minimalTurnAlt := 500.0 // порог в метрах
 	if altitude < minimalTurnAlt {
@@ -73,8 +75,8 @@ func (g *GuidanceState) ComputePitchAuto(
 
 	// Контроллер PD: задаёт желаемый угол на основе ошибки и вертикальной скорости.
 	// Коэффициенты (k_p, k_d) подбираются экспериментально.
-	k_p := 0.00005 // [°/м]
-	k_d := 0.08    // [°/(м/с)]
+	k_p := 0.0001 // [°/м]
+	k_d := 0.05   // [°/(м/с)]
 	desiredAngle := k_p*altError - k_d*vVertical
 
 	// Если горизонтальная скорость низкая, ракета ещё не готова к орбитальному полёту:
@@ -83,6 +85,9 @@ func (g *GuidanceState) ComputePitchAuto(
 	minTargetPitch := 10.0 // минимальный угол при достижении орбитальной скорости.
 	// Плавно смешиваем желаемый угол с минимальным уголом по мере роста горизонтальной скорости.
 	targetPitch := (1-ratio)*desiredAngle + ratio*minTargetPitch
+
+	//fmt.Printf("altError: %f, desiredAngle: %f, ratio: %f, targetPitch: %f, CurrentPitch: %f\n",
+	//	altError, desiredAngle, ratio, targetPitch, g.CurrentPitch)
 
 	// Ограничиваем целевой угол в допустимых пределах.
 	if targetPitch > 90 {
