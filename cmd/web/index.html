@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пульт управления симулятором</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ===================== Верхняя панель ===================== -->
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">▲</span>
+    <span class="brand-text">Пульт управления</span>
+  </div>
+
+  <div class="run-controls">
+    <label class="speed">
+      Носитель
+      <select id="profile"></select>
+    </label>
+    <label class="speed" title="Куда выводить: на замкнутую орбиту или по трансатмосферной траектории">
+      Задание
+      <select id="mission"></select>
+    </label>
+    <span class="sep"></span>
+    <button id="btn-start"     class="btn btn-go"    data-key="1">Start</button>
+    <button id="btn-pause"     class="btn"           data-key="2">Pause</button>
+    <button id="btn-resume"    class="btn"           data-key="3">Resume</button>
+    <button id="btn-step"      class="btn"           data-key="4">Step</button>
+    <button id="btn-stop"      class="btn">Stop</button>
+    <button id="btn-reset"     class="btn">Reset</button>
+    <span class="sep"></span>
+    <label class="speed">
+      Скорость
+      <select id="speed"></select>
+    </label>
+    <span class="sep"></span>
+    <button id="btn-nominal"   class="btn btn-warn">Штатный режим</button>
+    <button id="btn-ignite"    class="btn btn-go" title="Запустить все камеры активной ступени в обход наведения — тягу задайте отдельно ползунком «Тяга двигательной установки»">Зажечь двигатели</button>
+    <button id="btn-emergency" class="btn btn-crit" title="Погасить все камеры и обнулить уставку тяги">Погасить все двигатели</button>
+  </div>
+
+  <div class="status-strip">
+    <div class="stat"><span class="stat-label">Модельное время</span><span class="stat-value" id="stat-model">—</span></div>
+    <div class="stat"><span class="stat-label">Реальное</span><span class="stat-value" id="stat-real">—</span></div>
+    <div class="stat"><span class="stat-label">Состояние</span><span class="stat-value" id="stat-state">—</span></div>
+    <div class="stat"><span class="stat-label">Фаза</span><span class="stat-value" id="stat-phase">—</span></div>
+    <div class="stat"><span class="stat-label">Прогон</span><span class="stat-value" id="stat-run">—</span></div>
+    <div class="stat"><span class="stat-label">Сценарий</span><span class="stat-value" id="stat-scenario">—</span></div>
+    <div class="stat"><span class="stat-label">Связь</span><span class="stat-value" id="stat-link">нет</span></div>
+    <div class="stat"><span class="stat-label">Задержка</span><span class="stat-value" id="stat-latency">—</span></div>
+  </div>
+
+  <div class="mode-strip">
+    <label class="toggle toggle-unsafe">
+      <input type="checkbox" id="mode-unsafe">
+      <span>Unsafe overrides</span>
+    </label>
+    <label class="toggle toggle-direct">
+      <input type="checkbox" id="mode-direct">
+      <span>Direct state override</span>
+    </label>
+  </div>
+</header>
+
+<div id="mode-banner" class="hidden"></div>
+<div id="flight-banner" class="hidden"></div>
+
+<!-- ===================== Три области ===================== -->
+<main id="layout">
+
+  <!-- ---------- Левая панель: управление ---------- -->
+  <section id="panel-control" class="pane">
+    <div class="pane-head">
+      <h2>Управление</h2>
+      <input type="search" id="param-filter" placeholder="Поиск параметра…">
+    </div>
+
+    <nav id="subsystem-tabs" class="tabs"></nav>
+
+    <div id="quick-actions" class="quick-block"></div>
+
+    <div id="param-list" class="scroll"></div>
+  </section>
+
+  <!-- ---------- Центр: состояние системы ---------- -->
+  <section id="panel-state" class="pane">
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Блок двигателей</h2>
+        <span class="hint">У каждого двигателя свой турбонасос: команду можно адресовать одному агрегату</span>
+      </div>
+      <div id="engine-strip" class="engine-strip"></div>
+    </div>
+
+    <div class="card card-accent" id="throttle-card">
+      <div class="card-head">
+        <h2>Тяга двигательной установки</h2>
+        <span class="hint">Ползунок задаёт уровень тяги всей ступени. Пока он не тронут, тягой распоряжается наведение</span>
+      </div>
+      <div id="throttle-panel" class="throttle-panel"></div>
+    </div>
+
+    <div id="pump-experiment" class="card card-accent">
+      <div class="card-head">
+        <h2>Быстрый эксперимент с турбонасосным агрегатом</h2>
+        <label class="target">
+          Адресат
+          <select id="engine-target"></select>
+        </label>
+      </div>
+      <div class="hint" id="target-hint">
+        Внутри агрегата вал общий: насосы горючего и окислителя сидят на одном
+        валу, и раскрутить их порознь физически нельзя.
+      </div>
+      <div id="pump-grid" class="pump-grid"></div>
+      <div id="pump-buttons" class="pump-buttons"></div>
+    </div>
+
+    <div class="row">
+      <div class="card attitude">
+        <div class="card-head">
+          <h2>Ориентация корпуса</h2>
+          <label class="check">
+            <input type="checkbox" id="att-flow" checked> Поток
+          </label>
+        </div>
+        <canvas id="attitude-canvas"></canvas>
+        <div id="attitude-values" class="att-values"></div>
+      </div>
+
+      <div class="card grow">
+        <div class="card-head"><h2>Ключевые показатели</h2></div>
+        <div id="key-values" class="kv-grid"></div>
+      </div>
+      <div class="card alarms">
+        <div class="card-head"><h2>Предупреждения</h2></div>
+        <div id="alarm-list" class="alarm-list"><div class="muted">Нет отклонений</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Отклик модели на воздействие</h2>
+        <span class="hint">Показаны только те величины, которые действительно изменились в симуляции</span>
+      </div>
+      <div id="causal" class="causal"><div class="muted">Воздействий не было</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Активные воздействия</h2>
+        <button id="btn-release-all" class="btn btn-sm">Снять все</button>
+      </div>
+      <div id="effects" class="effects"><div class="muted">Все параметры под управлением модели</div></div>
+    </div>
+
+  </section>
+
+  <!-- ---------- Правая панель: графики и журналы ---------- -->
+  <section id="panel-data" class="pane">
+    <nav class="tabs" id="data-tabs">
+      <button class="tab active" data-view="charts">Графики</button>
+      <button class="tab" data-view="cutaway">Развёртка</button>
+      <button class="tab" data-view="entry">Вход в атмосферу</button>
+      <button class="tab" data-view="scene">3D</button>
+      <button class="tab" data-view="compare">Сравнение</button>
+      <button class="tab" data-view="log">Журнал</button>
+      <button class="tab" data-view="scenario">Сценарии</button>
+      <button class="tab" data-view="grafana">Grafana</button>
+    </nav>
+
+    <!-- Графики -->
+    <div class="view active" id="view-charts">
+      <div class="view-head">
+        <label class="check"><input type="checkbox" id="chart-follow" checked> Следить за концом</label>
+        <select id="chart-window">
+          <option value="60">60 с</option>
+          <option value="120" selected>120 с</option>
+          <option value="300">300 с</option>
+          <option value="0">Весь прогон</option>
+        </select>
+        <button id="btn-baseline" class="btn btn-sm">Set baseline</button>
+      </div>
+      <div id="charts" class="charts scroll"></div>
+    </div>
+
+    <!-- Развёртка носителя -->
+    <div class="view" id="view-cutaway">
+      <div class="view-head">
+        <span id="cutaway-title" class="muted">Носитель не выбран</span>
+        <label class="check"><input type="checkbox" id="cutaway-labels" checked> Выноски</label>
+        <label class="check"><input type="checkbox" id="cutaway-engines" checked> Вид с торца</label>
+        <label class="check">Масштаб
+          <input type="range" id="cutaway-zoom" min="0.6" max="3" step="0.1" value="1">
+          <span id="cutaway-zoom-value" class="muted">100 %</span>
+        </label>
+      </div>
+      <div id="cutaway" class="cutaway scroll"></div>
+      <div id="cutaway-detail" class="cutaway-detail muted">
+        Наведите на отсек или двигатель, чтобы увидеть его состояние.
+      </div>
+    </div>
+
+    <!-- Вход в атмосферу -->
+    <div class="view" id="view-entry">
+      <div class="view-head">
+        <button id="btn-entry" class="btn btn-sm btn-warn">Сход с орбиты</button>
+        <button id="btn-land" class="btn btn-sm btn-crit">Начать посадку</button>
+        <button id="btn-flaps-deploy" class="btn btn-sm">Выпустить плавники</button>
+        <button id="btn-flaps-auto" class="btn btn-sm">Всё на автомат</button>
+        <span id="entry-state" class="muted">Корабль на выведении</span>
+      </div>
+      <div id="entry-panel" class="entry-panel scroll"></div>
+    </div>
+
+    <!-- Трёхмерная сцена -->
+    <div class="view" id="view-scene">
+      <div class="view-head">
+        <button id="scene-reset" class="btn btn-sm">Сброс камеры</button>
+        <label class="check" title="Камера держится за корпус: корабль стоит на месте, поворачивается мир"><input type="checkbox" id="scene-body" checked> По корпусу</label>
+        <label class="check" title="Камера встаёт так, чтобы поток шёл слева направо"><input type="checkbox" id="scene-follow"> По потоку</label>
+        <label class="check"><input type="checkbox" id="scene-flow" checked> Стрелки</label>
+        <label class="check"><input type="checkbox" id="scene-grid" checked> Земля</label>
+        <span class="muted">Тяните мышью — камера, колесо — приближение</span>
+      </div>
+      <div id="scene-wrap" class="scene-wrap">
+        <canvas id="scene-canvas" class="scene-canvas"></canvas>
+        <canvas id="scene-globe" class="scene-globe" width="180" height="180"></canvas>
+      </div>
+    </div>
+
+    <!-- Сравнение -->
+    <div class="view" id="view-compare">
+      <div class="view-head">
+        <span id="baseline-label" class="muted">Эталон не задан</span>
+        <button id="btn-refresh-compare" class="btn btn-sm">Обновить</button>
+      </div>
+      <div id="compare-table" class="scroll"></div>
+    </div>
+
+    <!-- Журнал -->
+    <div class="view" id="view-log">
+      <div class="view-head">
+        <input type="search" id="log-filter" placeholder="Фильтр по параметру или оператору…">
+        <select id="log-status">
+          <option value="">Все статусы</option>
+          <option value="applied">Applied</option>
+          <option value="rejected">Rejected</option>
+          <option value="released">Released</option>
+        </select>
+        <button id="btn-export-log" class="btn btn-sm">Экспорт</button>
+      </div>
+      <div id="log-table" class="scroll"></div>
+    </div>
+
+    <!-- Сценарии -->
+    <div class="view" id="view-scenario">
+      <div class="view-head">
+        <select id="scenario-select"></select>
+        <button id="btn-scenario-run"  class="btn btn-sm btn-go">Запустить</button>
+        <button id="btn-scenario-stop" class="btn btn-sm">Остановить</button>
+        <button id="btn-scenario-new"  class="btn btn-sm">Новый</button>
+        <button id="btn-scenario-copy" class="btn btn-sm">Копия</button>
+        <button id="btn-scenario-del"  class="btn btn-sm">Удалить</button>
+        <button id="btn-scenario-exp"  class="btn btn-sm">Экспорт</button>
+        <label class="btn btn-sm file">Импорт<input type="file" id="scenario-import" accept=".json" hidden></label>
+      </div>
+      <div class="scroll">
+        <div class="scenario-meta">
+          <label>Название <input type="text" id="scenario-name"></label>
+          <span id="scenario-progress" class="muted"></span>
+        </div>
+        <div id="scenario-steps"></div>
+        <button id="btn-step-add" class="btn btn-sm">Добавить шаг</button>
+      </div>
+    </div>
+
+    <!-- Grafana -->
+    <div class="view" id="view-grafana">
+      <div class="view-head">
+        <input type="text" id="grafana-url" placeholder="http://localhost:3000">
+        <button id="btn-grafana-open" class="btn btn-sm">Открыть дашборд</button>
+      </div>
+      <iframe id="grafana-frame" title="Grafana"></iframe>
+    </div>
+  </section>
+</main>
+
+<!-- ===================== Подтверждение опасной команды ===================== -->
+<div id="confirm" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="confirm-title">Подтверждение</h3>
+    <p id="confirm-text"></p>
+    <div id="confirm-consequence" class="consequence"></div>
+    <div class="modal-actions">
+      <button id="confirm-cancel" class="btn">Отмена</button>
+      <button id="confirm-ok" class="btn btn-crit">Применить</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="app.js"></script>
+<script src="scene3d.js"></script>
+</body>
+</html>

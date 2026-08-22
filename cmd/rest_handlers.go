@@ -2,169 +2,170 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/gorilla/mux"
+
 	"rocketTelemetrySim/simulator"
 )
 
-// simulationStartChan – канал для команды запуска симуляции
+// simulationStartChan — канал команды запуска симуляции.
 var simulationStartChan = make(chan bool, 1)
 
 func startRESTServer() {
 	router := mux.NewRouter()
-	router.HandleFunc("/simulation/start", startSimulationHandler).Methods("POST", "OPTIONS")
-	router.HandleFunc("/simulation/data", getSimulationDataHandler).Methods("GET")
-	router.HandleFunc("/engines", getEnginesHandler).Methods("GET")
-	router.HandleFunc("/engines/stop", updateEngineHandler).Methods("POST", "OPTIONS")
-	router.HandleFunc("/engines/start", updateEngineHandler).Methods("POST", "OPTIONS")
-	router.HandleFunc("/engines/{id}", updateEngineHandler).Methods("PUT", "OPTIONS")
-	router.HandleFunc("/simulation/separation", separationHandler).Methods("POST", "OPTIONS")
+	router.Use(corsMiddleware)
+
+	router.HandleFunc("/simulation/start", startSimulationHandler).Methods(http.MethodPost, http.MethodOptions)
+	router.HandleFunc("/simulation/stop", stopSimulationHandler).Methods(http.MethodPost, http.MethodOptions)
+	router.HandleFunc("/simulation/data", getSimulationDataHandler).Methods(http.MethodGet, http.MethodOptions)
+	router.HandleFunc("/simulation/separation", separationHandler).Methods(http.MethodPost, http.MethodOptions)
+	router.HandleFunc("/engines", getEnginesHandler).Methods(http.MethodGet, http.MethodOptions)
+	router.HandleFunc("/engines/stop", stopEnginesHandler).Methods(http.MethodPost, http.MethodOptions)
+	router.HandleFunc("/engines/start", startEnginesHandler).Methods(http.MethodPost, http.MethodOptions)
+	router.HandleFunc("/engines/{id}", updateEngineHandler).Methods(http.MethodPut, http.MethodOptions)
+
+	// Пульт ручного управления: реестр параметров, приём команд, журнал
+	// и поток телеметрии.
+	registerControlRoutes(router)
+
+	// Веб-интерфейс центра управления.
+	registerUIRoutes(router)
 
 	log.Println("REST API server running on port 8087")
 	log.Fatal(http.ListenAndServe(":8087", router))
 }
 
-func getEnginesHandler(w http.ResponseWriter, r *http.Request) {
-	// Добавляем CORS-заголовки
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+// corsMiddleware добавляет заголовки CORS и отвечает на preflight-запросы.
+// Раньше эти пять строк были скопированы в каждый обработчик.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
-	engines := make([]simulator.Engine, 1)
-	if simulator.CurrentSimulation != nil {
-		engines = simulator.CurrentSimulation.Engines
+// requireSimulation возвращает активную симуляцию или отвечает 503.
+// Прежние обработчики разыменовывали глобальную переменную без проверки —
+// запрос до старта симуляции ронял процесс.
+func requireSimulation(w http.ResponseWriter) (*simulator.Simulation, bool) {
+	sim := simulator.GetCurrentSimulation()
+	if sim == nil {
+		http.Error(w, "simulation is not running", http.StatusServiceUnavailable)
+		return nil, false
 	}
+	return sim, true
+}
+
+func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(engines); err != nil {
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
 func startSimulationHandler(w http.ResponseWriter, r *http.Request) {
-	// Добавляем CORS-заголовки
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-	// Обработка предварительного запроса CORS
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+	// Идущий прогон останавливается: без этого команда старта легла бы
+	// в буфер канала и сработала бы неизвестно когда — либо не сработала
+	// вовсе. Для оператора это выглядело как зависший интерфейс.
+	stopRunningSimulation()
 
 	select {
 	case simulationStartChan <- true:
-		simulator.CurrentSimulation.Reset() // Например, сброс состояния симуляции
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintln(w, "Simulation start command accepted")
+		writeJSON(w, map[string]string{"status": "starting"})
 	default:
-		http.Error(w, "Simulation already running or start command already issued", http.StatusConflict)
+		http.Error(w, "команда старта уже принята и ещё не обработана",
+			http.StatusConflict)
 	}
 }
 
+func stopSimulationHandler(w http.ResponseWriter, r *http.Request) {
+	sim, ok := requireSimulation(w)
+	if !ok {
+		return
+	}
+	sim.Stop()
+	writeJSON(w, map[string]string{"status": "stopping"})
+}
+
+func getSimulationDataHandler(w http.ResponseWriter, r *http.Request) {
+	sim, ok := requireSimulation(w)
+	if !ok {
+		return
+	}
+	writeJSON(w, sim.Snapshot())
+}
+
+func getEnginesHandler(w http.ResponseWriter, r *http.Request) {
+	sim, ok := requireSimulation(w)
+	if !ok {
+		return
+	}
+	writeJSON(w, sim.EngineList())
+}
+
+func stopEnginesHandler(w http.ResponseWriter, r *http.Request) {
+	sim, ok := requireSimulation(w)
+	if !ok {
+		return
+	}
+	sim.SetAllEnginesRunning(false)
+	writeJSON(w, map[string]string{"status": "all engines stopped"})
+}
+
+func startEnginesHandler(w http.ResponseWriter, r *http.Request) {
+	sim, ok := requireSimulation(w)
+	if !ok {
+		return
+	}
+	sim.SetAllEnginesRunning(true)
+	writeJSON(w, map[string]string{"status": "all engines started"})
+}
+
 func updateEngineHandler(w http.ResponseWriter, r *http.Request) {
-	// Добавляем CORS-заголовки
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-	// Обработка предварительного запроса CORS
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+	sim, ok := requireSimulation(w)
+	if !ok {
 		return
 	}
 
-	if strings.Contains(r.URL.Path, "/engines/stop") {
-		for i, engine := range simulator.CurrentSimulation.Engines {
-			engine.Running = false
-			simulator.CurrentSimulation.Engines[i] = engine
-		}
-		return
-	}
-	if strings.Contains(r.URL.Path, "/engines/start") {
-		for i, engine := range simulator.CurrentSimulation.Engines {
-			engine.Running = true
-			simulator.CurrentSimulation.Engines[i] = engine
-		}
-		return
-	}
-	vars := mux.Vars(r)
-	idStr := vars["id"]
-	engineID, err := strconv.Atoi(idStr)
-	if err != nil {
-		http.Error(w, "Invalid engine id", http.StatusBadRequest)
+	// Идентификатор двигателя — строка вида "S1-3" либо порядковый номер
+	// в текущей ступени. Двигатели разных ступеней имеют разные обозначения,
+	// поэтому сквозной нумерации больше нет.
+	engineID := mux.Vars(r)["id"]
+	if engineID == "" {
+		http.Error(w, "invalid engine id", http.StatusBadRequest)
 		return
 	}
 
-	// Ожидаем JSON с новыми параметрами: новая тяга и состояние двигателя
 	var payload struct {
 		Thrust  float64 `json:"thrust"`
 		Running bool    `json:"running"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
-	// Обновляем двигатель в симуляторе
-	if err := simulator.UpdateEngine(engineID, payload.Thrust, payload.Running, simulator.CurrentSimulation.Engines); err != nil {
+	if err := sim.SetEngineState(engineID, payload.Thrust, payload.Running); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Engine %d updated successfully", engineID)
-}
-
-func getSimulationDataHandler(w http.ResponseWriter, r *http.Request) {
-	// Добавляем CORS-заголовки
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-	data := simulator.CurrentSimulation.GetData()
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
+	writeJSON(w, map[string]any{"status": "updated", "engine": engineID})
 }
 
 func separationHandler(w http.ResponseWriter, r *http.Request) {
-	// Добавляем CORS-заголовки
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-	// Обработка предварительного запроса CORS
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+	sim, ok := requireSimulation(w)
+	if !ok {
 		return
 	}
-
-	simulator.CurrentSimulation.DryMass = 4000
-	simulator.CurrentSimulation.TotalMass = 110000
-	disabledEngines := 0
-	for i, engine := range simulator.CurrentSimulation.Engines {
-		if engine.Running {
-			if disabledEngines == len(simulator.CurrentSimulation.Engines)-1 {
-				return
-			}
-			simulator.CurrentSimulation.Engines[i].Running = false
-			disabledEngines++
-		}
-	}
-
-	for i, engine := range simulator.CurrentSimulation.Engines {
-		if engine.Running {
-			engine.ISP = 348
-			simulator.CurrentSimulation.Engines[i] = engine
-		}
-	}
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Separation successfully")
+	sim.ForceStageSeparation()
+	writeJSON(w, map[string]string{"status": "stage separated"})
 }

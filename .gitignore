@@ -1,0 +1,30 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+rocket-simulator
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes data (will be in volumes, not in project dir)
+# But if someone runs without docker:
+prometheus-data/
+grafana-data/
+CLAUDE.md
