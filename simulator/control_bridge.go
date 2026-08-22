@@ -3,6 +3,7 @@ package simulator
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"rocketTelemetrySim/control"
 	"rocketTelemetrySim/simulator/orbit"
@@ -212,15 +213,27 @@ func (s *Simulation) Pause() {
 	s.mu.Lock()
 	if s.runState == RunRunning {
 		s.runState = RunPaused
+		s.haltedAt = time.Now()
 	}
 	s.mu.Unlock()
 }
 
 // Resume возобновляет ход симуляции.
+//
+// startedAt сдвигается вперёд ровно на время паузы: реальное время в
+// снимке — это время, которое прогон действительно шёл, а не то, что
+// утекло по часам на стене, пока оператор держал его на паузе.
 func (s *Simulation) Resume() {
 	s.mu.Lock()
 	if s.runState == RunPaused {
 		s.runState = RunRunning
+		switch {
+		case s.startedAt.IsZero():
+			s.startedAt = time.Now()
+		case !s.haltedAt.IsZero():
+			s.startedAt = s.startedAt.Add(time.Since(s.haltedAt))
+		}
+		s.haltedAt = time.Time{}
 	}
 	s.mu.Unlock()
 }

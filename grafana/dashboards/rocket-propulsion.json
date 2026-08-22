@@ -1821,9 +1821,20 @@
           },
           "editorMode": "code",
           "expr": "turbopump_rpm{engine_id=~\"$engine\"}",
-          "legendFormat": "{{engine_id}} · Обороты",
+          "legendFormat": "{{engine_id}} · Обороты (датчик)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "turbopump_rpm_true{engine_id=~\"$engine\"}",
+          "legendFormat": "{{engine_id}} · Обороты (истинные)",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Обороты вала",
@@ -2367,7 +2378,7 @@
           },
           "editorMode": "code",
           "expr": "chamber_pressure_pa{engine_id=~\"$engine\"}",
-          "legendFormat": "{{engine_id}} · Мгновенное",
+          "legendFormat": "{{engine_id}} · Мгновенное (датчик)",
           "range": true,
           "refId": "A"
         },
@@ -2381,6 +2392,17 @@
           "legendFormat": "{{engine_id}} · Среднее",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "chamber_pressure_true_pa{engine_id=~\"$engine\"}",
+          "legendFormat": "{{engine_id}} · Истинное",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Давление в камере",

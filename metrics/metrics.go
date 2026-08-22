@@ -24,8 +24,9 @@ var (
 	horizontalAccelGauge = gauge("rocket_h_acceleration_mps2", "Горизонтальное ускорение")
 	verticalAccelGauge   = gauge("rocket_v_acceleration_mps2", "Вертикальное ускорение")
 
-	massGauge     = gauge("rocket_mass_kg", "Текущая масса")
-	fuelMassGauge = gauge("rocket_fuel_kg", "Остаток топлива")
+	massGauge           = gauge("rocket_mass_kg", "Текущая масса")
+	fuelMassGauge       = gauge("rocket_fuel_kg", "Остаток топлива (истинный)")
+	fuelMassSensedGauge = gauge("rocket_fuel_sensed_kg", "Остаток топлива (показание датчика, на нём решается MECO)")
 
 	dragGauge            = gauge("rocket_drag_newton", "Сила лобового сопротивления")
 	airDensityGauge      = gauge("rocket_air_density_kg_per_m3", "Плотность атмосферы")
@@ -51,6 +52,9 @@ var (
 	rocketPitchRate = gauge("rocket_pitch_rate_dps", "Угловая скорость по тангажу, град/с")
 	rocketYawRate   = gauge("rocket_yaw_rate_dps", "Угловая скорость по рысканию, град/с")
 	rocketRollRate  = gauge("rocket_roll_rate_dps", "Угловая скорость по крену, град/с")
+
+	attitudeSensorErrorGauge = gauge("rocket_attitude_sensor_error_deg",
+		"Расхождение показания датчика ориентации с истинной ориентацией, град")
 
 	// --- Рулевой тракт и устойчивость ----------------------------------------
 	ctrlGimbalPitch  = gauge("rocket_gimbal_pitch_deg", "Отклонение камер по тангажу")
@@ -164,13 +168,13 @@ func collectors() []prometheus.Collector {
 	base := []prometheus.Collector{
 		altitudeGauge, verticalVelocityGauge, horizontalVelocityGauge, groundSpeedGauge,
 		horizontalAccelGauge, verticalAccelGauge,
-		massGauge, fuelMassGauge,
+		massGauge, fuelMassGauge, fuelMassSensedGauge,
 		dragGauge, airDensityGauge, machGauge, dynamicPressureGauge, heatFluxGauge,
 		ambientTempGauge, recoveryTempGauge,
 		engineStatusGauge, throttleGauge, totalThrustGauge,
 		rocketPositionLat, rocketPositionLon, rocketPositionAlt,
 		rocketPitch, rocketYaw, rocketRoll, rocketAzimuth,
-		rocketPitchRate, rocketYawRate, rocketRollRate,
+		rocketPitchRate, rocketYawRate, rocketRollRate, attitudeSensorErrorGauge,
 		rocketAoA, rocketSideslip, rocketTotalAoA,
 		ctrlGimbalPitch, ctrlGimbalYaw, ctrlGimbalDemand, ctrlGimbalLimit,
 		ctrlAuthority, ctrlSaturated, ctrlRCS,
@@ -233,33 +237,35 @@ func Registered() bool {
 
 // FlightSample — набор параметров полёта для публикации.
 type FlightSample struct {
-	Time               float64
-	Altitude           float64
-	VerticalVelocity   float64
-	HorizontalVelocity float64
-	GroundSpeed        float64
-	VerticalAccel      float64
-	HorizontalAccel    float64
-	Mass               float64
-	FuelMass           float64
-	Drag               float64
-	AirDensity         float64
-	AmbientTemp        float64
-	RecoveryTemp       float64
-	Mach               float64
-	DynamicPressure    float64
-	HeatFlux           float64
-	EnginesRunning     int
-	Pitch              float64
-	Yaw                float64
-	Roll               float64
-	Azimuth            float64
-	PitchRate          float64
-	YawRate            float64
-	RollRate           float64
-	AngleOfAttack      float64
-	SideslipAngle      float64
-	TotalAoA           float64
+	Time                   float64
+	Altitude               float64
+	VerticalVelocity       float64
+	HorizontalVelocity     float64
+	GroundSpeed            float64
+	VerticalAccel          float64
+	HorizontalAccel        float64
+	Mass                   float64
+	FuelMass               float64
+	FuelMassSensed         float64
+	Drag                   float64
+	AirDensity             float64
+	AmbientTemp            float64
+	RecoveryTemp           float64
+	Mach                   float64
+	DynamicPressure        float64
+	HeatFlux               float64
+	EnginesRunning         int
+	Pitch                  float64
+	Yaw                    float64
+	Roll                   float64
+	Azimuth                float64
+	PitchRate              float64
+	AttitudeSensorErrorDeg float64
+	YawRate                float64
+	RollRate               float64
+	AngleOfAttack          float64
+	SideslipAngle          float64
+	TotalAoA               float64
 
 	// Рулевой тракт и статическая устойчивость.
 	GimbalPitch      float64
@@ -292,6 +298,7 @@ func SetFlight(s FlightSample) {
 	horizontalAccelGauge.Set(s.HorizontalAccel)
 	massGauge.Set(s.Mass)
 	fuelMassGauge.Set(s.FuelMass)
+	fuelMassSensedGauge.Set(s.FuelMassSensed)
 	dragGauge.Set(s.Drag)
 	airDensityGauge.Set(s.AirDensity)
 	machGauge.Set(s.Mach)
@@ -312,6 +319,7 @@ func SetFlight(s FlightSample) {
 	rocketPitchRate.Set(s.PitchRate)
 	rocketYawRate.Set(s.YawRate)
 	rocketRollRate.Set(s.RollRate)
+	attitudeSensorErrorGauge.Set(s.AttitudeSensorErrorDeg)
 	rocketAoA.Set(s.AngleOfAttack)
 
 	ctrlGimbalPitch.Set(s.GimbalPitch)

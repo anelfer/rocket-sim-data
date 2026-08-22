@@ -242,6 +242,18 @@ type GNCSystem struct {
 	AzimuthAchieved bool
 }
 
+// derivativeFilterTime — постоянная времени фильтра производной для всех
+// контуров с ненулевым Kd.
+//
+// Наведение теперь замкнуто по показаниям навигационных датчиков
+// (sensing.DefaultPositionSensor/DefaultVelocitySensor, постоянная времени
+// 0.3 с), а не по истинному состоянию модели: без фильтра сырая конечная
+// разность (err-lastError)/dt усиливала бы шум датчика прямо пропорционально
+// Kd/dt. Величина взята с запасом в несколько постоянных времени датчика —
+// этого достаточно, чтобы подавить шум, и пренебрежимо мало на фоне
+// собственной динамики контуров (минуты набора высоты и довыведения).
+const derivativeFilterTime = 1.5
+
 // NewGNCSystem создаёт систему управления.
 func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 	g := &GNCSystem{
@@ -251,12 +263,13 @@ func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 		// Сто километров недобора дают примерно пятнадцать градусов
 		// подъёма носа.
 		ApoapsisPitch: PIDController{
-			Kp:            1.5e-4,
-			Ki:            1.0e-7,
-			Kd:            1.5e-3,
-			MinOutput:     -12,
-			MaxOutput:     42,
-			IntegralLimit: 5,
+			Kp:                   1.5e-4,
+			Ki:                   1.0e-7,
+			Kd:                   1.5e-3,
+			MinOutput:            -12,
+			MaxOutput:            42,
+			IntegralLimit:        5,
+			DerivativeFilterTime: derivativeFilterTime,
 		},
 
 		// Удержание высоты на разгонном участке. Вход — ошибка вертикальной
@@ -269,32 +282,35 @@ func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 		// удержать высоту не может в принципе, — она снижалась с работающими
 		// двигателями и на низкой цели доходила до земли.
 		AltitudeHold: PIDController{
-			Kp:            0.10,
-			Ki:            4.0e-4,
-			Kd:            0.03,
-			MinOutput:     -20,
-			MaxOutput:     40,
-			IntegralLimit: 20,
+			Kp:                   0.10,
+			Ki:                   4.0e-4,
+			Kd:                   0.03,
+			MinOutput:            -20,
+			MaxOutput:            40,
+			IntegralLimit:        20,
+			DerivativeFilterTime: derivativeFilterTime,
 		},
 
 		RadialHold: PIDController{
 			// 100 м/с снижения дают примерно +2° к тангажу.
-			Kp:            0.02,
-			Ki:            1.0e-4,
-			Kd:            0.05,
-			MinOutput:     -15,
-			MaxOutput:     15,
-			IntegralLimit: 5,
+			Kp:                   0.02,
+			Ki:                   1.0e-4,
+			Kd:                   0.05,
+			MinOutput:            -15,
+			MaxOutput:            15,
+			IntegralLimit:        5,
+			DerivativeFilterTime: derivativeFilterTime,
 		},
 
 		InclinationTrim: PIDController{
 			// 1° ошибки наклонения даёт примерно 3° поправки к азимуту.
-			Kp:            3.0,
-			Ki:            0.01,
-			Kd:            1.0,
-			MinOutput:     -15,
-			MaxOutput:     15,
-			IntegralLimit: 5,
+			Kp:                   3.0,
+			Ki:                   0.01,
+			Kd:                   1.0,
+			MinOutput:            -15,
+			MaxOutput:            15,
+			IntegralLimit:        5,
+			DerivativeFilterTime: derivativeFilterTime,
 		},
 
 		CircThrottle: PIDController{
@@ -303,12 +319,13 @@ func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 			// отсечением результата, — иначе интеграл продолжал бы копиться
 			// к паспортным ста процентам, которых регулятору всё равно
 			// никогда не отдадут).
-			Kp:            0.005,
-			Ki:            0.0002,
-			Kd:            0.001,
-			MinOutput:     0,
-			MaxOutput:     nominalThrottleOr1(cfg),
-			IntegralLimit: 0.5,
+			Kp:                   0.005,
+			Ki:                   0.0002,
+			Kd:                   0.001,
+			MinOutput:            0,
+			MaxOutput:            nominalThrottleOr1(cfg),
+			IntegralLimit:        0.5,
+			DerivativeFilterTime: derivativeFilterTime,
 		},
 
 		Attitude: physics.Attitude{

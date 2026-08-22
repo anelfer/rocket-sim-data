@@ -24,9 +24,18 @@ type PIDController struct {
 	// (anti-windup в единицах выхода, а не в единицах ошибки).
 	IntegralLimit float64
 
-	integral    float64
-	lastError   float64
-	initialized bool
+	// DerivativeFilterTime — постоянная времени однополюсного фильтра
+	// производной, с. Ноль (по умолчанию) выключает фильтр — производная
+	// считается сырой конечной разностью, как и раньше, это сохраняет
+	// поведение всех контуров, для которых фильтр явно не включён.
+	// Обязателен там, где Kd != 0, а измеряемая величина приходит с
+	// датчика: без фильтра шум датчика усиливается пропорционально Kd/dt.
+	DerivativeFilterTime float64
+
+	integral           float64
+	lastError          float64
+	filteredDerivative float64
+	initialized        bool
 }
 
 // Update вычисляет управляющее воздействие по ошибке за шаг dt.
@@ -41,7 +50,14 @@ func (p *PIDController) Update(setpoint, measured, dt float64) float64 {
 	// иначе на старте регулятор выдаёт бросок.
 	derivative := 0.0
 	if p.initialized {
-		derivative = (err - p.lastError) / dt
+		raw := (err - p.lastError) / dt
+		if p.DerivativeFilterTime > 0 {
+			decay := math.Exp(-dt / p.DerivativeFilterTime)
+			p.filteredDerivative = raw + (p.filteredDerivative-raw)*decay
+			derivative = p.filteredDerivative
+		} else {
+			derivative = raw
+		}
 	}
 	p.lastError = err
 	p.initialized = true
@@ -77,5 +93,6 @@ func (p *PIDController) Update(setpoint, measured, dt float64) float64 {
 func (p *PIDController) Reset() {
 	p.integral = 0
 	p.lastError = 0
+	p.filteredDerivative = 0
 	p.initialized = false
 }

@@ -10,7 +10,9 @@ import (
 	"rocketTelemetrySim/control"
 	"rocketTelemetrySim/simulator/env"
 	"rocketTelemetrySim/simulator/orbit"
+	"rocketTelemetrySim/simulator/orbit/sensing"
 	"rocketTelemetrySim/simulator/physics"
+	"rocketTelemetrySim/simulator/propulsion"
 	"rocketTelemetrySim/simulator/vehicle"
 )
 
@@ -215,6 +217,62 @@ type Simulation struct {
 	// startedAt — момент запуска в реальном времени.
 	startedAt time.Time
 
+	// haltedAt — момент, когда прогон перестал идти (пауза, остановка,
+	// завершение). Пока прогон не остановлен, поле нулевое.
+	//
+	// RealTime в снимке считается не как «сейчас минус startedAt» всегда —
+	// иначе после Stop оно продолжало бы расти вечно, хотя модельное время
+	// уже замерло: снимок состояния оператор может запросить в любой
+	// момент, в том числе спустя часы после остановки прогона.
+	haltedAt time.Time
+
+	// fuelSensor — датчик остатка горючего первой ступени. Настоящего
+	// датчика массы не существует физически (см. DefaultPropellantSensor);
+	// это единственное измерение, от которого зависит решение о выключении
+	// двигателей по остатку топлива (shouldMECO) — оно не должно судить
+	// по истинной массе в баке, которую в реальности борт не знает.
+	fuelSensor *propulsion.Sensor
+
+	// sensedFuelMass — последнее достоверное показание fuelSensor, кг.
+	// На пропуске связи не обновляется: держит предыдущее показание, а не
+	// откатывается к истинной массе и не проваливается в ноль.
+	sensedFuelMass float64
+
+	// positionSensor/velocitySensor — навигационные каналы положения и
+	// скорости в ECI. Наведение (GNCSystem.Update) решает по их показаниям,
+	// а не по истинному вектору состояния: реальный борт видит только то,
+	// что говорит навигационная система, и умеет ошибаться так же, как она.
+	positionSensor *sensing.VectorSensor
+	velocitySensor *sensing.VectorSensor
+
+	// lastValidSensedPosition/lastValidSensedVelocity — последнее достоверное
+	// показание на случай пропуска связи. На пропуске наведение обязано
+	// держать последний известный вектор состояния, а не откатываться
+	// к истинному (тогда датчик был бы подделкой) и не проваливаться в ноль
+	// (тогда наведение среагировало бы на выдуманный скачок).
+	lastValidSensedPosition physics.Vec3
+	lastValidSensedVelocity physics.Vec3
+
+	// attitudeSensor — датчик ориентации корпуса (гироскоп/звёздный датчик).
+	// Автопилот (attitudeError в attitude_dynamics.go) решает по его
+	// показанию, а не по истинной ориентации: реальный борт не имеет
+	// прямого доступа к своей истинной ориентации, только к тому, что
+	// говорит гироскоп.
+	attitudeSensor *sensing.AttitudeSensor
+
+	// lastValidSensedOrientation — последнее достоверное показание на
+	// случай пропуска связи. Держится неизменным на пропуске: ни отката
+	// к истинной ориентации, ни проваливания в единичный кватернион.
+	lastValidSensedOrientation physics.Quaternion
+
+	// sensorRng — отдельный генератор для шума всех измерительных каналов
+	// (двигательные датчики, остаток топлива, навигация). Не общий с rng:
+	// иначе изменение характеристик датчика (число каналов, частота
+	// обновления) сдвигало бы поток rng и меняло бы саму физическую
+	// траекторию полёта — шум измерения не должен возвращаться в модель
+	// даже косвенно, через общий генератор.
+	sensorRng *rand.Rand
+
 	rng  *rand.Rand
 	stop chan struct{}
 	done chan struct{}
@@ -310,6 +368,18 @@ func (s *Simulation) Seed() int64 {
 	return s.seed
 }
 
+// splitMix64 — детерминированное перемешивание 64-битного числа (алгоритм
+// SplitMix64). Нужно только для того, чтобы развести из одного seed два
+// независимых, но воспроизводимых потока ГСЧ — физику и шум датчиков, — не
+// расходуя ни одного броска ни одного из этих потоков.
+func splitMix64(x uint64) uint64 {
+	x += 0x9E3779B97F4A7C15
+	z := x
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
 // initState приводит симуляцию в состояние «на стартовом столе».
 // Вызывается и из конструктора, и из Reset — состояние сбрасывается полностью,
 // без забытых полей.
@@ -319,6 +389,16 @@ func (s *Simulation) initState() {
 	// Генератор пересоздаётся от того же зерна, поэтому Reset даёт в точности
 	// тот же полёт: тот же ветер, те же отклонения, те же отказы.
 	s.rng = rand.New(rand.NewSource(s.seed))
+
+	// sensorRng разводится от того же seed чистым арифметическим
+	// перемешиванием (splitMix64), а не броском s.rng: если бы для этого
+	// понадобился хотя бы один вызов s.rng.Int63(), сама эта развязка
+	// сдвинула бы поток s.rng на один бросок и заново испортила
+	// воспроизводимость прежних сидов. Перемешивание детерминировано:
+	// тот же seed всегда даёт тот же поток шума датчиков, но он не пересекается
+	// с потоком физической случайности.
+	s.sensorRng = rand.New(rand.NewSource(int64(splitMix64(uint64(s.seed)))))
+
 	s.wind = env.NewWindProfile(s.rng)
 	s.dispersion = RandomDispersion(s.rng)
 
@@ -361,15 +441,23 @@ func (s *Simulation) initState() {
 		OxTankPressure:     cfg.FirstStage.OxTankPressure,
 		FuelPressurantMass: cfg.FirstStage.FuelPressurantMass,
 		OxPressurantMass:   cfg.FirstStage.OxPressurantMass,
-	}, s.rng, ambient)
+	}, s.rng, s.sensorRng, ambient)
 
 	s.dryMass = s.propulsion.DryMass()
 	s.state.FuelMass = s.propulsion.PropellantMass()
+	s.fuelSensor = propulsion.NewSensorAt(propulsion.DefaultPropellantSensor(s.state.FuelMass), s.state.FuelMass)
+	s.sensedFuelMass = s.state.FuelMass
+	s.positionSensor = sensing.NewVectorSensorAt(sensing.DefaultPositionSensor(), s.state.Position)
+	s.velocitySensor = sensing.NewVectorSensorAt(sensing.DefaultVelocitySensor(), s.state.Velocity)
+	s.lastValidSensedPosition = s.state.Position
+	s.lastValidSensedVelocity = s.state.Velocity
 	s.area = cfg.CrossSectionArea()
 	s.prevAxialAccel = 0
 	s.prevLateralAccel = 0
 	s.prevAngularAccel = 0
 	s.elapsed = 0
+	s.startedAt = time.Time{}
+	s.haltedAt = time.Time{}
 	s.phase = orbit.PhasePreLaunch
 	s.Entry = DefaultEntryConfig()
 	s.entryRequested = false
@@ -403,6 +491,8 @@ func (s *Simulation) initState() {
 		Yaw:   azimuth,
 		Roll:  cfg.InitialRoll(),
 	}, physics.NewLocalFrame(position))
+	s.attitudeSensor = sensing.NewAttitudeSensor(sensing.DefaultAttitudeSensor())
+	s.lastValidSensedOrientation = s.attitude.Orientation
 	s.telemetry = s.buildTelemetryLocked()
 }
 
@@ -472,6 +562,7 @@ func (s *Simulation) Run() {
 	s.mu.Lock()
 	s.runState = RunRunning
 	s.startedAt = time.Now()
+	s.haltedAt = time.Time{}
 	s.mu.Unlock()
 
 	// Публикуем состояние на стартовом столе до первого шага интегрирования.
@@ -487,6 +578,7 @@ func (s *Simulation) Run() {
 		case <-s.stop:
 			s.mu.Lock()
 			s.runState = RunStopped
+			s.haltedAt = time.Now()
 			s.mu.Unlock()
 			log.Println("Simulation stopped")
 			return
@@ -542,6 +634,7 @@ func (s *Simulation) Run() {
 		if crashed {
 			s.mu.Lock()
 			s.runState = RunEnded
+			s.haltedAt = time.Now()
 			s.mu.Unlock()
 			log.Println("Simulation ended: vehicle impacted the surface")
 			return
@@ -562,6 +655,36 @@ func (s *Simulation) step(dt float64) {
 	// 1. Навигация: полное состояние выводится из вектора состояния в ECI.
 	nav := s.navState()
 
+	// Показание датчика остатка топлива — раз за такт, до проверки условий
+	// смены фазы. MECO по остатку горючего обязан судить о нём так же,
+	// как судил бы борт, а не подсматривать в истинную массу в баке.
+	// На пропуске связи показание просто не обновляется — держит предыдущее,
+	// а не откатывается к истине и не проваливается в ноль.
+	if v, valid := s.fuelSensor.UpdateWith(s.state.FuelMass, dt, s.sensorRng, control.SensorOverrides{}); valid {
+		s.sensedFuelMass = v
+	}
+
+	// Показания навигационных датчиков (положение/скорость в ECI) — тоже раз
+	// за такт, той же логикой держания последнего достоверного значения на
+	// пропуске связи. Идут в наведение (см. ниже), а не в проверку смены фазы
+	// и не в остальные использования nav в этом шаге (атмосфера, тепловой
+	// поток, угол атаки для аэродинамики) — воздух не знает, что думает
+	// навигационная система.
+	if m := s.positionSensor.UpdateWith(s.state.Position, dt, s.sensorRng, control.SensorOverrides{}); m.Valid {
+		s.lastValidSensedPosition = m.Value
+	}
+	if m := s.velocitySensor.UpdateWith(s.state.Velocity, dt, s.sensorRng, control.SensorOverrides{}); m.Valid {
+		s.lastValidSensedVelocity = m.Value
+	}
+
+	// Показание датчика ориентации — той же логикой: раз за такт, держит
+	// последнее достоверное значение на пропуске связи. Идёт только в
+	// вычисление ошибки автопилота (attitudeError), а не в само
+	// интегрирование истинной ориентации по угловой скорости.
+	if m := s.attitudeSensor.UpdateWith(s.attitude.Orientation, dt, s.sensorRng, control.SensorOverrides{}); m.Valid {
+		s.lastValidSensedOrientation = m.Orientation
+	}
+
 	// 2. Обновление фазы полёта.
 	s.updateFlightPhase(nav)
 	nav.Phase = s.phase
@@ -573,7 +696,21 @@ func (s *Simulation) step(dt float64) {
 	// фазе просит полный газ. Раньше так и было — посадочный контур считал
 	// уставку, а следующей же строкой её затирала единица, и корабль летел
 	// к земле на полной тяге, развёрнутый поперёк движения.
-	command := s.gnc.Update(nav, dt)
+	// Датчик подменяет вход только для контуров выведения (тангаж по
+	// апоцентру, азимут, довыведение) — их и разбирал план Фазы 3, и только
+	// под них добавлен фильтр производной в PIDController. На посадочном
+	// участке наведение попадает в ту же ветку computeTargetPitch
+	// (progradePitch по вектору скорости), но там скорость мала, и шум
+	// датчика скорости (абсолютный порог, не доля) даёт огромную ошибку
+	// направления — ровно то, чем должна заниматься Фаза 4 (датчик
+	// ориентации), а не эта. До неё посадочный и пассивные участки остаются
+	// на истинной навигации.
+	navForGuidance := nav
+	switch s.phase {
+	case orbit.PhaseFirstStage, orbit.PhaseSecondStage, orbit.PhaseCircularization:
+		navForGuidance = s.sensedNavState(nav)
+	}
+	command := s.gnc.Update(navForGuidance, dt)
 	if s.inLanding() {
 		command.Throttle = s.landingThrottle
 	}
@@ -803,6 +940,28 @@ func (s *Simulation) navState() orbit.NavState {
 		s.state.Position, s.state.Velocity,
 		s.windVelocity(s.state.Position, altitude),
 		mass, available, s.elapsed, s.phase,
+	)
+}
+
+// sensedNavState собирает NavState из показаний навигационных датчиков —
+// то, чем на самом деле распоряжается наведение.
+//
+// Положение и скорость берутся с датчиков (либо последнее достоверное
+// значение, если сейчас пропуск связи), а масса, доступная тяга, время и
+// фаза полёта остаются истинными: это не измеряемые датчиком величины,
+// а внутренний учёт борта (масса — по расходу и заправке, фаза — по
+// собственной логике полётной программы). Ветер вычисляется в точке
+// показанного датчиком положения — так же, как атмосферная модель
+// в реальности видела бы обстановку там, где, по её мнению, находится
+// ракета, а не там, где она находится на самом деле.
+func (s *Simulation) sensedNavState(trueNav orbit.NavState) orbit.NavState {
+	position := s.lastValidSensedPosition
+	velocity := s.lastValidSensedVelocity
+	altitude := position.Norm() - physics.EarthRadius
+	return orbit.NewNavState(
+		position, velocity,
+		s.windVelocity(position, altitude),
+		trueNav.Mass, trueNav.AvailableThrust, trueNav.Time, trueNav.Phase,
 	)
 }
 

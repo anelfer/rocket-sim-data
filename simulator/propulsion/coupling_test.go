@@ -48,7 +48,7 @@ func runToSteadyState(e *Engine, in EngineInput, seconds float64) {
 }
 
 func newNominalEngine() *Engine {
-	e := NewEngine(Merlin1DConfig(), rand.New(rand.NewSource(1)), 288)
+	e := NewEngine(Merlin1DConfig(), rand.New(rand.NewSource(1)), rand.New(rand.NewSource(2)), 288)
 	e.Detailed = true
 	e.Start()
 	return e
@@ -196,7 +196,7 @@ func TestTurbinePowerShortfallCascades(t *testing.T) {
 	weakCfg := Merlin1DConfig()
 	// Клапан газогенератора приоткрыт лишь наполовину.
 	weakCfg.Turbopump.GasGeneratorFlow *= 0.5
-	weak := NewEngine(weakCfg, rand.New(rand.NewSource(1)), 288)
+	weak := NewEngine(weakCfg, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(2)), 288)
 	weak.Start()
 	runToSteadyState(weak, nominalInput(), 12)
 
@@ -514,7 +514,7 @@ func TestSensorNoisePreservesRelations(t *testing.T) {
 // с проектным соотношением заправки.
 func TestOverallMixtureRatioMatchesTankFill(t *testing.T) {
 	cfg := Merlin1DConfig()
-	e := NewEngine(cfg, rand.New(rand.NewSource(1)), 288)
+	e := NewEngine(cfg, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(2)), 288)
 	e.Start()
 	runToSteadyState(e, nominalInput(), 12)
 

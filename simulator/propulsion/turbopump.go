@@ -285,6 +285,12 @@ type Turbopump struct {
 	// на уровень тяги.
 	governorActive bool
 
+	// lastValidMeasuredSpeed — последнее достоверное показание датчика
+	// оборотов, рад/с. Держится на пропуске связи: регулятор не должен ни
+	// тайно подсматривать в истинные обороты, ни пугаться нулевого
+	// показания и дёргать клапан.
+	lastValidMeasuredSpeed float64
+
 	// valveDelay — накопленное запаздывание приводов, с.
 	valveDelay [4]float64
 }
@@ -299,7 +305,14 @@ func (tp *Turbopump) GovernorActive() bool { return tp.governorActive }
 // рассогласование, интегральная удерживает режим. Интегратор ограничен ходом
 // клапана, иначе после длительного насыщения он не успевал бы разрядиться
 // и обороты проскакивали бы уставку.
-func (tp *Turbopump) GovernorCommand(target, dt float64) float64 {
+//
+// measured — показание датчика оборотов (рад/с), а не истинные tp.Speed:
+// регулятор реального двигателя знает только то, что ему сказал тахометр.
+// На пропуске связи (measured.Valid == false) регулятор держит последнее
+// достоверное показание и не двигает интеграл — иначе он либо тайно
+// подсмотрел бы в истинные обороты, либо испугался бы нулевого показания
+// и рвано задёргал клапаном.
+func (tp *Turbopump) GovernorCommand(measured Measurement, target, dt float64) float64 {
 	tp.governorActive = true
 	if tp.Config.DesignSpeed <= 0 {
 		return 0
@@ -311,9 +324,17 @@ func (tp *Turbopump) GovernorCommand(target, dt float64) float64 {
 		stroke = 1
 	}
 
-	err := (target - tp.Speed) / tp.Config.DesignSpeed
-	tp.governorIntegral += ki * err * dt
-	tp.governorIntegral = math.Max(0, math.Min(stroke, tp.governorIntegral))
+	speed := tp.lastValidMeasuredSpeed
+	if measured.Valid {
+		speed = measured.Value
+		tp.lastValidMeasuredSpeed = speed
+	}
+
+	err := (target - speed) / tp.Config.DesignSpeed
+	if measured.Valid {
+		tp.governorIntegral += ki * err * dt
+		tp.governorIntegral = math.Max(0, math.Min(stroke, tp.governorIntegral))
+	}
 
 	return clampTo(kp*err+tp.governorIntegral, stroke)
 }

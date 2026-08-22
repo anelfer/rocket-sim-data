@@ -41,9 +41,10 @@ type Telemetry struct {
 	Stage      int     `json:"stage"`
 
 	// Массы, кг.
-	DryMass   float64 `json:"dryMass"`
-	FuelMass  float64 `json:"fuelMass"`
-	TotalMass float64 `json:"totalMass"`
+	DryMass        float64 `json:"dryMass"`
+	FuelMass       float64 `json:"fuelMass"`
+	FuelMassSensed float64 `json:"fuelMassSensed"` // показание датчика остатка, на нём принимается решение о MECO
+	TotalMass      float64 `json:"totalMass"`
 
 	// Кинематика.
 	Altitude           float64 `json:"altitude"`           // м
@@ -69,6 +70,12 @@ type Telemetry struct {
 	PitchRate float64 `json:"pitchRate"`
 	YawRate   float64 `json:"yawRate"`
 	RollRate  float64 `json:"rollRate"`
+
+	// AttitudeSensorErrorDeg — расхождение показания датчика ориентации
+	// с истинной ориентацией, градусы. Это и есть то, чем в действительности
+	// распоряжается автопилот при вычислении ошибки (attitudeError) — а не
+	// сама ошибка наведения.
+	AttitudeSensorErrorDeg float64 `json:"attitudeSensorErrorDeg"`
 
 	// Аэродинамические углы, градусы.
 	AngleOfAttack float64 `json:"angleOfAttack"`
@@ -204,6 +211,12 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 	pitchRate, yawRate, rollRate := s.attitude.Rates()
 	alpha, beta := physics.AeroAngles(body, vRel)
 
+	// Расхождение показания датчика ориентации с истинной ориентацией —
+	// то, что реально закладывает шум в контур автопилота. |W|, а не W:
+	// кватернионы q и −q описывают один и тот же поворот.
+	attitudeErrQ := s.attitude.Orientation.Conjugate().Multiply(s.lastValidSensedOrientation).Normalized()
+	attitudeSensorErrorDeg := 2 * math.Acos(math.Min(1, math.Abs(attitudeErrQ.W))) * physics.RadToDeg
+
 	mass := s.dryMass + st.FuelMass
 	gravity := physics.GravityMagnitudeAtAltitude(altitude)
 
@@ -218,9 +231,10 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 		PhaseIndex: int(s.phase),
 		Stage:      s.stage,
 
-		DryMass:   s.dryMass,
-		FuelMass:  st.FuelMass,
-		TotalMass: mass,
+		DryMass:        s.dryMass,
+		FuelMass:       st.FuelMass,
+		FuelMassSensed: s.sensedFuelMass,
+		TotalMass:      mass,
 
 		Altitude:           altitude,
 		VerticalVelocity:   st.RadialVelocity(),
@@ -242,6 +256,8 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 		PitchRate: pitchRate,
 		YawRate:   yawRate,
 		RollRate:  rollRate,
+
+		AttitudeSensorErrorDeg: attitudeSensorErrorDeg,
 
 		AngleOfAttack: alpha,
 		SideslipAngle: beta,
@@ -427,49 +443,51 @@ func (s *Simulation) attachedStageTelemetry(
 // Publish отправляет снимок в Prometheus.
 func (t Telemetry) Publish() {
 	metrics.SetFlight(metrics.FlightSample{
-		Time:               t.Time,
-		Altitude:           t.Altitude,
-		VerticalVelocity:   t.VerticalVelocity,
-		HorizontalVelocity: t.HorizontalVelocity,
-		GroundSpeed:        t.GroundSpeed,
-		VerticalAccel:      t.VerticalAccel,
-		HorizontalAccel:    t.HorizontalAccel,
-		Mass:               t.TotalMass,
-		FuelMass:           t.FuelMass,
-		Drag:               t.DragForce,
-		AirDensity:         t.AirDensity,
-		AmbientTemp:        t.AmbientTemp,
-		RecoveryTemp:       t.RecoveryTemp,
-		Mach:               t.Mach,
-		DynamicPressure:    t.DynamicPressure,
-		HeatFlux:           t.HeatFlux,
-		EnginesRunning:     t.EnginesRunning,
-		Pitch:              t.Pitch,
-		Yaw:                t.Yaw,
-		Roll:               t.Roll,
-		Azimuth:            t.Azimuth,
-		PitchRate:          t.PitchRate,
-		YawRate:            t.YawRate,
-		RollRate:           t.RollRate,
-		AngleOfAttack:      t.AngleOfAttack,
-		GimbalPitch:        t.GimbalPitch,
-		GimbalYaw:          t.GimbalYaw,
-		GimbalDemand:       t.GimbalDemand,
-		GimbalLimit:        t.GimbalLimit,
-		ControlAuthority:   t.ControlAuthority,
-		ControlSaturated:   t.ControlSaturated,
-		UsingRCS:           t.UsingRCS,
-		AeroTorque:         t.AeroTorque,
-		ControlTorque:      t.ControlTorque,
-		StaticMargin:       t.StaticMargin,
-		SideslipAngle:      t.SideslipAngle,
-		TotalAoA:           t.TotalAoA,
-		Gravity:            t.Gravity,
-		TWR:                t.TWR,
-		Throttle:           t.Throttle,
-		TotalThrust:        t.TotalThrust,
-		Latitude:           t.Latitude,
-		Longitude:          t.Longitude,
+		Time:                   t.Time,
+		Altitude:               t.Altitude,
+		VerticalVelocity:       t.VerticalVelocity,
+		HorizontalVelocity:     t.HorizontalVelocity,
+		GroundSpeed:            t.GroundSpeed,
+		VerticalAccel:          t.VerticalAccel,
+		HorizontalAccel:        t.HorizontalAccel,
+		Mass:                   t.TotalMass,
+		FuelMass:               t.FuelMass,
+		FuelMassSensed:         t.FuelMassSensed,
+		Drag:                   t.DragForce,
+		AirDensity:             t.AirDensity,
+		AmbientTemp:            t.AmbientTemp,
+		RecoveryTemp:           t.RecoveryTemp,
+		Mach:                   t.Mach,
+		DynamicPressure:        t.DynamicPressure,
+		HeatFlux:               t.HeatFlux,
+		EnginesRunning:         t.EnginesRunning,
+		Pitch:                  t.Pitch,
+		Yaw:                    t.Yaw,
+		Roll:                   t.Roll,
+		Azimuth:                t.Azimuth,
+		PitchRate:              t.PitchRate,
+		YawRate:                t.YawRate,
+		RollRate:               t.RollRate,
+		AttitudeSensorErrorDeg: t.AttitudeSensorErrorDeg,
+		AngleOfAttack:          t.AngleOfAttack,
+		GimbalPitch:            t.GimbalPitch,
+		GimbalYaw:              t.GimbalYaw,
+		GimbalDemand:           t.GimbalDemand,
+		GimbalLimit:            t.GimbalLimit,
+		ControlAuthority:       t.ControlAuthority,
+		ControlSaturated:       t.ControlSaturated,
+		UsingRCS:               t.UsingRCS,
+		AeroTorque:             t.AeroTorque,
+		ControlTorque:          t.ControlTorque,
+		StaticMargin:           t.StaticMargin,
+		SideslipAngle:          t.SideslipAngle,
+		TotalAoA:               t.TotalAoA,
+		Gravity:                t.Gravity,
+		TWR:                    t.TWR,
+		Throttle:               t.Throttle,
+		TotalThrust:            t.TotalThrust,
+		Latitude:               t.Latitude,
+		Longitude:              t.Longitude,
 	})
 
 	metrics.SetOrbit(metrics.OrbitSample{

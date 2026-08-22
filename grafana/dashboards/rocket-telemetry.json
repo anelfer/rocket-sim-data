@@ -91,7 +91,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 1
       },
@@ -126,225 +126,6 @@
       ],
       "title": "Altitude",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 50000
-              },
-              {
-                "color": "red",
-                "value": 100000
-              }
-            ]
-          },
-          "unit": "lengthm"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 1
-      },
-      "id": 2,
-      "options": {
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "text": {}
-      },
-      "pluginVersion": "10.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_altitude_meters",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Current Altitude",
-      "type": "gauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "color": "red",
-                  "index": 0,
-                  "text": "OFF"
-                },
-                "1": {
-                  "color": "green",
-                  "index": 1,
-                  "text": "1 Engine"
-                },
-                "9": {
-                  "color": "green",
-                  "index": 2,
-                  "text": "9 Engines"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 1
-      },
-      "id": 3,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "textMode": "value_and_name",
-        "text": {}
-      },
-      "pluginVersion": "10.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_engine_status",
-          "legendFormat": "Engines",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Engine Status",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "kg"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 9
-      },
-      "id": 4,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "textMode": "auto",
-        "text": {}
-      },
-      "pluginVersion": "10.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_mass_kg",
-          "legendFormat": "Mass",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Rocket Mass",
-      "type": "stat"
     },
     {
       "datasource": {
@@ -433,9 +214,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 13
+        "w": 8,
+        "x": 8,
+        "y": 1
       },
       "id": 5,
       "options": {
@@ -536,9 +317,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 13
+        "w": 8,
+        "x": 16,
+        "y": 1
       },
       "id": 6,
       "options": {
@@ -582,75 +363,6 @@
       ],
       "title": "Acceleration",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "green",
-                "value": 1.2
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 21
-      },
-      "id": 15,
-      "options": {
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "text": {}
-      },
-      "pluginVersion": "10.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_twr",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Thrust-to-Weight Ratio (TWR)",
-      "type": "gauge"
     },
     {
       "datasource": {
@@ -709,8 +421,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 8,
-        "y": 21
+        "x": 0,
+        "y": 9
       },
       "id": 16,
       "options": {
@@ -824,8 +536,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 16,
-        "y": 21
+        "x": 8,
+        "y": 9
       },
       "id": 30,
       "options": {
@@ -936,10 +648,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 7,
-        "w": 24,
-        "x": 0,
-        "y": 29
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
       },
       "id": 31,
       "options": {
@@ -1029,7 +741,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 17
       },
       "id": 17,
       "options": {
@@ -1199,7 +911,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 36
       },
       "id": 104,
       "panels": [],
@@ -1282,7 +994,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 49
+        "y": 37
       },
       "id": 32,
       "options": {
@@ -1402,7 +1114,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 49
+        "y": 37
       },
       "id": 33,
       "options": {
@@ -1505,7 +1217,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 49
+        "y": 37
       },
       "id": 34,
       "options": {
@@ -1598,7 +1310,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 57
+        "y": 45
       },
       "id": 40,
       "options": {
@@ -1726,7 +1438,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 57
+        "y": 45
       },
       "id": 41,
       "options": {
@@ -1770,189 +1482,6 @@
       ],
       "title": "Ударный слой: температура и ионизация",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Состояние первой ступени на протяжении всего полёта.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "color": "blue",
-                  "index": 0,
-                  "text": "В составе"
-                },
-                "1": {
-                  "color": "purple",
-                  "index": 1,
-                  "text": "Отделилась"
-                },
-                "2": {
-                  "color": "red",
-                  "index": 2,
-                  "text": "Разрушилась"
-                },
-                "3": {
-                  "color": "orange",
-                  "index": 3,
-                  "text": "Упала"
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              },
-              {
-                "color": "purple",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 2
-              },
-              {
-                "color": "orange",
-                "value": 3
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 57
-      },
-      "id": 35,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_spent_stage_outcome",
-          "legendFormat": "Состояние",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Первая ступень",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "До разделения ступени не существует, и величина не определена — панель показывает разрыв, а не «связь есть».",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "color": "green",
-                  "index": 0,
-                  "text": "Связь есть"
-                },
-                "1": {
-                  "color": "red",
-                  "index": 1,
-                  "text": "Блэкаут"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "unit": "short",
-          "noValue": "нет данных"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 57
-      },
-      "id": 42,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_spent_stage_radio_blackout",
-          "legendFormat": "",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Радиосвязь с 1-й ступенью",
-      "type": "stat"
     },
     {
       "datasource": {
@@ -2010,10 +1539,10 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
+        "h": 8,
         "w": 8,
         "x": 16,
-        "y": 65
+        "y": 45
       },
       "id": 43,
       "options": {
@@ -2093,7 +1622,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 53
       },
       "id": 36,
       "options": {
@@ -2289,7 +1818,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 53
       },
       "id": 44,
       "options": {
@@ -2444,7 +1973,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 66
       },
       "id": 101,
       "panels": [],
@@ -2509,7 +2038,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 67
       },
       "id": 7,
       "options": {
@@ -2601,7 +2130,7 @@
         "h": 8,
         "w": 8,
         "x": 12,
-        "y": 79
+        "y": 67
       },
       "id": 14,
       "options": {
@@ -2635,93 +2164,6 @@
       ],
       "title": "Engine Specific Impulse (ISP)",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "color": "red",
-                  "index": 0,
-                  "text": "OFF"
-                },
-                "1": {
-                  "color": "green",
-                  "index": 1,
-                  "text": "ON"
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          },
-          "unit": "short",
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 4,
-        "x": 20,
-        "y": 79
-      },
-      "id": 18,
-      "options": {
-        "displayMode": "gradient",
-        "minVizHeight": 10,
-        "minVizWidth": 0,
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showUnfilled": true,
-        "text": {},
-        "valueMode": "text"
-      },
-      "pluginVersion": "10.2.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_engine_thrust_newton > bool 100",
-          "legendFormat": "{{engine_id}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Двигатели: включён / выключен",
-      "type": "bargauge",
-      "description": "Единица — двигатель работает. Идентификатор содержит номер ступени: S1-1…S1-9 — первая ступень, S2-1 — вторая. После разделения ряды первой ступени исчезают, потому что её двигателей больше нет."
     },
     {
       "datasource": {
@@ -2785,7 +2227,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 87
+        "y": 75
       },
       "id": 8,
       "options": {
@@ -2877,7 +2319,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 87
+        "y": 75
       },
       "id": 12,
       "options": {
@@ -2968,7 +2410,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 95
+        "y": 83
       },
       "id": 13,
       "options": {
@@ -3007,7 +2449,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 91
       },
       "id": 102,
       "panels": [],
@@ -3072,7 +2514,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 104
+        "y": 92
       },
       "id": 9,
       "options": {
@@ -3163,7 +2605,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 104
+        "y": 92
       },
       "id": 10,
       "options": {
@@ -3254,7 +2696,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 104
+        "y": 92
       },
       "id": 11,
       "options": {
@@ -3293,7 +2735,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 100
       },
       "id": 103,
       "panels": [],
@@ -3412,9 +2854,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 16,
         "x": 0,
-        "y": 113
+        "y": 101
       },
       "id": 19,
       "options": {
@@ -3478,181 +2920,6 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "color": "purple",
-                  "index": 0,
-                  "text": "Pre-Launch"
-                },
-                "1": {
-                  "color": "orange",
-                  "index": 1,
-                  "text": "1st Stage"
-                },
-                "2": {
-                  "color": "yellow",
-                  "index": 2,
-                  "text": "Coast 1"
-                },
-                "3": {
-                  "color": "red",
-                  "index": 3,
-                  "text": "2nd Stage"
-                },
-                "4": {
-                  "color": "yellow",
-                  "index": 4,
-                  "text": "Coast 2"
-                },
-                "5": {
-                  "color": "blue",
-                  "index": 5,
-                  "text": "Circularize"
-                },
-                "6": {
-                  "color": "green",
-                  "index": 6,
-                  "text": "Orbital"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 113
-      },
-      "id": 20,
-      "options": {
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "text": {}
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_flight_phase",
-          "legendFormat": "Phase",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Фаза полета",
-      "type": "gauge",
-      "description": "0 — на столе, 1 — первая ступень, 2 — пауза на разделение, 3 — вторая ступень, 4 — полёт к апоцентру, 5 — довыведение, 6 — орбита."
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "max": 1,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.3
-              },
-              {
-                "color": "red",
-                "value": 0.7
-              }
-            ]
-          },
-          "unit": "short",
-          "decimals": 4
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 113
-      },
-      "id": 21,
-      "options": {
-        "orientation": "auto",
-        "reduceOptions": {
-          "values": false,
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "text": {}
-      },
-      "pluginVersion": "10.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_orbit_eccentricity",
-          "legendFormat": "Eccentricity",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Эксцентриситет траектории",
-      "type": "gauge",
-      "description": "Не «орбиты», а именно текущей траектории. На старте близок к единице: вертикальный подъём — это вырожденный эллипс. По мере выведения падает до сотых, и по нему видно, как траектория скругляется: 0.998 на старте, около 0.1 после выключения второй ступени, 0.003 после довыведения."
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
             "mode": "palette-classic"
           },
           "custom": {
@@ -3701,9 +2968,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
-        "y": 121
+        "y": 109
       },
       "id": 22,
       "options": {
@@ -3738,88 +3005,6 @@
       "title": "Гравитация на текущей высоте",
       "type": "timeseries",
       "description": "Истинное ускорение свободного падения. Центростремительное ускорение из него больше не вычитается: в инерциальной системе координат центробежной силы нет, орбитальное движение получается из интегрирования уравнений движения."
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Замкнута ли траектория и лежит ли перицентр выше поверхности. На всём активном участке — «суборбитальная»: это нормально, перицентр поднимается выше поверхности только при довыведении.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "0": {
-                  "color": "red",
-                  "index": 0,
-                  "text": "Суборбитальная"
-                },
-                "1": {
-                  "color": "green",
-                  "index": 1,
-                  "text": "Орбита замкнута"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 121
-      },
-      "id": 37,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "rocket_orbit_closed",
-          "legendFormat": "Замкнута",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Статус орбиты",
-      "type": "stat"
     },
     {
       "datasource": {
@@ -3878,9 +3063,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 121
+        "w": 8,
+        "x": 16,
+        "y": 101
       },
       "id": 38,
       "options": {
@@ -3911,6 +3096,219 @@
         }
       ],
       "title": "Наклонение орбиты",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "id": 107,
+      "panels": [],
+      "title": "📡 Датчики: истинное значение / показание",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "kg"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "id": 105,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rocket_fuel_kg",
+          "legendFormat": "Истинный",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rocket_fuel_sensed_kg",
+          "legendFormat": "Датчик",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Остаток топлива: истинный / датчик",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "deg"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "id": 106,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rocket_attitude_sensor_error_deg",
+          "legendFormat": "Ошибка датчика ориентации",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Датчик ориентации: расхождение с истинной ориентацией",
       "type": "timeseries"
     }
   ],

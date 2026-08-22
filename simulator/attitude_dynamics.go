@@ -165,6 +165,37 @@ type VehicleAttitude struct {
 
 	// SurfaceAuthority — располагаемый момент поверхностей по тангажу, Н·м.
 	SurfaceAuthority float64
+
+	// SensedOrientation — показание датчика ориентации, которым в
+	// attitudeError подменяется истинная ориентация при вычислении ошибки
+	// автопилота. Заполняется снаружи (Simulation.updateAttitude) один раз
+	// за такт, ДО вызова Update — датчик не опрашивается на каждом
+	// внутреннем подшаге интегрирования, как и остальные измерительные
+	// каналы симуляции.
+	//
+	// Нулевое значение (ещё не заполнено — например, в тестах, работающих
+	// с VehicleAttitude напрямую, без Simulation) означает «датчика нет»:
+	// attitudeError считает ошибку по истинной ориентации, как и до
+	// появления датчика. Само интегрирование истинного Orientation по
+	// угловой скорости эта подмена не затрагивает никогда — датчик влияет
+	// только на ветку вычисления ошибки.
+	SensedOrientation physics.Quaternion
+
+	// filteredResidual — сглаженный недобор момента (want − доставлено
+	// плавниками), по которому решается, включать ли двигатели ориентации
+	// (см. интегратор, случай cfg.RCSMoment > 0).
+	//
+	// Сглаживается только этот недобор, а не сама ошибка ориентации: контур
+	// качания камер обязан оставаться быстрым (посадочный манёвр считает
+	// доли секунды), а вот решение «включать ли РСУ» на пассивном участке —
+	// медленное и разовое, и там сырой шум датчика (см.
+	// sensing.DefaultAttitudeSensor), помноженный на момент инерции корпуса
+	// и коэффициент пропорциональности контура, выходит далеко за зону
+	// нечувствительности (RCSMoment·rcsDeadband) и заставляет двигатели
+	// молотить непрерывно там, где раньше молчали. Реальный борт тоже не
+	// принимает решение о расходе рабочего тела по одиночному отсчёту
+	// гироскопа — только по сглаженной оценке.
+	filteredResidual physics.Vec3
 }
 
 // AttitudeInput — внешние условия для расчёта углового движения.
@@ -222,6 +253,7 @@ func (a *VehicleAttitude) Init(target physics.Attitude, frame physics.LocalFrame
 	a.Orientation = physics.QuaternionFromBasis(body.Forward, body.Right, body.Down)
 	a.Omega = physics.Vec3{}
 	a.GimbalPitch, a.GimbalYaw, a.GimbalRoll = 0, 0, 0
+	a.filteredResidual = physics.Vec3{}
 	a.initialised = true
 }
 
@@ -440,6 +472,27 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 			Z: wantYaw - a.SurfaceTorque.Z,
 		}
 
+		// Сглаживание — только когда подключён датчик ориентации (иначе
+		// residual точен и фильтровать нечего, поведение остаётся прежним
+		// для прямых тестов VehicleAttitude). Решение «включать ли РСУ» на
+		// пассивном участке медленное и разовое, а сырой шум датчика (см.
+		// sensing.DefaultAttitudeSensor), помноженный на момент инерции
+		// корпуса и коэффициент пропорциональности контура, выходит далеко
+		// за зону нечувствительности (RCSMoment·rcsDeadband) и заставляет
+		// двигатели молотить непрерывно там, где раньше молчали. Постоянная
+		// времени здесь на порядки больше, чем у контура качания камер
+		// (который остаётся быстрым и сырым — см. attitudeError): решение
+		// о расходе рабочего тела реальный борт тоже не принимает по
+		// одиночному отсчёту гироскопа.
+		if a.SensedOrientation.Norm() > 1e-9 && dt > 0 {
+			const residualFilterTime = 1.5
+			decay := math.Exp(-dt / residualFilterTime)
+			a.filteredResidual = residual.Add(a.filteredResidual.Sub(residual).Scale(decay))
+			residual = a.filteredResidual
+		} else {
+			a.filteredResidual = residual
+		}
+
 		a.ControlTorque = physics.Vec3{
 			X: clampAbs(residual.X, cfg.RCSMoment*cfg.RollAuthority*10),
 			Y: clampAbs(residual.Y, cfg.RCSMoment),
@@ -509,7 +562,23 @@ func (a *VehicleAttitude) attitudeError(target physics.Attitude,
 	body := target.BodyFrame(frame)
 	want := physics.QuaternionFromBasis(body.Forward, body.Right, body.Down)
 
-	err := a.Orientation.Conjugate().Multiply(want).Normalized()
+	// Ошибку считаем от показания датчика, а не от истинной ориентации:
+	// автопилот, как и настоящий борт, знает только то, что говорит
+	// гироскоп. Нулевое SensedOrientation означает «датчик не подключен»
+	// (прямые тесты VehicleAttitude без Simulation) — тогда используется
+	// истинная ориентация, как и раньше.
+	//
+	// Показание здесь сырое, без сглаживания: контур качания камер должен
+	// оставаться быстрым даже на посадочном манёвре, где счёт идёт на доли
+	// секунды. Сглаживание, где оно нужно (решение о переходе на двигатели
+	// ориентации на пассивном участке), применяется отдельно и только там —
+	// см. комментарий у filteredResidual в integrate().
+	current := a.Orientation
+	if a.SensedOrientation.Norm() > 1e-9 {
+		current = a.SensedOrientation
+	}
+
+	err := current.Conjugate().Multiply(want).Normalized()
 
 	// Кватернионы q и −q задают один поворот. Берём тот, что соответствует
 	// повороту меньше половины оборота, иначе автопилот поведёт корпус длинным путём.
@@ -526,7 +595,6 @@ func (a *VehicleAttitude) attitudeError(target physics.Attitude,
 	} else {
 		axis = physics.Vec3{}
 	}
-
 	return axis.Y, axis.Z, axis.X
 }
 
@@ -674,6 +742,12 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 	if cfg.RCSMoment > 0 {
 		s.attitude.Config.RCSMoment = cfg.RCSMoment
 	}
+
+	// Показание датчика ориентации — то, чем реально распоряжается
+	// автопилот при вычислении ошибки (attitudeError). Истинная Orientation
+	// продолжает интегрироваться по угловой скорости ниже, эта подмена её
+	// не затрагивает.
+	s.attitude.SensedOrientation = s.lastValidSensedOrientation
 
 	s.attitude.Update(dt, AttitudeInput{
 		Overrides:        ov,

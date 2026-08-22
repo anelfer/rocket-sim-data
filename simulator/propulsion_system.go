@@ -145,7 +145,11 @@ func fuelHeatInflow(fuel propulsion.Propellant) float64 {
 }
 
 // NewPropulsionSystem собирает двигательную установку ступени.
-func NewPropulsionSystem(p StageProps, rng *rand.Rand, ambientTemperature float64) *PropulsionSystem {
+//
+// rng — физическая случайность (разброс изделий, пульсации давления);
+// sensorRng — отдельный поток для шума измерительных каналов. Их нельзя
+// объединять: см. комментарий у Engine.sensorRng.
+func NewPropulsionSystem(p StageProps, rng, sensorRng *rand.Rand, ambientTemperature float64) *PropulsionSystem {
 	// Компоненты берутся из конфигурации двигателя, а не задаются здесь:
 	// на метане и на керосине это разные жидкости с разной плотностью,
 	// температурой кипения и давлением насыщенных паров, и бак обязан
@@ -295,7 +299,7 @@ func NewPropulsionSystem(p StageProps, rng *rand.Rand, ambientTemperature float6
 	}
 
 	for _, g := range groups {
-		sys.addEngineGroup(g, prefix, rng, ambientTemperature)
+		sys.addEngineGroup(g, prefix, rng, sensorRng, ambientTemperature)
 	}
 
 	return sys
@@ -303,7 +307,7 @@ func NewPropulsionSystem(p StageProps, rng *rand.Rand, ambientTemperature float6
 
 // addEngineGroup добавляет в ступень группу однотипных двигателей.
 func (sys *PropulsionSystem) addEngineGroup(g vehicle.EngineGroup, prefix string,
-	rng *rand.Rand, ambientTemperature float64) {
+	rng, sensorRng *rand.Rand, ambientTemperature float64) {
 
 	for i := 0; i < g.Count; i++ {
 		// Каждый двигатель — отдельное изделие. Приёмочные испытания
@@ -318,7 +322,7 @@ func (sys *PropulsionSystem) addEngineGroup(g vehicle.EngineGroup, prefix string
 		cfg.Turbopump.RotorImbalance *= 1 + rng.NormFloat64()*0.15
 		cfg.Turbopump.GasGeneratorFlow *= 1 + rng.NormFloat64()*0.006
 
-		e := propulsion.NewEngine(cfg, rng, ambientTemperature)
+		e := propulsion.NewEngine(cfg, rng, sensorRng, ambientTemperature)
 		e.ID = fmt.Sprintf("%s-%s%d", prefix, g.Suffix, i+1)
 
 		// Подробный спектральный анализ ведётся по одному двигателю ступени:

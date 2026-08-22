@@ -150,6 +150,7 @@ func engineSample(e propulsion.EngineTelemetry) metrics.EngineDetailSample {
 		InjectorDropFraction: e.InjectorDropFraction,
 
 		ShaftRPM:            e.ShaftRPM.Value(),
+		ShaftRPMTrue:        e.ShaftRPMTrue,
 		AngularAcceleration: e.AngularAcceleration,
 		Torque:              e.ShaftTorque,
 		TurbinePower:        e.TurbinePower,
@@ -171,6 +172,7 @@ func engineSample(e propulsion.EngineTelemetry) metrics.EngineDetailSample {
 		BypassValve: e.BypassValve,
 
 		ChamberPressure:     e.ChamberPressure.Value(),
+		ChamberPressureTrue: e.ChamberPressureTrue,
 		ChamberPressureMean: e.ChamberPressureMean,
 		CharacteristicSpeed: e.CharacteristicVelocity,
 		CStarEfficiency:     e.CStarEfficiency,

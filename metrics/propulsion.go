@@ -93,6 +93,7 @@ var (
 
 	// --- Турбонасосный агрегат ------------------------------------------------
 	tpRPM       = gaugeVec("turbopump_rpm", "Обороты вала ТНА")
+	tpRPMTrue   = gaugeVec("turbopump_rpm_true", "Обороты вала ТНА (истинные, без шума датчика)")
 	tpAngAccel  = gaugeVec("turbopump_angular_acceleration_radps2", "Угловое ускорение вала")
 	tpTorque    = gaugeVec("turbopump_torque_nm", "Крутящий момент на валу")
 	tpTurbineP  = gaugeVec("turbine_power_w", "Мощность турбины")
@@ -110,6 +111,7 @@ var (
 
 	// --- Горение --------------------------------------------------------------
 	combPc         = gaugeVec("chamber_pressure_pa", "Давление в камере сгорания")
+	combPcTrue     = gaugeVec("chamber_pressure_true_pa", "Давление в камере сгорания (истинное, без шума датчика)")
 	combPcMean     = gaugeVec("chamber_pressure_mean_pa", "Среднее давление в камере")
 	combCstar      = gaugeVec("combustion_cstar_mps", "Характеристическая скорость c*")
 	combCstarEff   = gaugeVec("combustion_cstar_efficiency", "Полнота сгорания c*")
@@ -211,10 +213,10 @@ func enginePropulsionVecs() []*prometheus.GaugeVec {
 		flowFuel, flowOx, flowTotal, mixtureGge, flowGasGen,
 		injFuelDrop, injOxDrop, injFraction,
 		valveFuel, valveOx, valveGasGen, valveBypass,
-		tpRPM, tpAngAccel, tpTorque, tpTurbineP, tpFuelPumpP, tpOxPumpP,
+		tpRPM, tpRPMTrue, tpAngAccel, tpTorque, tpTurbineP, tpFuelPumpP, tpOxPumpP,
 		tpLossP, tpMarginP, tpFuelCav, tpOxCav, tpVibr, tpBearingT,
 		tpAxial, tpTurbineT,
-		combPc, combPcMean, combCstar, combCstarEff, combEff, combCf,
+		combPc, combPcTrue, combPcMean, combCstar, combCstarEff, combEff, combCf,
 		combTemp, combMixDev, combRMS, combPeak, combFreq, combMargin,
 		combState, combNonuniform,
 		nozHeatFlux, nozMargin, nozThroat, nozErosion, nozExpRatio,
@@ -242,11 +244,11 @@ func propulsionCollectors() []prometheus.Collector {
 		compDemand, compPerEng, compOut, compDeficit,
 		valveFuel, valveOx, valveGasGen, valveBypass,
 
-		tpRPM, tpAngAccel, tpTorque, tpTurbineP, tpFuelPumpP, tpOxPumpP,
+		tpRPM, tpRPMTrue, tpAngAccel, tpTorque, tpTurbineP, tpFuelPumpP, tpOxPumpP,
 		tpLossP, tpMarginP, tpFuelCav, tpOxCav, tpVibr, tpBearingT,
 		tpAxial, tpTurbineT,
 
-		combPc, combPcMean, combCstar, combCstarEff, combEff, combCf,
+		combPc, combPcTrue, combPcMean, combCstar, combCstarEff, combEff, combCf,
 		combTemp, combMixDev, combRMS, combPeak, combFreq, combMargin,
 		combState, combNonuniform, combSpectrum,
 
@@ -356,6 +358,7 @@ type EngineDetailSample struct {
 	InjectorDropFraction float64
 
 	ShaftRPM            float64
+	ShaftRPMTrue        float64
 	AngularAcceleration float64
 	Torque              float64
 	TurbinePower        float64
@@ -377,6 +380,7 @@ type EngineDetailSample struct {
 	BypassValve float64
 
 	ChamberPressure     float64
+	ChamberPressureTrue float64
 	ChamberPressureMean float64
 	CharacteristicSpeed float64
 	CStarEfficiency     float64
@@ -434,6 +438,7 @@ func SetEngineDetail(engineID string, s EngineDetailSample) {
 	injFraction.WithLabelValues(engineID).Set(s.InjectorDropFraction)
 
 	tpRPM.WithLabelValues(engineID).Set(s.ShaftRPM)
+	tpRPMTrue.WithLabelValues(engineID).Set(s.ShaftRPMTrue)
 	tpAngAccel.WithLabelValues(engineID).Set(s.AngularAcceleration)
 	tpTorque.WithLabelValues(engineID).Set(s.Torque)
 	tpTurbineP.WithLabelValues(engineID).Set(s.TurbinePower)
@@ -454,6 +459,7 @@ func SetEngineDetail(engineID string, s EngineDetailSample) {
 	valveBypass.WithLabelValues(engineID).Set(s.BypassValve)
 
 	combPc.WithLabelValues(engineID).Set(s.ChamberPressure)
+	combPcTrue.WithLabelValues(engineID).Set(s.ChamberPressureTrue)
 	combPcMean.WithLabelValues(engineID).Set(s.ChamberPressureMean)
 	combCstar.WithLabelValues(engineID).Set(s.CharacteristicSpeed)
 	combCstarEff.WithLabelValues(engineID).Set(s.CStarEfficiency)

@@ -33,7 +33,8 @@ type EngineTelemetry struct {
 	GasGeneratorThrust float64 `json:"gasGeneratorThrust"` // Н
 
 	// Давления.
-	ChamberPressure      physics.Float `json:"chamberPressure"`      // Па, с пульсациями
+	ChamberPressure      physics.Float `json:"chamberPressure"`      // Па, с пульсациями — показание датчика
+	ChamberPressureTrue  float64       `json:"chamberPressureTrue"`  // Па — истинное значение, без шума датчика
 	ChamberPressureMean  float64       `json:"chamberPressureMean"`  // Па
 	FuelPumpInlet        physics.Float `json:"fuelPumpInlet"`        // Па
 	FuelPumpOutlet       physics.Float `json:"fuelPumpOutlet"`       // Па
@@ -44,7 +45,8 @@ type EngineTelemetry struct {
 	InjectorDropFraction float64       `json:"injectorDropFraction"` // доля от Pc
 
 	// Турбонасосный агрегат.
-	ShaftRPM            physics.Float `json:"shaftRpm"`
+	ShaftRPM            physics.Float `json:"shaftRpm"`            // показание датчика
+	ShaftRPMTrue        float64       `json:"shaftRpmTrue"`        // истинные обороты, без шума датчика
 	AngularAcceleration float64       `json:"angularAcceleration"` // рад/с²
 	TurbinePower        float64       `json:"turbinePower"`        // Вт
 	FuelPumpPower       float64       `json:"fuelPumpPower"`       // Вт
@@ -174,6 +176,7 @@ func (e *Engine) Telemetry(dt float64, withSpectrum bool) EngineTelemetry {
 		GasGeneratorThrust: e.GasGeneratorThrust,
 
 		ChamberPressure:      physics.Float(ch.Pressure),
+		ChamberPressureTrue:  ch.Pressure,
 		ChamberPressureMean:  ch.MeanPressure,
 		FuelPumpInlet:        physics.Float(tp.FuelPump.InletPressure),
 		FuelPumpOutlet:       physics.Float(tp.FuelPump.OutletPressure),
@@ -184,6 +187,7 @@ func (e *Engine) Telemetry(dt float64, withSpectrum bool) EngineTelemetry {
 		InjectorDropFraction: dropFraction,
 
 		ShaftRPM:            physics.Float(tp.RPM()),
+		ShaftRPMTrue:        tp.RPM(),
 		AngularAcceleration: tp.AngularAcceleration,
 		TurbinePower:        tp.TurbinePower,
 		FuelPumpPower:       tp.FuelPump.Power,
@@ -257,7 +261,7 @@ func (e *Engine) Telemetry(dt float64, withSpectrum bool) EngineTelemetry {
 		s := e.Sensors
 		so := e.sensorOverrides
 		measure := func(sensor *Sensor, trueValue float64) physics.Float {
-			v, valid := sensor.UpdateWith(trueValue, dt, e.rng, so)
+			v, valid := sensor.UpdateWith(trueValue, dt, e.sensorRng, so)
 			if !valid {
 				return physics.Float(math.NaN())
 			}
@@ -270,7 +274,15 @@ func (e *Engine) Telemetry(dt float64, withSpectrum bool) EngineTelemetry {
 		t.OxPumpInlet = measure(s.OxPumpInlet, tp.OxPump.InletPressure)
 		t.FuelFlow = measure(s.FuelFlow, e.FuelFlow)
 		t.OxFlow = measure(s.OxFlow, e.OxFlow)
-		t.ShaftRPM = measure(s.ShaftSpeed, tp.RPM())
+		// Обороты вала уже сняты один раз за такт в Update() — регулятору
+		// нужно то же самое показание, и повторный вызов UpdateWith здесь
+		// испортил бы внутреннее состояние датчика (см. поле
+		// sensedShaftSpeed). Телеметрия только сообщает уже посчитанное.
+		if e.sensedShaftSpeed.Valid {
+			t.ShaftRPM = physics.Float(e.sensedShaftSpeed.Value)
+		} else {
+			t.ShaftRPM = physics.Float(math.NaN())
+		}
 		t.TurbineTemperature = measure(s.TurbineTemp, tp.TurbineTemperature)
 		t.BearingTemperature = measure(s.BearingTemp, tp.BearingTemperature)
 		t.CoolantOutlet = measure(s.CoolantOutlet, nz.CoolantOutletTemp)

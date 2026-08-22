@@ -257,12 +257,36 @@ type Engine struct {
 
 	rng *rand.Rand
 
+	// sensorRng — отдельный генератор для шума измерительных каналов
+	// (SensorSuite), не общий с rng.
+	//
+	// rng кормит физическую случайность (пульсации давления в камере —
+	// Chamber.rng), а показания датчиков — уже отчётность поверх физики.
+	// Если бы оба брали из одного потока, изменение характеристик датчика
+	// (частота обновления, добавление нового канала) сдвигало бы все
+	// последующие броски физического ГСЧ и меняло бы траекторию полёта —
+	// то есть шум измерения перепутывался бы с самой физикой.
+	sensorRng *rand.Rand
+
 	// oscillationStep — шаг интегрирования пульсаций давления, с.
 	oscillationStep float64
 
 	// sensorOverrides — воздействия на измерительный тракт. Хранятся на
 	// двигателе, чтобы телеметрия строилась с их учётом, не меняя сигнатур.
 	sensorOverrides control.SensorOverrides
+
+	// sensedShaftSpeed — показание датчика оборотов вала (об/мин), снятое
+	// один раз за такт, в начале Update.
+	//
+	// Раньше показание считалось только в Telemetry() — для отчёта, а
+	// регулятор оборотов читал истинные обороты напрямую. Теперь то же
+	// самое измерение нужно ещё и регулятору: он не должен «подсматривать»
+	// в истинное состояние модели. Считать его дважды за такт нельзя —
+	// второй вызов Sensor.UpdateWith возьмёт ещё один independent бросок
+	// общего ГСЧ и собьёт внутреннее состояние датчика (задержку, дрейф,
+	// пропуск связи), а с ним и воспроизводимость прогона по сиду. Поэтому
+	// показание считается один раз здесь, а Telemetry() его лишь читает.
+	sensedShaftSpeed Measurement
 
 	// Detailed включает подробный анализ пульсаций со спектром.
 	// Достаточно одного двигателя на ступень: спектры остальных совпадают
@@ -271,7 +295,11 @@ type Engine struct {
 }
 
 // NewEngine создаёт двигатель в выключенном состоянии.
-func NewEngine(cfg EngineConfig, rng *rand.Rand, ambientTemperature float64) *Engine {
+//
+// rng — генератор физической случайности (пульсации давления в камере);
+// sensorRng — отдельный генератор для шума измерительных каналов. Их нельзя
+// путать местами: см. комментарий у поля Engine.sensorRng.
+func NewEngine(cfg EngineConfig, rng, sensorRng *rand.Rand, ambientTemperature float64) *Engine {
 	const oscillationStep = 0.002 // 500 Гц — хватает для пульсаций до 250 Гц
 
 	e := &Engine{
@@ -281,6 +309,7 @@ func NewEngine(cfg EngineConfig, rng *rand.Rand, ambientTemperature float64) *En
 		Nozzle:          NewNozzle(cfg.Nozzle, ambientTemperature),
 		Sensors:         NewSensorSuite(cfg.Chamber.NominalPressure),
 		rng:             rng,
+		sensorRng:       sensorRng,
 		oscillationStep: oscillationStep,
 	}
 	return e
@@ -298,6 +327,16 @@ func (e *Engine) Update(dt float64, in EngineInput) {
 	// клапаны компонентов — площадь проходного сечения форсунок.
 	ov := in.Overrides
 	e.sensorOverrides = ov.Sensors
+
+	// Показание датчика оборотов — до команд клапанам: регулятор ниже
+	// в этой же функции обязан работать с тем, что «видит» борт, а не
+	// с истинными оборотами вала предыдущего такта.
+	if e.Sensors != nil {
+		v, valid := e.Sensors.ShaftSpeed.UpdateWith(e.Turbopump.RPM(), dt, e.sensorRng, e.sensorOverrides)
+		e.sensedShaftSpeed = Measurement{Value: v, Valid: valid}
+	} else {
+		e.sensedShaftSpeed = Measurement{}
+	}
 
 	if ov.ForceIgnition && !e.Running {
 		e.Start()
@@ -374,7 +413,13 @@ func (e *Engine) Update(dt float64, in EngineInput) {
 	// процентов» проходит через мощность турбины, момент на валу и инерцию
 	// ротора, а не появляется в телеметрии мгновенно.
 	if ov.Turbopump.SpeedTarget.Active && e.Running {
-		cmd.GasGen = e.Turbopump.GovernorCommand(ov.Turbopump.SpeedTarget.V, dt)
+		// Регулятор получает то же показание, что и оператор на пульте
+		// (об/мин), переведённое в рад/с — единицы самого регулятора и
+		// цели SpeedTarget. Не истинные обороты вала: без датчика в этой
+		// цепочке отказ измерительного канала было бы нечем показать.
+		measured := e.sensedShaftSpeed
+		measured.Value *= math.Pi / 30
+		cmd.GasGen = e.Turbopump.GovernorCommand(measured, ov.Turbopump.SpeedTarget.V, dt)
 	} else {
 		e.Turbopump.ReleaseGovernor()
 	}

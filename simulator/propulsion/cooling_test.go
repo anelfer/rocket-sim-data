@@ -19,7 +19,7 @@ import (
 
 // engineAt возвращает двигатель, выведенный на установившийся режим.
 func engineAt(cfg EngineConfig, in EngineInput, seconds float64) *Engine {
-	e := NewEngine(cfg, rand.New(rand.NewSource(1)), 288)
+	e := NewEngine(cfg, rand.New(rand.NewSource(1)), rand.New(rand.NewSource(2)), 288)
 	e.Detailed = true
 	e.Start()
 

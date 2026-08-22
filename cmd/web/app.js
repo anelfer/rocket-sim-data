@@ -535,11 +535,6 @@ function updateFlightBanner(s) {
 
   b.textContent = text;
   b.className = text ? cls : 'hidden';
-
-  const layout = $('#layout');
-  const banners = (text ? 1 : 0) + ($('#mode-banner').classList.contains('hidden') ? 0 : 1);
-  layout.classList.toggle('with-banner', banners === 1);
-  layout.classList.toggle('with-banner2', banners === 2);
 }
 
 /* Накопление рядов для графиков. Интерфейс хранит только то, что прислал
@@ -1500,6 +1495,15 @@ function renderParams() {
 function paramCard(p) {
   const card = el('div', `param${p.direct ? ' direct' : ''}`);
   card.dataset.id = p.id;
+  // Фиолетовая рамка — не про то, что воздействие сейчас активно (для
+  // этого есть синяя, .manual), а про природу самого параметра: он
+  // подменяет величину напрямую, в обход физики модели, и трогать его
+  // можно только в режиме «Прямая подмена состояния».
+  if (p.direct) {
+    card.title = 'Служебный параметр «напрямую»: значение подставляется в ' +
+      'модель как есть, минуя физический расчёт. Доступен только в режиме ' +
+      '«Прямая подмена состояния» (Direct state override).';
+  }
 
   /* --- заголовок --- */
   const head = el('div', 'param-head');
@@ -3360,7 +3364,47 @@ async function boot() {
   connect();
 }
 
+/* Сворачивание боковых панелей.
+
+   На тринадцатидюймовом экране (а тем более при разделённом на пол-экрана
+   окне) три колонки фиксированной ширины съедают весь экран, а левая панель
+   параметров нужна далеко не всегда — большую часть полёта достаточно
+   центральной панели и графиков. Состояние помнится между перезагрузками:
+   сворачивать панель заново при каждом обновлении страницы было бы
+   утомительно. */
+function setupPaneCollapse() {
+  const layout = $('#layout');
+
+  const apply = (side, collapsed) => {
+    layout.classList.toggle(`collapsed-${side}`, collapsed);
+    const btn = $(`#toggle-${side}`);
+    if (btn) {
+      btn.textContent = collapsed
+        ? (side === 'left' ? '›' : '‹')
+        : (side === 'left' ? '‹' : '›');
+      btn.title = collapsed
+        ? `Развернуть панель ${side === 'left' ? 'управления' : 'данных'}`
+        : `Свернуть панель ${side === 'left' ? 'управления' : 'данных'}`;
+    }
+  };
+
+  for (const side of ['left', 'right']) {
+    let stored = false;
+    try { stored = localStorage.getItem(`pane-collapsed-${side}`) === '1'; } catch { /* noop */ }
+    apply(side, stored);
+    $(`#toggle-${side}`).addEventListener('click', () => {
+      const collapsed = !layout.classList.contains(`collapsed-${side}`);
+      apply(side, collapsed);
+      try {
+        localStorage.setItem(`pane-collapsed-${side}`, collapsed ? '1' : '0');
+      } catch { /* приватный режим браузера — переживём и без запоминания */ }
+    });
+  }
+}
+
 function bindControls() {
+  setupPaneCollapse();
+
   // Делегированный обработчик нажатия по блоку двигателей.
   //
   // Сам #engine-strip не пересоздаётся никогда — только его содержимое,
@@ -3435,17 +3479,12 @@ function bindControls() {
       });
   };
 
-  $('#btn-ignite').onclick = igniteAll;
-  $('#btn-emergency').onclick = () => {
-    askConfirm('Аварийное выключение двигателей',
-      'Все двигатели будут выключены немедленно, в обход приоритетов воздействий.',
-      'Носитель перейдёт в баллистический полёт.',
-      () => action('emergency-shutdown'));
-  };
-  $('#btn-nominal').onclick = () => {
-    action('restore-nominal');
-    toast('ok', 'Штатный режим', 'Все воздействия сняты');
-  };
+  // Зажигание, аварийная остановка и «Штатный режим» — уже есть в карточках
+  // центральной панели (#panel-state, видна всегда, на любой вкладке слева
+  // и справа): «Тяга двигательной установки» и «Быстрый эксперимент
+  // с турбонасосным агрегатом» (кнопка «Штатный режим» в разделе «Возврат»).
+  // Дублировать их в шапке было попросту незачем, а с виду не отличить,
+  // какая из двух одинаковых кнопок сработает.
   $('#btn-release-all').onclick = () =>
     submit({ parameter: '*', mode: 'release' });
 

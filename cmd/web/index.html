@@ -25,21 +25,17 @@
       <select id="mission"></select>
     </label>
     <span class="sep"></span>
-    <button id="btn-start"     class="btn btn-go"    data-key="1">Start</button>
-    <button id="btn-pause"     class="btn"           data-key="2">Pause</button>
-    <button id="btn-resume"    class="btn"           data-key="3">Resume</button>
-    <button id="btn-step"      class="btn"           data-key="4">Step</button>
-    <button id="btn-stop"      class="btn">Stop</button>
-    <button id="btn-reset"     class="btn">Reset</button>
+    <button id="btn-start"     class="btn btn-go"    data-key="1" title="Начать новый прогон с чистого листа">Start</button>
+    <button id="btn-pause"     class="btn"           data-key="2" title="Остановить модельное время; телеметрия продолжает публиковаться, прогон не завершается">Pause</button>
+    <button id="btn-resume"    class="btn"           data-key="3" title="Снять паузу, вернуть ход модельного времени">Resume</button>
+    <button id="btn-step"      class="btn"           data-key="4" title="Только на паузе: продвинуть модель на несколько шагов интегрирования и снова встать — удобно разбирать быстрый процесс покадрово, не снимая паузу насовсем">Step</button>
+    <button id="btn-stop"      class="btn" title="Завершить прогон насовсем. Модельное время замирает, двигатели и наведение больше не работают — чтобы лететь дальше, нужен новый Start">Stop</button>
+    <button id="btn-reset"     class="btn" title="Вернуть ЭТОТ прогон к T+0 (носитель на старте, полные баки) и поставить на паузу — без остановки и нового Start. Все воздействия и режимы Unsafe/Direct снимаются">Reset</button>
     <span class="sep"></span>
     <label class="speed">
       Скорость
       <select id="speed"></select>
     </label>
-    <span class="sep"></span>
-    <button id="btn-nominal"   class="btn btn-warn">Штатный режим</button>
-    <button id="btn-ignite"    class="btn btn-go" title="Запустить все камеры активной ступени в обход наведения — тягу задайте отдельно ползунком «Тяга двигательной установки»">Зажечь двигатели</button>
-    <button id="btn-emergency" class="btn btn-crit" title="Погасить все камеры и обнулить уставку тяги">Погасить все двигатели</button>
   </div>
 
   <div class="status-strip">
@@ -53,16 +49,6 @@
     <div class="stat"><span class="stat-label">Задержка</span><span class="stat-value" id="stat-latency">—</span></div>
   </div>
 
-  <div class="mode-strip">
-    <label class="toggle toggle-unsafe">
-      <input type="checkbox" id="mode-unsafe">
-      <span>Unsafe overrides</span>
-    </label>
-    <label class="toggle toggle-direct">
-      <input type="checkbox" id="mode-direct">
-      <span>Direct state override</span>
-    </label>
-  </div>
 </header>
 
 <div id="mode-banner" class="hidden"></div>
@@ -73,9 +59,30 @@
 
   <!-- ---------- Левая панель: управление ---------- -->
   <section id="panel-control" class="pane">
+    <button id="toggle-left" class="pane-toggle" title="Свернуть панель управления">‹</button>
     <div class="pane-head">
       <h2>Управление</h2>
       <input type="search" id="param-filter" placeholder="Поиск параметра…">
+    </div>
+
+    <div class="param-legend">
+      <span class="legend-item" title="Параметр сейчас под ручной командой оператора — автопилот или регулятор в него не вмешивается">
+        <i class="legend-swatch manual"></i>Изменено вручную
+      </span>
+      <span class="legend-item" title="Служебный параметр «напрямую»: значение подставляется в модель как есть, в обход физического расчёта. Доступен только в режиме «Прямая подмена состояния»">
+        <i class="legend-swatch direct"></i>Прямая подмена
+      </span>
+    </div>
+
+    <div class="mode-strip">
+      <label class="toggle toggle-unsafe" title="Разрешает подавать значение параметра за пределами его аттестованного диапазона (например, дросселирование ниже нижнего предела камеры). Без этого режима такая команда отклоняется с объяснением, что случится">
+        <input type="checkbox" id="mode-unsafe">
+        <span>Небезопасный режим <i>(Unsafe overrides)</i></span>
+      </label>
+      <label class="toggle toggle-direct" title="Позволяет записать значение величины напрямую, в обход физики модели — например, задать давление в камере числом, а не получить его из расхода и горловины. Причинность на этой величине временно нарушается — на пульте это видно по фиолетовой рамке параметра">
+        <input type="checkbox" id="mode-direct">
+        <span>Прямая подмена <i>(Direct state override)</i></span>
+      </label>
     </div>
 
     <nav id="subsystem-tabs" class="tabs"></nav>
@@ -162,6 +169,7 @@
 
   <!-- ---------- Правая панель: графики и журналы ---------- -->
   <section id="panel-data" class="pane">
+    <button id="toggle-right" class="pane-toggle" title="Свернуть панель данных">›</button>
     <nav class="tabs" id="data-tabs">
       <button class="tab active" data-view="charts">Графики</button>
       <button class="tab" data-view="cutaway">Развёртка</button>

@@ -214,8 +214,16 @@ func (s *Simulation) ControlSnapshot() ControlSnapshot {
 		ThrottleDemand: s.propulsion.ThrottleDemand,
 		ThrustDeficit:  s.propulsion.ThrustDeficit,
 	}
+	// Пока прогон идёт, реальное время — часы на стене. Как только он
+	// остановлен, поставлен на паузу или завершён, оно замирает на
+	// haltedAt: снимок можно запросить и через час после Stop, и реальное
+	// время не должно расти вместе с этим часом.
 	if !s.startedAt.IsZero() {
-		snap.RealTime = time.Since(s.startedAt).Seconds()
+		ref := time.Now()
+		if s.runState != RunRunning && !s.haltedAt.IsZero() {
+			ref = s.haltedAt
+		}
+		snap.RealTime = ref.Sub(s.startedAt).Seconds()
 	}
 	engine := s.propulsion.PrimaryEngine()
 	all := append([]*propulsion.Engine(nil), s.propulsion.Engines...)

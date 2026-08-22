@@ -87,12 +87,21 @@ func (s *Simulation) shouldMECO(nav orbit.NavState) bool {
 	stage := s.Config.FirstStage
 
 	// Топливо израсходовано до резерва, оставленного на возврат ступени.
-	if s.state.FuelMass <= stage.FuelReserve {
+	//
+	// Порог по остатку — это ровно то решение, которое в реальности
+	// принимается по показанию датчика, а не по факту в баке: настоящего
+	// прямого измерения массы не существует физически (см.
+	// DefaultPropellantSensor), и борт не может знать остаток точнее,
+	// чем говорит его собственная оценка.
+	if s.sensedFuelMass <= stage.FuelReserve {
 		return true
 	}
 
 	// Либо кончился один из компонентов: дальше двигатель работать не может
-	// независимо от того, сколько осталось второго.
+	// независимо от того, сколько осталось второго. Это не показание
+	// датчика остатка, а физический факт — сорванная подача горючего или
+	// окислителя, который сама камера обнаруживает по срыву горения
+	// независимо ни от какой оценки массы.
 	if s.propulsion != nil {
 		if s.propulsion.FuelTank.Empty() || s.propulsion.OxTank.Empty() {
 			return true
@@ -240,7 +249,7 @@ func (s *Simulation) performStageSeparation() {
 		OxTankPressure:     cfg.SecondStage.OxTankPressure,
 		FuelPressurantMass: cfg.SecondStage.FuelPressurantMass,
 		OxPressurantMass:   cfg.SecondStage.OxPressurantMass,
-	}, s.rng, ambientTemp)
+	}, s.rng, s.sensorRng, ambientTemp)
 
 	s.dryMass = s.propulsion.DryMass()
 	s.state.FuelMass = s.propulsion.PropellantMass()
