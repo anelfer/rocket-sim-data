@@ -514,6 +514,8 @@ func (s *PropulsionSystem) Update(dt, throttle float64, env PropulsionEnvironmen
 		OxVaporPressure:   ox.Propellant.VaporPressure(ox.Temperature),
 		FuelAvailable:     !fuel.Empty() && !ov.FuelTank.LineRuptured,
 		OxAvailable:       !ox.Empty() && !ov.OxTank.LineRuptured,
+		FuelGasFraction:   1 - fuel.Settled,
+		OxGasFraction:     1 - ox.Settled,
 		Gravity:           env.Gravity,
 		MixtureTrim:       s.MixtureTrim * s.utilizationTrim(),
 		CoolingValve:      s.CoolingValve,

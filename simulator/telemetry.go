@@ -91,6 +91,9 @@ type Telemetry struct {
 	ControlSaturated bool    `json:"controlSaturated"`
 	UsingRCS         bool    `json:"usingRcs"`
 
+	// RCSPropellantMass — остаток рабочего тела двигателей ориентации, кг.
+	RCSPropellantMass float64 `json:"rcsPropellantMass"`
+
 	// Моменты, Н·м.
 	AeroTorque    float64 `json:"aeroTorque"`
 	ControlTorque float64 `json:"controlTorque"`
@@ -271,6 +274,8 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 		ControlAuthority: s.attitude.Authority,
 		ControlSaturated: s.attitude.Saturated,
 		UsingRCS:         s.attitude.UsingRCS,
+
+		RCSPropellantMass: s.rcsPropellant,
 
 		AeroTorque:    s.attitude.AeroTorque.Norm(),
 		ControlTorque: s.attitude.ControlTorque.Norm(),

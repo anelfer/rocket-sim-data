@@ -126,6 +126,13 @@ type Tank struct {
 	// CenterOfMassOffset — смещение центра масс жидкости от оси бака, м.
 	CenterOfMassOffset float64
 
+	// Settled — доля объёма жидкости, реально закрывающая заборник, 0…1.
+	//
+	// Под перегрузкой жидкость прижата к днищу; в свободном падении её
+	// ничто не удерживает у заборника, и насос вместо жидкости может
+	// забрать газ наддува. См. updateSettling.
+	Settled float64
+
 	// consumed — накопленный расход через двигатель, кг.
 	consumed float64
 
@@ -145,6 +152,7 @@ func NewTank(cfg TankConfig, p Propellant) *Tank {
 		PressurantPressure:  cfg.PressurantPressure,
 		LineTemperature:     cfg.InitialTemperature,
 		PressurantValve:     0,
+		Settled:             1,
 	}
 }
 
@@ -219,11 +227,15 @@ func (t *Tank) OutletPressure(axialAcceleration float64) float64 {
 	}
 
 	head := t.Density() * math.Max(0, axialAcceleration) * t.LiquidLevel()
-	p := t.Pressure + head - t.LineDrop
 
 	// Колебания жидкости качают давление на входе насоса: гребень волны
 	// у заборного устройства повышает напор, впадина понижает.
-	p += t.Density() * math.Max(0, axialAcceleration) * t.SloshAmplitude * 0.5
+	slosh := t.Density() * math.Max(0, axialAcceleration) * t.SloshAmplitude * 0.5
+
+	// Неосевшее топливо: заборник видит не жидкость, а газ наддува —
+	// без столба и без волны на поверхности, которых у него физически
+	// нет. См. updateSettling.
+	p := t.Pressure - t.LineDrop + (head+slosh)*t.Settled
 
 	if p < 0 {
 		return 0
@@ -299,6 +311,7 @@ func (t *Tank) Update(dt, consumption float64, env TankEnvironment) {
 	t.updateTemperature(dt, env)
 	t.updateLine(dt, consumption, env)
 	t.updateSlosh(dt, env)
+	t.updateSettling(dt, env)
 
 	// Прямые подмены состояния. Баланс масс при этом перестаёт сходиться,
 	// поэтому режим выделен в интерфейсе как отладочный.
@@ -622,6 +635,68 @@ func (t *Tank) updateSlosh(dt float64, env TankEnvironment) {
 	// подвижной массы: в почти полном баке плещется лишь тонкий слой.
 	mobile := 4 * fill * (1 - fill)
 	t.CenterOfMassOffset = t.SloshAmplitude * mobile * 0.5
+}
+
+// -----------------------------------------------------------------------------
+// Осадка топлива
+// -----------------------------------------------------------------------------
+
+// settleThreshold — осевая перегрузка, ниже которой жидкость в баке
+// считается неосевшей, м/с².
+//
+// Значение намеренно мало (около 0.005 g): нужна не точная граница,
+// а отсечка того, что неотличимо от невесомости — заметная тяга или
+// торможение поднимают перегрузку на порядки выше.
+const settleThreshold = 0.05
+
+// settleTau, unsettleTau — характерные времена осадки, с.
+//
+// Под тягой жидкость прижимается к днищу за секунды — этим временем
+// задаётся всплытие воздушных пузырей сквозь толщу жидкости и её растекание
+// по днищу. В свободном падении её ничто не удерживает у заборника, и она
+// уходит от него быстро, без всякой удерживающей силы.
+const (
+	settleTau   = 1.5
+	unsettleTau = 0.4
+)
+
+// updateSettling обновляет долю жидкости, реально закрывающую заборник.
+//
+// Под перегрузкой жидкость прижата к днищу и закрывает заборник; в свободном
+// падении её ничто не удерживает, и насос вместо жидкости может забрать газ
+// наддува — в OutletPressure это и моделируется отсечкой гидростатического
+// и slosh-вкладов долей Settled. Расходный бак всегда осел: в этом и смысл
+// его существования (см. OutletPressure, случай HeaderFeed).
+func (t *Tank) updateSettling(dt float64, env TankEnvironment) {
+	if t.HeaderFeed {
+		t.Settled = 1
+		return
+	}
+
+	target := 0.0
+	tau := unsettleTau
+	if env.AxialAcceleration > settleThreshold {
+		target = 1
+		tau = settleTau
+	}
+
+	t.Settled += (target - t.Settled) * math.Min(1, dt/tau)
+	t.Settled = math.Max(0, math.Min(1, t.Settled))
+
+	// Экспоненциальное приближение математически не достигает цели никогда,
+	// а остаток в тысячные доли процента — не остаточная авиация, а хвост
+	// релаксации. Без округления он бесконечно долго читался бы кавитацией
+	// (Pump.Update прибавляет к её глубине именно 1−Settled) — предупреждение
+	// держалось бы на приборной панели ещё десятки секунд после того, как
+	// топливо в любом практическом смысле уже осело.
+	const settleEpsilon = 1e-4
+	if math.Abs(t.Settled-target) < settleEpsilon {
+		t.Settled = target
+	}
+
+	if o := env.Overrides.SettledDirect; o.Active {
+		t.Settled = math.Max(0, math.Min(1, o.V))
+	}
 }
 
 // Consumed возвращает накопленный расход через двигатель, кг.

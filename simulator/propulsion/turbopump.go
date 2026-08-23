@@ -83,7 +83,12 @@ type Pump struct {
 //
 // Напор подчиняется законам подобия: H ∝ N². При кавитации часть крыльчатки
 // работает в паровой каверне, напор и КПД падают.
-func (p *Pump) Update(speed, inletPressure, density, vaporPressure, gravity float64,
+//
+// gasFraction — доля объёма на входе, занятая газом, а не жидкостью (0…1).
+// Источник — неосевшее в невесомости топливо (Tank.Settled, см. tank.go):
+// заборник вместо жидкости захватывает газ наддува. Складывается с ручным
+// GasIngestion, а не подменяет его — это два разных источника одного явления.
+func (p *Pump) Update(speed, inletPressure, density, vaporPressure, gravity, gasFraction float64,
 	ov control.PumpOverrides) {
 
 	cfg := p.Config
@@ -135,7 +140,7 @@ func (p *Pump) Update(speed, inletPressure, density, vaporPressure, gravity floa
 
 	// Газ, попавший на вход, действует на насос так же, как паровая каверна:
 	// крыльчатка работает в двухфазной среде и теряет напор.
-	if gas := ov.GasIngestion.Or(0); gas > 0 {
+	if gas := math.Max(0, gasFraction) + ov.GasIngestion.Or(0); gas > 0 {
 		p.CavitationSeverity = math.Min(1, p.CavitationSeverity+gas)
 	}
 

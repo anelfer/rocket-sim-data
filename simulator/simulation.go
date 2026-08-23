@@ -96,24 +96,25 @@ type Simulation struct {
 	mu sync.RWMutex
 
 	// Состояние, защищённое mu.
-	state        VehicleState
-	engines      []vehicle.Engine
-	dryMass      float64
-	area         float64
-	elapsed      float64
-	phase        orbit.FlightPhase
-	stage        int
-	gnc          *orbit.GNCSystem
-	maxQ         MaxQState
-	telemetry    Telemetry
-	fairingGone  bool
-	mecoTime     float64
-	secoTime     float64
-	circStart    float64
-	crashed      bool
-	released     bool
-	orbitReached bool
-	throttleCmd  float64
+	state         VehicleState
+	engines       []vehicle.Engine
+	dryMass       float64
+	rcsPropellant float64
+	area          float64
+	elapsed       float64
+	phase         orbit.FlightPhase
+	stage         int
+	gnc           *orbit.GNCSystem
+	maxQ          MaxQState
+	telemetry     Telemetry
+	fairingGone   bool
+	mecoTime      float64
+	secoTime      float64
+	circStart     float64
+	crashed       bool
+	released      bool
+	orbitReached  bool
+	throttleCmd   float64
 
 	// orbitCorrectionBurn сообщает, что двигатели сейчас работают по
 	// собственному решению автоматики поддержания орбиты (maintainOrbit),
@@ -444,6 +445,7 @@ func (s *Simulation) initState() {
 	}, s.rng, s.sensorRng, ambient)
 
 	s.dryMass = s.propulsion.DryMass()
+	s.rcsPropellant = cfg.RCSPropellantMass
 	s.state.FuelMass = s.propulsion.PropellantMass()
 	s.fuelSensor = propulsion.NewSensorAt(propulsion.DefaultPropellantSensor(s.state.FuelMass), s.state.FuelMass)
 	s.sensedFuelMass = s.state.FuelMass
@@ -751,6 +753,25 @@ func (s *Simulation) step(dt float64) {
 		AngularAcceleration: s.prevAngularAccel,
 		Gravity:             physics.GravityMagnitudeAtAltitude(nav.Altitude),
 	})
+
+	// Пока ракета держится захватами, она не в невесомости — топливо прижато
+	// к днищу баков обычной земной гравитацией, а не тягой. prevAxialAccel
+	// выше намеренно не видит эту гравитацию (см. п.6): она задаёт только
+	// добавочный напор от тяги, и Update, вызванный строкой выше, честно
+	// решил бы, что топливо всё это время не осело.
+	//
+	// Форсировать нужно именно здесь, ПОСЛЕ Update, а не до него: газовая
+	// доля на входе насоса берётся из Settled таким, каким он был к КОНЦУ
+	// предыдущего такта (тот же порядок причинности, что и у давления
+	// на входе насоса) — если бы поправка стояла перед Update, тот же вызов
+	// тут же откатил бы Settled на один шаг релаксации назад, и по всему
+	// столу, включая самый последний такт перед отрывом, приборы показывали
+	// бы кавитацию, которой нет.
+	if !s.released {
+		s.propulsion.FuelTank.Settled = 1
+		s.propulsion.OxTank.Settled = 1
+	}
+
 	s.syncEngineTelemetry(atm)
 
 	// 4.2. Угловое движение корпуса.

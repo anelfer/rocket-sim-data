@@ -124,6 +124,14 @@ type VehicleAttitude struct {
 	AeroTorque    physics.Vec3
 	ControlTorque physics.Vec3
 
+	// SloshTorque — момент от плескания топлива, Н·м.
+	//
+	// Смещённая масса жидкости в баках уводит общий центр масс носителя
+	// от продольной оси, на которой лежит вектор тяги; тяга, действующая
+	// на этом плече, и есть момент. Только по тангажу — так же, как и
+	// вход, которым плескание возбуждается (см. AttitudeInput.SloshLateralOffset).
+	SloshTorque physics.Vec3
+
 	// Inertia — тензор инерции на текущем шаге, кг·м².
 	Inertia physics.InertiaTensor
 
@@ -221,6 +229,17 @@ type AttitudeInput struct {
 	// Mass — масса носителя, кг.
 	Mass float64
 
+	// CarriedMass — масса, которую ступень везёт сверх своей конструкции
+	// и топлива: следующая ступень, обтекатель, полезная нагрузка, кг.
+	// Для тензора инерции считается точечной массой у носа, а не размазанной
+	// по длине текущей ступени — см. physics.CompositeInertia.
+	CarriedMass float64
+
+	// EngineMass — суммарная масса всех двигателей активной ступени, кг.
+	// Точечная масса у среза сопел (хвост), а не размазанная по длине
+	// ступени — см. physics.CompositeInertia.
+	EngineMass float64
+
 	// Length, Radius — геометрия корпуса, м.
 	Length, Radius float64
 
@@ -232,6 +251,12 @@ type AttitudeInput struct {
 
 	// EngineRingRadius — радиус расстановки двигателей, м.
 	EngineRingRadius float64
+
+	// SloshLateralOffset — поперечное смещение общего центра масс носителя
+	// из-за плескания топлива в баках, м. Считается снаружи (updateAttitude)
+	// из состояния баков — датчиков смещения жидкости не существует, это
+	// не измеряемая, а расчётная величина.
+	SloshLateralOffset float64
 
 	// Overrides — ручные воздействия на рулевой тракт.
 	Overrides control.ControlOverrides
@@ -286,20 +311,24 @@ func (a *VehicleAttitude) Update(dt float64, in AttitudeInput) {
 // integrate выполняет один малый шаг углового движения.
 func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	shape := physics.AeroShape{
-		Length:                 in.Length,
-		Radius:                 in.Radius,
-		CenterOfMass:           in.CenterOfMass,
-		CenterOfPressureAxial:  0.30,
-		CenterOfPressureNormal: 0.50,
+		Length:       in.Length,
+		Radius:       in.Radius,
+		CenterOfMass: in.CenterOfMass,
 	}
 	// Запас устойчивости в калибрах. Положительный означает, что центр
 	// давления позади центра масс и поток возвращает корпус к себе;
-	// отрицательный — что центр давления впереди и поток уводит.
-	// У носителя без оперения он отрицательный, и это норма.
-	a.StaticMargin = (shape.CenterOfPressureNormal - in.CenterOfMass) *
+	// отрицательный — что центр давления впереди и поток уводит. У
+	// изолированной ступени без оперения он обычно отрицательный, но
+	// не всегда: тяжёлая связка на носу (несомая масса — следующая
+	// ступень, нагрузка) утягивает центр масс вперёд и может развернуть
+	// знак в плюс — тогда корпус устойчив уже за счёт компоновки.
+	cop := physics.CenterOfPressureNormal(in.Mach)
+	a.StaticMargin = (cop - in.CenterOfMass) *
 		in.Length / (2 * in.Radius)
 
-	a.Inertia = physics.CylinderInertia(in.Mass, in.Radius, in.Length)
+	a.Inertia = physics.CompositeInertia(
+		in.Mass-in.CarriedMass-in.EngineMass, in.EngineMass, in.CarriedMass,
+		in.Radius, in.Length, in.CenterOfMass)
 
 	// --- 1. Аэродинамический момент ------------------------------------------
 	//
@@ -515,7 +544,8 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	}
 
 	// --- 6. Уравнения вращения ------------------------------------------------
-	torque := a.AeroTorque.Add(a.ControlTorque).Add(a.SurfaceTorque)
+	a.SloshTorque = physics.Vec3{Y: in.Thrust * in.SloshLateralOffset}
+	torque := a.AeroTorque.Add(a.ControlTorque).Add(a.SurfaceTorque).Add(a.SloshTorque)
 	alpha := a.Inertia.AngularAcceleration(a.Omega, torque)
 
 	a.Omega = a.Omega.Add(alpha.Scale(dt))
@@ -692,7 +722,7 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 	nav orbit.NavState, atm physics.AtmosphereState, ov control.ControlOverrides) {
 
 	cfg := s.Config
-	mass := s.dryMass + s.state.FuelMass
+	mass := s.dryMass + s.state.FuelMass + s.rcsPropellant
 
 	// Длина активной ступени вместе с тем, что она везёт.
 	length := cfg.FirstStageLength
@@ -700,18 +730,42 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 		length = secondStageLength(cfg)
 	}
 
-	// Центр масс уезжает к двигателям по мере выработки: полный бак смещает
-	// его к носу, пустой оставляет массу конструкции внизу. Именно поэтому
-	// запас устойчивости меняется по ходу работы ступени.
-	fill := 0.0
-	if s.propulsion != nil {
-		fill = s.propulsion.FillFraction()
+	// Центр масс и тензор инерции считаются по одному и тому же разложению
+	// на тела: своя конструкция ступени с топливом, двигатели у среза сопел
+	// и всё, что ступень везёт сверх этого (следующая ступень, обтекатель,
+	// нагрузка) — точечная масса у носа. Восстанавливается вычитанием, новых
+	// полей конфигурации почти не потребовалось (см. physics.CompositeInertia).
+	ownDryMass := cfg.FirstStage.DryMass
+	stageCfg := cfg.FirstStage
+	if s.stage == 1 {
+		ownDryMass += s.dispersion.DryMassDelta // тот же разброс, что в StructureMass
+	} else {
+		ownDryMass = cfg.SecondStage.DryMass
+		stageCfg = cfg.SecondStage
 	}
-	const (
-		comFull  = 0.52 // доля длины от носа при полных баках
-		comEmpty = 0.72 // при пустых
-	)
-	com := comEmpty + (comFull-comEmpty)*fill
+	propellant := 0.0
+	if s.propulsion != nil {
+		propellant = s.propulsion.PropellantMass()
+	}
+	// Топливо РСУ — аппаратура текущей ступени, а не следующей: в "своей"
+	// массе, а не в несомой.
+	carried := math.Max(0, mass-ownDryMass-propellant-s.rcsPropellant)
+
+	// Двигатели — тяжёлая масса, сосредоточенная у среза сопел, а не
+	// размазанная по длине ступени вместе с баками. Пустой бак не тянет
+	// центр масс к двигателям сам по себе: тянут именно они, и ровно
+	// настолько, насколько весят.
+	engineMass := stageCfg.EngineMass * stageCfg.EngineCount
+	bodyMass := math.Max(0, ownDryMass+propellant+s.rcsPropellant-engineMass)
+
+	// Центр масс — взвешенное среднее трёх тел: своя конструкция с топливом
+	// на геометрической середине (length/2), двигатели у хвоста (x=length),
+	// несомая масса у носа (x=0). В долях длины от носа коэффициент при
+	// bodyMass — 0.5, при engineMass — 1, при carried — 0.
+	com := 0.5
+	if mass > 0 {
+		com = (bodyMass*0.5 + engineMass) / mass
+	}
 
 	// На возвращении центр масс уходит вперёд: посадочное топливо держат
 	// в носовых расходных баках. Это не мелочь компоновки, а условие
@@ -730,6 +784,15 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 		thrust = s.propulsion.TotalThrust
 	}
 
+	// Плескание топлива смещает общий центр масс носителя от продольной
+	// оси, на которой лежит вектор тяги: тяга на этом плече и есть момент
+	// возмущения (см. AttitudeInput.SloshLateralOffset, integrate()).
+	sloshOffset := 0.0
+	if s.propulsion != nil && mass > 0 {
+		sloshOffset = (s.propulsion.FuelTank.Mass*s.propulsion.FuelTank.CenterOfMassOffset +
+			s.propulsion.OxTank.Mass*s.propulsion.OxTank.CenterOfMassOffset) / mass
+	}
+
 	// На стартовом столе корпус удерживается захватами и повернуться не может.
 	// Интегрировать вращение до отрыва значит позволить ветру развернуть
 	// закреплённую ракету.
@@ -738,9 +801,14 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 		return
 	}
 
-	// Момент двигателей ориентации — свойство изделия.
+	// Момент двигателей ориентации — свойство изделия. Истощённый бюджет
+	// топлива РСУ выключает его так же честно, как ov.Dead: ступень без
+	// рабочего тела реально теряет ориентацию, а не работает бесплатно.
 	if cfg.RCSMoment > 0 {
 		s.attitude.Config.RCSMoment = cfg.RCSMoment
+		if s.rcsPropellant <= 0 {
+			s.attitude.Config.RCSMoment = 0
+		}
 	}
 
 	// Показание датчика ориентации — то, чем реально распоряжается
@@ -750,21 +818,33 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 	s.attitude.SensedOrientation = s.lastValidSensedOrientation
 
 	s.attitude.Update(dt, AttitudeInput{
-		Overrides:        ov,
-		Target:           target,
-		Frame:            nav.Frame,
-		AirRelative:      nav.AirRelativeVelocity,
-		DynamicPressure:  nav.DynamicPressure,
-		Mach:             machNumber(nav.AirRelativeVelocity.Norm(), atm.SoundSpeed),
-		Thrust:           thrust,
-		Mass:             mass,
-		Length:           length,
-		Radius:           cfg.Diameter / 2,
-		CenterOfMass:     com,
-		GimbalArm:        arm,
-		EngineRingRadius: cfg.EngineRingRadius,
-		Controllable:     thrust > 0,
+		Overrides:          ov,
+		Target:             target,
+		Frame:              nav.Frame,
+		AirRelative:        nav.AirRelativeVelocity,
+		DynamicPressure:    nav.DynamicPressure,
+		Mach:               machNumber(nav.AirRelativeVelocity.Norm(), atm.SoundSpeed),
+		Thrust:             thrust,
+		Mass:               mass,
+		CarriedMass:        carried,
+		EngineMass:         engineMass,
+		Length:             length,
+		Radius:             cfg.Diameter / 2,
+		CenterOfMass:       com,
+		GimbalArm:          arm,
+		EngineRingRadius:   cfg.EngineRingRadius,
+		SloshLateralOffset: sloshOffset,
+		Controllable:       thrust > 0,
 	})
+
+	// Расход рабочего тела РСУ: пропорционален доле от располагаемого
+	// момента, а не факту работы как таковому — блокам, довернувшим корпус
+	// на пределе, топлива нужно больше, чем еле заметно шевелящим его.
+	if s.attitude.UsingRCS && cfg.RCSMoment > 0 {
+		fraction := s.attitude.ControlTorque.Norm() / cfg.RCSMoment
+		used := math.Min(s.rcsPropellant, cfg.RCSPropellantFlow*fraction*dt)
+		s.rcsPropellant -= used
+	}
 }
 
 // Attitude возвращает угловое состояние носителя.
@@ -777,7 +857,9 @@ func (s *Simulation) Attitude() VehicleAttitude {
 // integrateNoControl интегрирует вращение только под управляющим моментом.
 // Используется в тестах для проверки знаков.
 func (a *VehicleAttitude) integrateNoControl(dt float64, in AttitudeInput) {
-	a.Inertia = physics.CylinderInertia(in.Mass, in.Radius, in.Length)
+	a.Inertia = physics.CompositeInertia(
+		in.Mass-in.CarriedMass-in.EngineMass, in.EngineMass, in.CarriedMass,
+		in.Radius, in.Length, in.CenterOfMass)
 	side := in.Thrust * in.GimbalArm
 	a.ControlTorque = physics.Vec3{
 		X: in.Thrust * math.Sin(a.GimbalRoll) * in.EngineRingRadius,

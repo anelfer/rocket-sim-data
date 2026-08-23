@@ -170,6 +170,13 @@ type EngineInput struct {
 	FuelAvailable bool
 	OxAvailable   bool
 
+	// FuelGasFraction, OxGasFraction — доля газа наддува на входе насоса,
+	// а не жидкости (0…1). Источник — неосевшее в невесомости топливо
+	// (Tank.Settled): заборник вместо жидкости захватывает газ. Ноль
+	// означает, что топливо у заборника, как на активном участке.
+	FuelGasFraction float64
+	OxGasFraction   float64
+
 	// Gravity — местное ускорение свободного падения, м/с².
 	Gravity float64
 
@@ -446,9 +453,11 @@ func (e *Engine) Update(dt float64, in EngineInput) {
 	e.Turbopump.OxPump.MassFlow = e.OxFlow
 
 	e.Turbopump.FuelPump.Update(e.Turbopump.Speed, in.FuelInletPressure,
-		in.FuelDensity, in.FuelVaporPressure, in.Gravity, ov.Turbopump.FuelPump)
+		in.FuelDensity, in.FuelVaporPressure, in.Gravity, in.FuelGasFraction,
+		ov.Turbopump.FuelPump)
 	e.Turbopump.OxPump.Update(e.Turbopump.Speed, in.OxInletPressure,
-		in.OxDensity, in.OxVaporPressure, in.Gravity, ov.Turbopump.OxPump)
+		in.OxDensity, in.OxVaporPressure, in.Gravity, in.OxGasFraction,
+		ov.Turbopump.OxPump)
 
 	// --- 4. Охлаждающий тракт ------------------------------------------------
 	//

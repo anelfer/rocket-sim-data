@@ -183,6 +183,11 @@ type TankOverrides struct {
 	MassDirect        Opt
 	PressureDirect    Opt
 	TemperatureDirect Opt
+
+	// SettledDirect — принудительная доля осадки топлива, 0…1. Не сам манёвр
+	// осадки (импульс РСУ перед повторным зажигом), а способ задать его
+	// результат — реальной модели ullage burn в симуляторе нет.
+	SettledDirect Opt
 }
 
 // ChamberOverrides — воздействия на камеру сгорания.

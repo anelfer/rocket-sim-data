@@ -60,6 +60,25 @@ func TestDragCoefficientTransonicPeak(t *testing.T) {
 	}
 }
 
+// Центр давления должен уходить назад к трансзвуку и возвращаться вперёд
+// на сверхзвуке — иначе запас статической устойчивости на Max-Q не может
+// просесть так, как это происходит у настоящей ракеты без оперения.
+func TestCenterOfPressureTransonicPeak(t *testing.T) {
+	subsonic := CenterOfPressureNormal(0.3)
+	peak := CenterOfPressureNormal(1.2)
+	hypersonic := CenterOfPressureNormal(6.0)
+
+	if !(peak > subsonic && peak > hypersonic) {
+		t.Errorf("ожидался трансзвуковой пик ЦД: M0.3=%.3f, M1.2=%.3f, M6=%.3f",
+			subsonic, peak, hypersonic)
+	}
+	approx(t, peak, 0.50, 1e-9, "ЦД на M=1.2")
+
+	if got := CenterOfPressureNormal(math.NaN()); math.IsNaN(got) {
+		t.Error("ЦД не должен быть NaN при NaN на входе")
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Атмосфера
 // -----------------------------------------------------------------------------
@@ -420,6 +439,86 @@ func TestInertiaTensorForCylinder(t *testing.T) {
 		t.Error("у вытянутого тела поперечный момент должен превышать продольный")
 	}
 	approx(t, inertia.Iyy, inertia.Izz, 1e-9, "симметрия поперечных моментов")
+}
+
+// Без двигателей, несомой массы и с центром масс на геометрической середине
+// составное тело обязано в точности совпадать с однородным цилиндром —
+// вырожденный случай, которым CompositeInertia продолжает CylinderInertia.
+func TestCompositeInertiaDegeneratesToCylinder(t *testing.T) {
+	cyl := CylinderInertia(25600, 1.83, 42.6)
+	comp := CompositeInertia(25600, 0, 0, 1.83, 42.6, 0.5)
+
+	approx(t, comp.Ixx, cyl.Ixx, 1e-9, "Ixx вырожденного случая")
+	approx(t, comp.Iyy, cyl.Iyy, 1e-9, "Iyy вырожденного случая")
+	approx(t, comp.Izz, cyl.Izz, 1e-9, "Izz вырожденного случая")
+}
+
+// Несомая масса у носа увеличивает поперечный момент по теореме
+// Гюйгенса-Штейнера, но не влияет на продольный: точечная масса на оси
+// не создаёт крена.
+func TestCompositeInertiaSteinerShift(t *testing.T) {
+	const (
+		ownMass     = 25600.0  // сухая масса второй ступени Falcon 9
+		carriedMass = 111500.0 // вторая ступень целиком (4000+107500) как несомая масса первой
+		radius      = 1.83
+		length      = 42.6
+		com         = 0.6
+	)
+
+	base := CompositeInertia(ownMass, 0, 0, radius, length, com)
+	withCarried := CompositeInertia(ownMass, 0, carriedMass, radius, length, com)
+
+	if withCarried.Ixx != base.Ixx {
+		t.Errorf("несомая масса на оси изменила продольный момент: %.6g → %.6g",
+			base.Ixx, withCarried.Ixx)
+	}
+	if withCarried.Iyy <= base.Iyy {
+		t.Errorf("несомая масса у носа не увеличила поперечный момент: %.6g → %.6g",
+			base.Iyy, withCarried.Iyy)
+	}
+
+	// Ручной расчёт по Штейнеру: сравниваем со значением, которое даёт
+	// сама формула, чтобы зафиксировать её как контракт.
+	own := CylinderInertia(ownMass, radius, length)
+	xcm := com * length
+	d1 := xcm - length/2
+	d3 := xcm
+	wantIyy := own.Iyy + ownMass*d1*d1 + carriedMass*d3*d3
+	approx(t, withCarried.Iyy, wantIyy, 1e-6, "Iyy по формуле Штейнера")
+
+	t.Logf("Iyy без несомой массы %.4g, с несомой массой %.4g (×%.2f)",
+		base.Iyy, withCarried.Iyy, withCarried.Iyy/base.Iyy)
+}
+
+// Двигатели у среза сопел (хвост) увеличивают поперечный момент точно так
+// же, как несомая масса у носа, но не влияют на продольный.
+func TestCompositeInertiaEngineMassSteinerShift(t *testing.T) {
+	const (
+		ownMass    = 25600.0
+		engineMass = 4230.0 // 9 × 470 кг, Merlin 1D первой ступени Falcon 9
+		radius     = 1.83
+		length     = 42.6
+		com        = 0.6
+	)
+
+	base := CompositeInertia(ownMass, 0, 0, radius, length, com)
+	withEngines := CompositeInertia(ownMass, engineMass, 0, radius, length, com)
+
+	if withEngines.Ixx != base.Ixx {
+		t.Errorf("двигатели на оси изменили продольный момент: %.6g → %.6g",
+			base.Ixx, withEngines.Ixx)
+	}
+	if withEngines.Iyy <= base.Iyy {
+		t.Errorf("двигатели у хвоста не увеличили поперечный момент: %.6g → %.6g",
+			base.Iyy, withEngines.Iyy)
+	}
+
+	own := CylinderInertia(ownMass, radius, length)
+	xcm := com * length
+	d1 := xcm - length/2
+	d2 := xcm - length
+	wantIyy := own.Iyy + ownMass*d1*d1 + engineMass*d2*d2
+	approx(t, withEngines.Iyy, wantIyy, 1e-6, "Iyy по формуле Штейнера для двигателей")
 }
 
 // Свободное вращение сохраняет момент импульса и энергию.

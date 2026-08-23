@@ -252,6 +252,7 @@ func (s *Simulation) performStageSeparation() {
 	}, s.rng, s.sensorRng, ambientTemp)
 
 	s.dryMass = s.propulsion.DryMass()
+	s.rcsPropellant = cfg.RCSPropellantMass
 	s.state.FuelMass = s.propulsion.PropellantMass()
 	s.propulsion.StartAll()
 

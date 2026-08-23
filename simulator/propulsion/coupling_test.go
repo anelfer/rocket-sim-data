@@ -510,6 +510,99 @@ func TestSensorNoisePreservesRelations(t *testing.T) {
 		typical*100, outliers, dropouts, len(deviations)+dropouts)
 }
 
+// tankEngineInput собирает вход двигателя из фактического состояния баков —
+// в отличие от nominalInput(), давление на входе не задаётся числом,
+// а вычисляется через Tank.OutletPressure(), то есть зависит от осадки
+// топлива.
+func tankEngineInput(fuel, ox *Tank, axialAccel float64) EngineInput {
+	return EngineInput{
+		Throttle:          1,
+		AmbientPressure:   101325,
+		FuelInletPressure: fuel.OutletPressure(axialAccel),
+		OxInletPressure:   ox.OutletPressure(axialAccel),
+		FuelDensity:       fuel.Density(),
+		OxDensity:         ox.Density(),
+		FuelTemperature:   fuel.Temperature,
+		OxTemperature:     ox.Temperature,
+		FuelVaporPressure: fuel.Propellant.VaporPressure(fuel.Temperature),
+		OxVaporPressure:   ox.Propellant.VaporPressure(ox.Temperature),
+		FuelAvailable:     true,
+		OxAvailable:       true,
+		FuelGasFraction:   1 - fuel.Settled,
+		OxGasFraction:     1 - ox.Settled,
+		Gravity:           9.81,
+		MixtureTrim:       1,
+		CoolingValve:      1,
+	}
+}
+
+// oxTestTank возвращает наполовину заправленный бак окислителя для тестов.
+func oxTestTank() *Tank {
+	return NewTank(TankConfig{
+		Name:                  "ox",
+		Volume:                10,
+		Height:                4,
+		CrossSection:          2.5,
+		InitialMass:           9000,
+		InitialTemperature:    85,
+		TargetPressure:        3.4e5,
+		LineResistance:        5,
+		PressurantMass:        50,
+		PressurantPressure:    2.1e7,
+		PressurantTemperature: 200,
+	}, LOX())
+}
+
+// В свободном падении топливо отходит от заборника (Tank.updateSettling),
+// заборник вместо жидкости захватывает газ наддува, и насос теряет напор
+// через ту же кавитационную модель, что и при паровой каверне (см.
+// Pump.Update, EngineInput.FuelGasFraction/OxGasFraction). Без единой новой
+// проверки в Start() это валит давление в камере — то самое «зажигание
+// с перебоями», о котором и был вопрос: полного гашения по ignitionGrace
+// не гарантируется (зависит от MinChamberPressureFraction конкретного
+// двигателя), но устойчивого номинального режима достичь нельзя.
+func TestUnsettledPropellantPreventsIgnition(t *testing.T) {
+	const dt = 0.02
+
+	fuel, ox := testTank(), oxTestTank()
+	settled := newNominalEngine()
+	for i := 0; i < 400; i++ { // 8 с под перегрузкой, топливо всё время осевшее
+		env := TankEnvironment{AxialAcceleration: 20}
+		fuel.updateSettling(dt, env)
+		ox.updateSettling(dt, env)
+		settled.Update(dt, tankEngineInput(fuel, ox, 20))
+	}
+	nominal := settled.Config.Chamber.NominalPressure
+	if !settled.Running || settled.Chamber.MeanPressure < 0.9*nominal {
+		t.Fatalf("контрольный случай (топливо осело) не вышел на режим: "+
+			"Running=%v, Pc=%.2f МПа", settled.Running, settled.Chamber.MeanPressure/1e6)
+	}
+
+	fuel, ox = testTank(), oxTestTank()
+	unsettled := newNominalEngine()
+	for i := 0; i < 400; i++ { // 8 с в свободном падении
+		env := TankEnvironment{AxialAcceleration: 0}
+		fuel.updateSettling(dt, env)
+		ox.updateSettling(dt, env)
+		unsettled.Update(dt, tankEngineInput(fuel, ox, 0))
+	}
+
+	if cav := unsettled.Turbopump.OxPump.CavitationSeverity; cav < 0.5 {
+		t.Errorf("кавитация от газа наддува слишком слабая: глубина %.2f", cav)
+	}
+	if unsettled.Chamber.MeanPressure >= 0.5*settled.Chamber.MeanPressure {
+		t.Errorf("давление в камере не просело без осадки топлива: "+
+			"%.2f МПа против осевшего случая %.2f МПа",
+			unsettled.Chamber.MeanPressure/1e6, settled.Chamber.MeanPressure/1e6)
+	}
+
+	t.Logf("Осевшее топливо: Pc=%.2f МПа, работает=%v. Неосевшее: Pc=%.2f МПа, "+
+		"работает=%v, кавитация=%.2f (осадка горючего=%.2f, окислителя=%.2f)",
+		settled.Chamber.MeanPressure/1e6, settled.Running,
+		unsettled.Chamber.MeanPressure/1e6, unsettled.Running,
+		unsettled.Turbopump.OxPump.CavitationSeverity, fuel.Settled, ox.Settled)
+}
+
 // Выработка компонентов согласована: соотношение расходов из баков совпадает
 // с проектным соотношением заправки.
 func TestOverallMixtureRatioMatchesTankFill(t *testing.T) {

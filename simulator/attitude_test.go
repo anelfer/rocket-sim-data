@@ -143,7 +143,7 @@ func TestAirframeIsStaticallyUnstable(t *testing.T) {
 
 	shape := physics.AeroShape{
 		Length: 47, Radius: 1.83,
-		CenterOfMass: 0.60, CenterOfPressureNormal: 0.50,
+		CenterOfMass: 0.60,
 	}
 
 	var a VehicleAttitude
@@ -357,6 +357,48 @@ func TestAeroDampingStopsRotation(t *testing.T) {
 		t.Errorf("вращение не затухло: %.4f → %.4f рад/с", start, end)
 	}
 	t.Logf("Демпфирование за две секунды: %.3f → %.3f рад/с", start, end)
+}
+
+// Плескание топлива уводит носитель через тягу: смещённый центр масс
+// оказывается не на линии действия тяги, и возникает момент M = Thrust·Δy.
+func TestSloshOffsetProducesTorque(t *testing.T) {
+	frame := testFrame()
+
+	var a VehicleAttitude
+	a.Init(physics.Attitude{Pitch: 45}, frame)
+
+	// Аэродинамику и автопилот убираем, чтобы момент от плескания был
+	// единственным источником вращения — иначе его не отделить от прочих.
+	in := nominalAttitudeInput(frame)
+	in.Controllable = false
+	in.Overrides.Dead = true
+	in.DynamicPressure = 0
+	in.SloshLateralOffset = 0.05 // 5 см смещения центра масс
+
+	a.integrate(0.01, in)
+
+	want := in.Thrust * in.SloshLateralOffset
+	if math.Abs(a.SloshTorque.Y-want) > 1e-6 {
+		t.Errorf("момент от плескания %.3e Н·м, ожидалось %.3e", a.SloshTorque.Y, want)
+	}
+	if a.Omega.Y <= 0 {
+		t.Errorf("угловая скорость по тангажу не выросла от плескания: %.3e рад/с",
+			a.Omega.Y)
+	}
+
+	// Без смещения момента нет — это не тяга сама по себе раскачивает корпус.
+	var b VehicleAttitude
+	b.Init(physics.Attitude{Pitch: 45}, frame)
+	baseline := in
+	baseline.SloshLateralOffset = 0
+	b.integrate(0.01, baseline)
+	if b.SloshTorque.Y != 0 {
+		t.Errorf("момент от плескания не нулевой при нулевом смещении: %.3e",
+			b.SloshTorque.Y)
+	}
+
+	t.Logf("Плескание: смещение %.2f м, тяга %.1f кН → момент %.3e Н·м, ω=%.4f рад/с",
+		in.SloshLateralOffset, in.Thrust/1000, a.SloshTorque.Y, a.Omega.Y)
 }
 
 // В полёте ориентация должна отставать от команды, а не совпадать с ней.
