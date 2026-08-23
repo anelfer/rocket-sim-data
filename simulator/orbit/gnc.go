@@ -47,6 +47,12 @@ type NavState struct {
 	Mass            float64
 	AvailableThrust float64
 
+	// ISP — удельный импульс текущей ступени в вакууме, с. Инженерная
+	// константа двигателя, не измеряется навигационными датчиками — как
+	// Mass и AvailableThrust, приходит из внутреннего учёта борта. Нужна
+	// PEG (explicit guidance) для расчёта расхода массы.
+	ISP float64
+
 	Phase FlightPhase
 }
 
@@ -58,7 +64,7 @@ type NavState struct {
 // источник поперечной нагрузки на корпус.
 func NewNavState(
 	position, velocity, wind physics.Vec3,
-	mass, availableThrust, t float64,
+	mass, availableThrust, isp, t float64,
 	phase FlightPhase,
 ) NavState {
 	up := position.Unit()
@@ -85,6 +91,7 @@ func NewNavState(
 		DynamicPressure:        physics.DynamicPressure(atm.Density, vRel.Norm()),
 		Mass:                   mass,
 		AvailableThrust:        availableThrust,
+		ISP:                    isp,
 		Phase:                  phase,
 	}
 }
@@ -174,6 +181,14 @@ type GNCConfig struct {
 	// Множитель растягивает таблицу: на двойке программа отрабатывается
 	// вдвое выше по высоте, то есть разворот идёт вдвое положе.
 	PitchProgramStretch float64
+
+	// PEGMinPitch/PEGMaxPitch — пределы, в которые зажимается тангаж,
+	// выданный PEG (см. orbit/peg.go). Это не рабочий диапазон закона
+	// наведения, а страховка от вырожденных входов — унаследованы от
+	// пределов прежних регуляторов ApoapsisPitch/AltitudeHold как отправная
+	// точка.
+	PEGMinPitch float64
+	PEGMaxPitch float64
 }
 
 // DefaultGNCConfig возвращает настройки для выведения на низкую орбиту.
@@ -199,6 +214,8 @@ func DefaultGNCConfig(targetAltitude, targetInclination float64) GNCConfig {
 		MinThrottle:         0.40,
 		NominalThrottle:     0.935,
 		PitchProgramStretch: 1.0,
+		PEGMinPitch:         -12,
+		PEGMaxPitch:         42,
 	}
 }
 
@@ -206,9 +223,13 @@ func DefaultGNCConfig(targetAltitude, targetInclination float64) GNCConfig {
 type GNCSystem struct {
 	Config GNCConfig
 
+	// PEG — explicit guidance тангажа на вакуумном участке второй ступени
+	// (см. orbit/peg.go). Не ПИД: явная модель тяги и краевая задача по
+	// радиусу/радиальной скорости, а не обратная связь по накопленной
+	// ошибке.
+	PEG PEGGuidance
+
 	// Замкнутые контуры.
-	ApoapsisPitch   PIDController // тангаж по ошибке высоты апоцентра
-	AltitudeHold    PIDController // тангаж по вертикальной скорости на целевой высоте
 	RadialHold      PIDController // тангаж по радиальной скорости при довыведении
 	InclinationTrim PIDController // азимут по ошибке наклонения
 	CircThrottle    PIDController // дросселирование при довыведении
@@ -240,6 +261,9 @@ type GNCSystem struct {
 	TargetApoapsis  float64
 	InclinationDeg  float64
 	AzimuthAchieved bool
+
+	// PredictedTgo — зеркало PEG.PredictedTgo для диагностики/телеметрии.
+	PredictedTgo float64
 }
 
 // derivativeFilterTime — постоянная времени фильтра производной для всех
@@ -258,38 +282,6 @@ const derivativeFilterTime = 1.5
 func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 	g := &GNCSystem{
 		Config: cfg,
-
-		// Выход — абсолютный угол тангажа, вход — ошибка высоты апоцентра.
-		// Сто километров недобора дают примерно пятнадцать градусов
-		// подъёма носа.
-		ApoapsisPitch: PIDController{
-			Kp:                   1.5e-4,
-			Ki:                   1.0e-7,
-			Kd:                   1.5e-3,
-			MinOutput:            -12,
-			MaxOutput:            42,
-			IntegralLimit:        5,
-			DerivativeFilterTime: derivativeFilterTime,
-		},
-
-		// Удержание высоты на разгонном участке. Вход — ошибка вертикальной
-		// скорости, выход — абсолютный угол тангажа.
-		//
-		// Ход намеренно широкий. Пока скорость заметно ниже первой космической,
-		// центробежная разгрузка мала, и удержать высоту можно только заметным
-		// подъёмом носа: при тяговооружённости полтора это градусов тридцать
-		// пять. Узкий предел в четырнадцать градусов означал, что ступень
-		// удержать высоту не может в принципе, — она снижалась с работающими
-		// двигателями и на низкой цели доходила до земли.
-		AltitudeHold: PIDController{
-			Kp:                   0.10,
-			Ki:                   4.0e-4,
-			Kd:                   0.03,
-			MinOutput:            -20,
-			MaxOutput:            40,
-			IntegralLimit:        20,
-			DerivativeFilterTime: derivativeFilterTime,
-		},
 
 		RadialHold: PIDController{
 			// 100 м/с снижения дают примерно +2° к тангажу.
@@ -342,8 +334,7 @@ func NewGNCSystem(cfg GNCConfig) *GNCSystem {
 
 // Reset возвращает систему в исходное состояние.
 func (g *GNCSystem) Reset() {
-	g.ApoapsisPitch.Reset()
-	g.AltitudeHold.Reset()
+	g.PEG.Reset()
 	g.RadialHold.Reset()
 	g.InclinationTrim.Reset()
 	g.CircThrottle.Reset()
@@ -353,6 +344,7 @@ func (g *GNCSystem) Reset() {
 	g.AngleOfAttack, g.SideslipAngle, g.TotalAoA = 0, 0, 0
 	g.ascending = true
 	g.LastCommand = GuidanceCommand{}
+	g.PredictedTgo = 0
 }
 
 // Update выполняет полный цикл наведения и возвращает отработанную команду.
@@ -599,53 +591,24 @@ func FirstStagePitchProgram(altitude float64) float64 {
 // ровно с нулевой вертикальной скоростью. Регулятор по апоцентру делает именно
 // это: пока апоцентр ниже цели — нос приподнят, по мере приближения к цели
 // команда плавно уходит к горизонту.
+// vacuumAscentPitch — наведение на разрежённом участке методом PEG
+// (Powered Explicit Guidance).
+//
+// Прежняя схема держала два ПИД-регулятора с ручным переключением:
+// сначала гонялась за высотой апоцентра, а по достижении цели переключалась
+// на удержание высоты с разгоном в горизонт. Эти две задачи решались
+// последовательно, а не одновременно, и апоцентр стабильно перелетал цель
+// (см. campaign_test.go: knownApoapsisOvershoot) — ступень доразгонялась уже
+// после того, как апоцентр пройден.
+//
+// PEG решает обе задачи ОДНИМ законом: тангаж — прямое следствие решения
+// краевой задачи «на предсказанный момент отсечки одновременно радиус
+// придёт к цели и радиальная скорость обнулится», а не порогового
+// переключения режимов. Вывод и обоснование — см. orbit/peg.go.
 func (g *GNCSystem) vacuumAscentPitch(nav NavState, dt float64) float64 {
-	target := g.Config.TargetOrbitAltitude
-
-	// Требуемая вертикальная скорость пропорциональна недобору высоты.
-	// Вдали от цели ступень набирает высоту, у цели требование плавно
-	// сходит к нулю, и вся тяга разворачивается в горизонт.
-	//
-	// Управление именно по вертикальной скорости, а не напрямую по апоцентру,
-	// устойчивее: апоцентр вблизи орбитальной скорости крайне чувствителен
-	// к малым изменениям, и регулятор по нему раскачивался, перебрасывая
-	// верхнюю точку орбиты на сотни километров за цель.
-	apoapsis := nav.Elements.ApoapsisAltitude
-
-	// Незамкнутая траектория означает избыток энергии — опускаем нос.
-	if math.IsInf(apoapsis, 1) || !nav.Elements.Elliptical {
-		return g.ApoapsisPitch.MinOutput
-	}
-
-	// Пока ступень идёт снизу и верхняя точка ниже цели, управляем апоцентром:
-	// регулятор приподнимает нос ровно настолько, чтобы прийти в цель.
-	//
-	// Но одного апоцентра мало, и это не мелочь. Высота апоцентра ничего
-	// не говорит о том, где ступень находится: «апоцентр двести километров»
-	// одинаково верно и для машины, идущей на двухстах, и для той, что уже
-	// падает и проходит девяносто. Регулятор по апоцентру во втором случае
-	// доволен и держит горизонт, пока ступень не воткнётся в землю. Поэтому
-	// как только высота набрана, управление переходит к удержанию высоты.
-	arrived := nav.Altitude >= target*0.9 || apoapsis >= target*0.98
-	if !arrived {
-		g.AltitudeHold.Reset()
-		return g.ApoapsisPitch.Update(target, apoapsis, dt)
-	}
-
-	// Дальше по апоцентру управлять нельзя, и это не тонкость настройки,
-	// а смена смысла задачи. Ракета уже пришла на целевую высоту; всякий
-	// последующий горизонтальный разгон делает эту точку перицентром и
-	// поднимает противоположную сторону орбиты. Регулятор, которому велено
-	// «держать апоцентр», в такой обстановке может только опускать нос — и
-	// опускает, пока ступень не воткнётся в землю с работающими двигателями.
-	// Ровно это и происходило на низкой цели.
-	//
-	// Правильная задача здесь другая: держать высоту и разгоняться в горизонт,
-	// пока перицентр не поднимется до заданного. Потребная вертикальная
-	// скорость берётся пропорционально недобору высоты и ограничивается —
-	// резких подъёмов на этом участке быть не должно.
-	wantVertical := physics.Clamp((target-nav.Altitude)*0.03, -60, 60)
-	return g.AltitudeHold.Update(wantVertical, nav.RadialVelocity, dt)
+	pitch := g.PEG.Pitch(nav, g.Config, dt, g.Attitude.Pitch)
+	g.PredictedTgo = g.PEG.PredictedTgo
+	return pitch
 }
 
 // -----------------------------------------------------------------------------

@@ -939,7 +939,7 @@ func (s *Simulation) navState() orbit.NavState {
 	return orbit.NewNavState(
 		s.state.Position, s.state.Velocity,
 		s.windVelocity(s.state.Position, altitude),
-		mass, available, s.elapsed, s.phase,
+		mass, available, s.currentStage().VacuumISP, s.elapsed, s.phase,
 	)
 }
 
@@ -947,10 +947,11 @@ func (s *Simulation) navState() orbit.NavState {
 // то, чем на самом деле распоряжается наведение.
 //
 // Положение и скорость берутся с датчиков (либо последнее достоверное
-// значение, если сейчас пропуск связи), а масса, доступная тяга, время и
-// фаза полёта остаются истинными: это не измеряемые датчиком величины,
-// а внутренний учёт борта (масса — по расходу и заправке, фаза — по
-// собственной логике полётной программы). Ветер вычисляется в точке
+// значение, если сейчас пропуск связи), а масса, доступная тяга, удельный
+// импульс, время и фаза полёта остаются истинными: это не измеряемые
+// датчиком величины, а внутренний учёт борта (масса — по расходу и
+// заправке, удельный импульс — паспортная характеристика двигателя, фаза —
+// по собственной логике полётной программы). Ветер вычисляется в точке
 // показанного датчиком положения — так же, как атмосферная модель
 // в реальности видела бы обстановку там, где, по её мнению, находится
 // ракета, а не там, где она находится на самом деле.
@@ -961,7 +962,7 @@ func (s *Simulation) sensedNavState(trueNav orbit.NavState) orbit.NavState {
 	return orbit.NewNavState(
 		position, velocity,
 		s.windVelocity(position, altitude),
-		trueNav.Mass, trueNav.AvailableThrust, trueNav.Time, trueNav.Phase,
+		trueNav.Mass, trueNav.AvailableThrust, trueNav.ISP, trueNav.Time, trueNav.Phase,
 	)
 }
 

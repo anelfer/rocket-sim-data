@@ -584,12 +584,24 @@ function vehicleFaces(faces, t) {
 
       // Верх верхней ступени — носовая часть. В обводах она называется
       // грузовым отсеком: у корабля это одно и то же место, там же и купол.
-      const tiled = stage.index === 2;
+      //
+      // Плиточная теплозащита — не у всякой второй ступени: у Falcon 9 она
+      // одноразовая и не входит в атмосферу управляемо, плиток там нет.
+      // layout.flaps — тот же признак «корабль класса Starship», что и у
+      // плавников (сейчас это одно и то же семейство носителей), поэтому
+      // им же гасится и рисовка плиток на чужой ракете.
+      const tiled = stage.index === 2 && !!layout.flaps;
       const top = stage === stages[0] && section === stage.sections[0];
 
       if (section.kind === 'nose' || top) {
         const coneLen = Math.min(section.length, r * 2.6);
-        noseFaces(faces, toWorld, x0, x0 - coneLen, r, seg, steelColour, tileColour, tiled);
+        // Тот же признак семейства, что и у плиток: тупой купол — примета
+        // корабля Starship, у обтекателя/носа прочих носителей (Falcon 9
+        // и т.п.) профиль заметно острее — заострённый оживал, а не купол.
+        // Без этого различия силуэт читался как Starship даже без плавников
+        // и плиток: форма носа — самая узнаваемая часть контура.
+        const pointed = !layout.flaps;
+        noseFaces(faces, toWorld, x0, x0 - coneLen, r, seg, steelColour, tileColour, tiled, pointed);
         if (section.length > coneLen) {
           hullFaces(faces, toWorld, x0 - coneLen, x1, r, seg, steelColour, tileColour, tiled);
         }
@@ -644,15 +656,18 @@ function hullFaces(faces, toWorld, x0, x1, r, seg, steel, tiles, tiled) {
 }
 
 /* Носовая часть: конус со скруглением. */
-function noseFaces(faces, toWorld, x0, x1, r, seg, steel, tiles, tiled) {
+function noseFaces(faces, toWorld, x0, x1, r, seg, steel, tiles, tiled, pointed) {
   const steps = 5;
   let prev = ring(x1, r, seg);
   for (let s = 1; s <= steps; s++) {
     const k = s / steps;
     const x = x1 + (x0 - x1) * k;
-    // Оживало: радиус падает как корень, а не линейно — так нос
-    // получается тупым, каким он и есть.
-    const rr = r * Math.sqrt(Math.max(0, 1 - k * k));
+    // Купол Starship: радиус падает как корень, тупой профиль. У носителей
+    // с заострённым обтекателем (pointed) — оживал ближе к прямому конусу,
+    // с лёгкой выпуклостью, а не полукруглый купол.
+    const rr = pointed
+      ? r * Math.pow(Math.max(0, 1 - k), 0.85)
+      : r * Math.sqrt(Math.max(0, 1 - k * k));
     const cur = ring(x, Math.max(rr, 0.05), seg);
     for (let i = 0; i < seg; i++) {
       const j = (i + 1) % seg;
