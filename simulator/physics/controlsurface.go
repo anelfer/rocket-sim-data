@@ -34,8 +34,24 @@ type ControlSurface struct {
 	Area float64
 
 	// Arm — положение оси навески относительно центра масс в связанных
-	// осях, м. Плечо момента считается от него.
+	// осях, м. Плечо момента считается от него. Продольная (X) составляющая
+	// используется как есть, только если PositionFromNose == 0 (см. ниже) —
+	// иначе Torque() строит X-плечо динамически и это поле в X, если
+	// заполнено, для расчёта момента не используется.
 	Arm Vec3
+
+	// PositionFromNose — физическая позиция аэродинамического центра
+	// поверхности вдоль продольной оси корпуса, м от носа. Ненулевое
+	// значение переключает Torque()/UpdateTorque()/PitchAuthority() на
+	// динамическое продольное плечо (PositionFromNose − текущий CoM от
+	// носа), а не на застывшее Arm.X, — так плечо не отстаёт, когда CoM
+	// смещается.
+	//
+	// Нулевое значение (по умолчанию, как у плавников корабля, ShipFlaps)
+	// сохраняет прежнее поведение: Arm.X — уже готовое, один раз посчитанное
+	// плечо относительно CoM, зафиксированного на постройке набора
+	// поверхностей.
+	PositionFromNose float64
 
 	// Neutral — единичная нормаль панели в нейтральном положении,
 	// связанные оси.
@@ -44,8 +60,31 @@ type ControlSurface struct {
 	// Hinge — единичный вектор оси вращения панели, связанные оси.
 	Hinge Vec3
 
-	// MaxDeflection — предельный угол отклонения от нейтрали, рад.
-	MaxDeflection float64
+	// MinDeflection, MaxDeflection — физические пределы хода привода, рад,
+	// от Neutral (δ=0 — нормаль панели равна Neutral). Знак — не
+	// формальность, а часть физической модели: у панели с шарниром,
+	// способным вращаться в обе стороны от нейтрали (решётчатые рули —
+	// см. vehicle.GridFins), MinDeflection<0<MaxDeflection, и δ=0 —
+	// действительно СЕРЕДИНА хода, а не механический упор. У панели,
+	// которая физически складывается плашмя вдоль борта и не может
+	// повернуться "внутрь" корпуса (плавники корабля — см.
+	// vehicle.ShipFlaps), MinDeflection=0=MaxDeflection на прижатом конце
+	// хода: там δ=0 — это именно упор, а не середина.
+	//
+	// Раньше отдельного MinDeflection не было, и все потребители (Allocate,
+	// SetManual, PitchAuthority, покоординатный перебор) МОЛЧА
+	// предполагали диапазон [0, MaxDeflection] — верно для плавников
+	// корабля (там это и есть физика), но не для решётчатых рулей: у
+	// ControlSurface.Force/Normal никакого запрета на отрицательный угол
+	// нет (rotateAboutAxis прекрасно поворачивает и в другую сторону), и
+	// открытые источники по актуации решётчатых рулей (независимое
+	// управление тангажом/рысканием/креном каждым рулём) описывают именно
+	// двустороннее рулевое отклонение от центра, а не одностороннее
+	// открытие. Скрытое [0,Max] было ограничением МОДЕЛИ актуатора, а не
+	// подтверждённым механическим пределом, и оно СИСТЕМАТИЧЕСКИ душило
+	// -pitch/-roll авторитет решётчатых рулей (см. регрессии в
+	// surfaces_deflection_bounds_test.go).
+	MinDeflection, MaxDeflection float64
 
 	// Rate — скорость перекладки привода, рад/с.
 	Rate float64
@@ -97,11 +136,36 @@ func (s ControlSurface) Force(deflection float64, airBody Vec3,
 	return normal.Scale(magnitude * sign(cos))
 }
 
-// Torque возвращает момент панели относительно центра масс, Н·м.
-func (s ControlSurface) Torque(deflection float64, airBody Vec3,
-	dynamicPressure, mach float64) Vec3 {
+// ForceAndTorque возвращает силу панели в связанных осях (Н) и её момент
+// относительно ТЕКУЩЕГО центра масс (Н·м) — момент строится как r×F от ЭТОЙ
+// ЖЕ силы, а не пересчитывается отдельно: одна и та же физическая
+// аэродинамическая сила панели одновременно толкает корпус (сила) и
+// разворачивает его (момент), и вычисляться она обязана один раз.
+//
+// comFromNose — положение центра масс от носа, м, на этот такт. Учитывается
+// только если у поверхности задан PositionFromNose (см. поле): тогда
+// продольное плечо — это (PositionFromNose − comFromNose), а не
+// зафиксированное когда-то Arm.X. Без PositionFromNose (плавники корабля)
+// comFromNose не используется вовсе, поведение не меняется.
+func (s ControlSurface) ForceAndTorque(deflection float64, airBody Vec3,
+	dynamicPressure, mach, comFromNose float64) (force, torque Vec3) {
 
-	return s.Arm.Cross(s.Force(deflection, airBody, dynamicPressure, mach))
+	force = s.Force(deflection, airBody, dynamicPressure, mach)
+	arm := s.Arm
+	if s.PositionFromNose != 0 {
+		arm.X = s.PositionFromNose - comFromNose
+	}
+	return force, arm.Cross(force)
+}
+
+// Torque возвращает момент панели относительно ТЕКУЩЕГО центра масс, Н·м.
+// См. ForceAndTorque — момент здесь считается от той же силы, просто без
+// возврата её вызывающей стороне.
+func (s ControlSurface) Torque(deflection float64, airBody Vec3,
+	dynamicPressure, mach, comFromNose float64) Vec3 {
+
+	_, torque := s.ForceAndTorque(deflection, airBody, dynamicPressure, mach, comFromNose)
+	return torque
 }
 
 // sign возвращает знак числа.

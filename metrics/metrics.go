@@ -130,6 +130,34 @@ var (
 	engineNozzleGauge  = gaugeVec("rocket_engine_nozzle_temperature_celsius", "Температура газа на срезе сопла, °C")
 	engineWallGauge    = gaugeVec("rocket_engine_wall_temperature_celsius", "Температура стенки камеры, °C")
 	engineTurbineGauge = gaugeVec("rocket_engine_turbine_temperature_celsius", "Температура на входе турбины, °C")
+
+	// Возвращающийся бустер (RTLS). Появляется только на носителях с активным
+	// возвратом первой ступени и только с момента отделения — до этого момента
+	// и после разрушения все величины не определены (см. undefinedOnStart).
+	//
+	// Собственная двигательная установка бустера метрик не заводит отдельно:
+	// её камеры (S1-1 … S1-N) публикуются через тот же rocket_engine_*
+	// с engine_id, что и у корабля — идентификаторы не пересекаются, а вести
+	// две параллельные пары метрик под одни и те же величины незачем.
+	boosterAltitude   = gauge("rocket_booster_altitude_meters", "Высота возвращающегося бустера")
+	boosterLatitude   = gauge("rocket_booster_latitude", "Широта возвращающегося бустера")
+	boosterLongitude  = gauge("rocket_booster_longitude", "Долгота возвращающегося бустера")
+	boosterVVel       = gauge("rocket_booster_vertical_velocity_mps", "Вертикальная скорость бустера")
+	boosterTVel       = gauge("rocket_booster_total_velocity_mps", "Полная скорость бустера")
+	boosterPitch      = gauge("rocket_booster_pitch_deg", "Тангаж бустера, градусы")
+	boosterYaw        = gauge("rocket_booster_yaw_deg", "Рыскание бустера, градусы")
+	boosterRoll       = gauge("rocket_booster_roll_deg", "Крен бустера, градусы")
+	boosterFuelMass   = gauge("rocket_booster_fuel_mass_kg", "Остаток топлива бустера")
+	boosterThrottle   = gauge("rocket_booster_throttle_percent", "Уставка тяги бустера")
+	boosterEngines    = gauge("rocket_booster_engines_running", "Число работающих камер бустера")
+	boosterPhase      = gauge("rocket_booster_phase", "Фаза возврата: 0 — разворотный импульс, 1 — баллистика, 2 — посадочный импульс, 3 — приводнение, 4 — разрушен")
+	boosterVentGas    = gauge("rocket_booster_vent_gas_kg", "Остаток газа наддува (питает и баки, и ориентацию на пассивном участке)")
+	boosterTilt       = gauge("rocket_booster_tilt_deg", "Угол завала после приводнения, градусы")
+	boosterSplashV    = gauge("rocket_booster_splash_speed_mps", "Скорость в момент касания воды")
+	boosterSplashdown = gauge("rocket_booster_splashdown", "1 — коснулся воды")
+	boosterDestroyed  = gauge("rocket_booster_destroyed", "1 — разрушен")
+
+	boosterFinDeflection = gaugeVec("rocket_booster_grid_fin_deflection_deg", "Угол раскрытия решётчатого руля")
 )
 
 func gauge(name, help string) prometheus.Gauge {
@@ -190,6 +218,11 @@ func collectors() []prometheus.Collector {
 		debrisMinorAxis, debrisSurviving,
 		engineThrustGauge, engineIspGauge, engineChamberGauge,
 		engineNozzleGauge, engineWallGauge, engineTurbineGauge,
+		boosterAltitude, boosterLatitude, boosterLongitude,
+		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
+		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
+		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
+		boosterFinDeflection,
 	}
 	return append(base, propulsionCollectors()...)
 }
@@ -216,6 +249,14 @@ func undefinedOnStart() []prometheus.Gauge {
 		stageSkinTemp, stageHeatFlux, stageDynamicQ, stageOutcome,
 		stageSpinRate, stageAoA, stageShockTemp, stageIonization,
 		stagePlasmaFreq, stageBlackout,
+
+		// Бустер существует только на носителях с активным возвратом,
+		// и только с момента отделения — та же причина, что и у отработавшей
+		// ступени выше.
+		boosterAltitude, boosterLatitude, boosterLongitude,
+		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
+		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
+		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
 	}
 }
 
@@ -399,6 +440,72 @@ func SetSpentStage(s SpentStageSample) {
 
 	for _, n := range s.NodeTemps {
 		stageNodeTemp.WithLabelValues(n.Name).Set(n.Temperature)
+	}
+}
+
+// GridFinSample — угол раскрытия одного решётчатого руля.
+type GridFinSample struct {
+	Name       string
+	Deflection float64
+}
+
+// BoosterSample — параметры возвращающегося бустера (RTLS).
+type BoosterSample struct {
+	Phase float64
+
+	Altitude         float64
+	Latitude         float64
+	Longitude        float64
+	VerticalVelocity float64
+	TotalVelocity    float64
+
+	Pitch, Yaw, Roll float64
+
+	FuelMass       float64
+	Throttle       float64
+	EnginesRunning float64
+
+	// VentGasMass — остаток газа наддува в баках, кг: тот же ресурс держит
+	// в них давление и питает стравливание для ориентации на пассивном
+	// участке (Coast) — отдельных блоков РСУ у бустера нет.
+	VentGasMass float64
+
+	Splashdown  bool
+	Destroyed   bool
+	SplashSpeed float64
+	Tilt        float64
+
+	GridFins []GridFinSample
+}
+
+// SetBooster публикует параметры возвращающегося бустера.
+func SetBooster(s BoosterSample) {
+	ensureRegistered()
+	boosterPhase.Set(s.Phase)
+	boosterAltitude.Set(s.Altitude)
+	boosterLatitude.Set(s.Latitude)
+	boosterLongitude.Set(s.Longitude)
+	boosterVVel.Set(s.VerticalVelocity)
+	boosterTVel.Set(s.TotalVelocity)
+	boosterPitch.Set(s.Pitch)
+	boosterYaw.Set(s.Yaw)
+	boosterRoll.Set(s.Roll)
+	boosterFuelMass.Set(s.FuelMass)
+	boosterThrottle.Set(s.Throttle)
+	boosterEngines.Set(s.EnginesRunning)
+	boosterVentGas.Set(s.VentGasMass)
+	boosterTilt.Set(s.Tilt)
+	boosterSplashdown.Set(boolToFloat(s.Splashdown))
+	boosterDestroyed.Set(boolToFloat(s.Destroyed))
+	// Скорость касания воды имеет смысл только после самого касания —
+	// та же причина, что и у радиосвязи отработавшей ступени выше.
+	if s.Splashdown {
+		boosterSplashV.Set(s.SplashSpeed)
+	} else {
+		boosterSplashV.Set(math.NaN())
+	}
+	for _, f := range s.GridFins {
+		boosterFinDeflection.WithLabelValues(f.Name).Set(f.Deflection)
 	}
 }
 

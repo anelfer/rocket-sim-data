@@ -123,9 +123,11 @@ const hotStageThrottle = 0.4
 
 // hotStageEngines — сколько камер бустера остаётся работать при разделении.
 //
-// Три центральные: они же качаются в подвесе, значит связка остаётся
-// управляемой до самого расхождения.
-const hotStageEngines = 3
+// Пять: три центральные (они же качаются в подвесе, значит связка остаётся
+// управляемой до самого расхождения) и две с соседнего кольца — по записям
+// реальных пусков Super Heavy V3 остаётся именно пять, а не только
+// центральная тройка.
+const hotStageEngines = 5
 
 func (s *Simulation) performMECO() {
 	s.mecoTime = s.elapsed
@@ -202,16 +204,27 @@ func (s *Simulation) performStageSeparation() {
 	stageSkinTemp := math.Min(separationSkinLimit,
 		physics.EffectiveEnvironmentTemperature(
 			s.state.Altitude(), s.state.AirRelativeVelocity().Norm()))
-	s.spentStage = env.NewSpentStage(
-		cfg.FirstStage.Name,
-		s.state.Position, s.state.Velocity,
-		cfg.FirstStage.DryMass+cfg.FirstStage.FuelReserve,
-		cfg.FirstStageLength, cfg.Diameter/2,
-		stageSkinTemp,
-		s.elapsed,
-		env.RandomTipOff(s.rng),
-		s.wind,
-	)
+
+	// Носители с активным возвратом (решётчатые рули, посадочный импульс,
+	// приводнение в заливе) получают полноценный второй аппарат вместо
+	// пассивной баллистики — см. booster.go. Остальные (например Falcon 9
+	// в этой модели) ведут себя как прежде.
+	if cfg.BoosterReturn {
+		s.booster = NewBooster(cfg, s.state.Position, s.state.Velocity,
+			s.elapsed, s.rng, s.sensorRng, stageStartTemperature(cfg), s.attitude.Orientation)
+		s.calibrateBoosterBoard()
+	} else {
+		s.spentStage = env.NewSpentStage(
+			cfg.FirstStage.Name,
+			s.state.Position, s.state.Velocity,
+			cfg.FirstStage.DryMass+cfg.FirstStage.FuelReserve,
+			cfg.FirstStageLength, cfg.Diameter/2,
+			stageSkinTemp,
+			s.elapsed,
+			env.RandomTipOff(s.rng),
+			s.wind,
+		)
+	}
 
 	s.stage = 2
 

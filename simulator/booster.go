@@ -1,0 +1,3332 @@
+package simulator
+
+import (
+	"log"
+	"math"
+	"math/rand"
+
+	"rocketTelemetrySim/control"
+	"rocketTelemetrySim/simulator/env"
+	"rocketTelemetrySim/simulator/orbit"
+	"rocketTelemetrySim/simulator/physics"
+	"rocketTelemetrySim/simulator/vehicle"
+)
+
+// -----------------------------------------------------------------------------
+// Возврат и посадка первой ступени (RTLS).
+//
+// После горячего разделения бустер живёт собственной, гораздо более простой
+// жизнью, чем корабль: ни орбитальной механики, ни довыведения — только
+// разворотный импульс к площадке, баллистический спуск под решётчатыми
+// рулями и посадочный импульс. Опор и перехвата вышкой нет: коснувшись воды
+// мягко, бустер всё равно заваливается набок и разрушается — так же, как
+// вело себя изделие на первых лётных испытаниях без ловли.
+//
+// Физика переиспользована целиком: тот же RK4 (integrator.go), та же
+// двигательная установка (propulsion_system.go), тот же контур ориентации
+// (attitude_dynamics.go, VehicleAttitude.Update) и те же решётчатые рули
+// (vehicle.GridFins) через тот же SurfaceSet, что уже держит плавники
+// корабля. Ново здесь только то, чем нельзя было не обзавестись заново:
+// последовательность фаз возврата и её пороги (по образцу entry.go, но для
+// другого манёвра).
+// -----------------------------------------------------------------------------
+
+// BoosterPhase — фаза возврата бустера.
+type BoosterPhase int
+
+const (
+	// BoosterBoostback — разворот и гашение горизонтальной скорости "от
+	// площадки": бустер жжёт против движения, ступенями сокращая число
+	// работающих камер (33→13→3→0, по времени манёвра — см.
+	// boostbackEngineGroup) до самого его конца.
+	BoosterBoostback BoosterPhase = iota
+
+	// BoosterCoast — баллистический спуск, двигатели выключены, решётчатые
+	// рули держат корпус против потока.
+	BoosterCoast
+
+	// BoosterLandingBurn — посадочный импульс, гашение снижения к воде.
+	BoosterLandingBurn
+
+	// BoosterSplashdown — коснулся воды и заваливается: опор нет, стоять
+	// не на чем.
+	BoosterSplashdown
+
+	// BoosterDestroyed — завалился и разрушился. Конечное состояние.
+	BoosterDestroyed
+)
+
+// String возвращает название фазы для телеметрии.
+func (p BoosterPhase) String() string {
+	switch p {
+	case BoosterBoostback:
+		return "Boostback"
+	case BoosterCoast:
+		return "Coast"
+	case BoosterLandingBurn:
+		return "Landing Burn"
+	case BoosterSplashdown:
+		return "Splashdown"
+	case BoosterDestroyed:
+		return "Destroyed"
+	default:
+		return "?"
+	}
+}
+
+// Число работающих камер меняется по ходу возврата ступенями, а не плавным
+// дросселем одной и той же тройки — так и работает настоящий Super Heavy V3:
+// после отделения на разворотный импульс зажигаются все тридцать три камеры,
+// вскоре их число падает до тринадцати, ещё позже — до трёх (только
+// центральное, качающееся кольцо — оно одно и держит управление до конца
+// манёвра), и на этом фактически весь манёвр завершён — камеры гасятся
+// полностью (0), а довод до нуля горизонтального сноса к этому моменту уже
+// сделан почти идеально. Весь разворотный импульс по времени — порядка
+// тридцати секунд, не полторы-две минуты и не дольше. Дальше — Coast под
+// решётчатыми рулями, без тяги, до повторного розжига посадочного импульса.
+// На посадочном импульсе — отдельный повторный розжиг тринадцати камер,
+// затем пять, касание — на трёх, с остатком топлива, близким к нулю.
+const (
+	boosterBoostbackHigh = 33 // все камеры сразу после отделения
+	boosterBoostbackMid  = 13 // центр + внутреннее кольцо
+	boosterBoostbackLow  = 3  // только центральное кольцо — оно одно качается
+
+	boosterLandingHigh = 13 // повторный розжиг для посадочного импульса
+	boosterLandingMid  = 5
+	boosterLandingLow  = 3 // касание воды
+)
+
+// boosterFuelReserveFraction — доля бюджета возврата (FuelReserve), которую
+// разворотный импульс не имеет права трогать. Без резерва бустер мог бы
+// сжечь всё топливо на развороте и прийти к посадочному импульсу пустым —
+// частый отказ реальных ступеней при промахе с топливным бюджетом.
+//
+// Пятнадцать процентов — не впритык к тому, что реально требуется
+// развороту (при бюджете в 900 т разворотный импульс сам укладывается
+// в район 550-600 т и доворачивает снос до нуля с запасом задолго до
+// упора в эту долю), а страховка на случай траектории хуже опорной:
+// более крутого отделения, встречного ветра на развороте и т.п. — тогда
+// импульс всё равно остановится по резерву, а не съест то, что оставлено
+// посадочному.
+const boosterFuelReserveFraction = 0.15
+
+// landingDecelBudget — доля располагаемого замедления (при столько-то
+// работающих камерах), которую расписание скорости (landingThrottle)
+// реально планирует использовать: тринадцать камер дают тягу с большим
+// избытком против висения, и если гнаться за полным замедлением с первой
+// же секунды, дросселирование раскачивается.
+const landingDecelBudget = 0.6
+
+// throttleFilterTime — постоянная времени сглаживания команды тяги
+// посадочного импульса, с (см. throttleCommand/filteredThrottle). Общая с
+// landingGroupDwellTime (см. updateLandingEngineGroup) не случайно: решение
+// "какая группа камер вообще нужна" не должно реагировать быстрее, чем
+// сама тяга успевает измениться в ответ на предыдущий такт.
+const throttleFilterTime = 1.2
+
+// landingBurnIgnitionAltitude возвращает высоту (м) повторного розжига
+// посадочного импульса — Stage 4.15: кинематически вычисленный тормозной
+// путь ПЕРВОЙ (самой мощной, 13 камер — boosterLandingHigh) группы
+// посадочной последовательности на её РАСПОЛАГАЕМОМ (с тем же запасом
+// landingDecelBudget, что и весь остальной вертикальный канал —
+// landingRequiredThrust/landingStoppingMargin уже используют его для той же
+// цели: не гнаться за пределом, оставляя запас на просадку тяги/турбонасоса)
+// замедлении — а не фиксированное число.
+//
+// Раньше здесь стояла константа 3300 м (см. историю: формула когда-то
+// честно давала 15-25 км, потому что снижение и снос на этой высоте в
+// модели были заметно больше, чем в реальных пусках, — и вместо того чтобы
+// маскировать это фиксированным числом, розжиг был жёстко привязан к
+// хронометражу реальных посадок Super Heavy V3). Stage 4.15 переработала
+// именно ту физику, которую тогда назвали причиной (Boostback без
+// демпфирования по скорости закрытия и Coast, тонущий в необузданном
+// остаточном вращении, см. их историю) — снижение и снос к моменту розжига
+// изменились не постепенно, а качественно (устойчивый Coast даёт куда
+// меньшее аэродинамическое торможение, чем беспорядочно кувыркавшийся, и
+// приходит к концу участка БЫСТРЕЕ, а не медленнее) настолько, что сама
+// зафиксированная высота перестала быть безопасной ориентировочной, — с
+// ней бустер входит в посадочный импульс на сотнях, а не десятках м/с,
+// и просто не успевает затормозить. Кинематическая формула, honest про
+// РЕАЛЬНОЕ снижение и РЕАЛЬНО располагаемое замедление на этот такт, —
+// именно то, что нужно взамен: розжиг подстраивается под фактическую
+// скорость подхода САМ, а не под то, что когда-то было типичным.
+func (b *Booster) landingBurnIgnitionAltitude(nav orbit.NavState) float64 {
+	_, aMax := b.groupAccelEnvelope(nav, boosterLandingHigh)
+	aBudget := landingDecelBudget * aMax
+	if aBudget <= 0 {
+		return 0
+	}
+	return landingStoppingDistance(-nav.RadialVelocity, aBudget)
+}
+
+// Booster — первая ступень после отделения: активный возврат к площадке
+// и мягкая посадка на воду.
+type Booster struct {
+	Config vehicle.Config
+
+	state      VehicleState
+	propulsion *PropulsionSystem
+	attitude   VehicleAttitude
+
+	// engineLayout — геометрия ВСЕХ камер первой ступени (позиция, способна
+	// ли качаться), в том же порядке, что и propulsion.Engines — см.
+	// NewBooster. Неизменна за весь полёт (позиции камер не двигаются),
+	// строится один раз при создании, а не каждый такт: vehicle.NewLayout
+	// пересчитывает геометрию всего носителя, дороже, чем нужно вызывать
+	// на каждом шаге контура ориентации (100 Гц).
+	engineLayout []vehicle.EngineLayout
+
+	phase BoosterPhase
+
+	// launchTarget — Stage 4.11, п.1; Stage 4.12, п.1 (target split
+	// устранён): LandingTargetPosition = LaunchPosition
+	// (координаты стартового комплекса, см. NewBooster) — ЕДИНАЯ цель для
+	// Boostback guidance (Stage 4.11), permanent miss-телеметрии (Stage
+	// 4.11) и position-aware terminal landing guidance (Stage 4.12) — до
+	// Stage 4.12 существовало отдельное поле target (Stage 4.3-4.6,
+	// BoosterLandingLatitude/Longitude), которое НИГДЕ фактически не
+	// читалось (landingHorizontalAccelDemand до Stage 4.12 гасила только
+	// скорость, без цели по положению вообще) — удалено, а не просто
+	// переставлено на launchTarget, чтобы не оставлять второе, всегда
+	// молчащее поле-ловушку.
+	launchTarget physics.Geodetic
+
+	// landingMissDistanceLast — Stage 4.11, п.2: LandingMissDistance,
+	// зафиксированное в момент приводнения (checkSplashdown) — горизонтальное
+	// расстояние от фактической точки касания до launchTarget, м. NaN, пока
+	// приводнение не произошло.
+	landingMissDistanceLast float64
+
+	// boostbackPredictedMissPrev, boostbackMissWorsening — Stage 4.11, п.8
+	// (пересмотрено Stage 4.15): состояние детектора локального минимума
+	// ТЕКУЩЕЙ горизонтальной ошибки положения (landingHorizontalPositionError,
+	// см. updatePhase, случай BoosterBoostback, — раньше здесь стоял
+	// прогнозируемый баллистический промах landingPredictedImpact, см. её
+	// историю в updatePhase). boostbackPredictedMissPrev — значение на
+	// предыдущем такте (NaN — ещё не инициализирован); boostbackMissWorsening
+	// — сколько секунд подряд оно растёт (дебаунс против одиночного шумного
+	// такта, тот же приём, что landingGroupDwell). Имя поля сохранено
+	// (не переименовано в boostbackPosErrPrev) — назначение то же самое,
+	// смена лишь того, ЧТО именно отслеживается.
+	boostbackPredictedMissPrev float64
+	boostbackMissWorsening     float64
+
+	// outboundHorizontal — единичный вектор ГОРИЗОНТАЛЬНОЙ (ground-relative,
+	// см. NewBooster) скорости в момент отделения, ECI. Раньше (Stage ≤4.10)
+	// служил осью критерия останова Boostback ("пока проекция скорости на
+	// этот вектор не станет неположительной") — с Stage 4.11 останов решает
+	// predicted-impact тренд (updatePhase), а это поле осталось только
+	// опорной осью для downrange/crossrange разложения в телеметрии
+	// (landingMiss/groundMissAgainst) — не входит в саму величину промаха.
+	outboundHorizontal physics.Vec3
+
+	// boostbackCommandedDir, boostbackCommandedRate — Stage 4.15: motion-profile
+	// цели ориентации разворотного импульса — тот же приём, что и у
+	// coastCommandedDir/coastCommandedRate и landingCommandedDir/
+	// landingCommandedRate (см. их комментарии): commandedDir — не сырое,
+	// пересчитанное с нуля на этом такте направление коррекции промаха
+	// (см. boostbackTarget), а reference-направление, которое само
+	// разгоняется и тормозит с ограничением по располагаемому угловому
+	// ускорению (reorientAngularAccel) и не может обогнать физическую
+	// способность корпуса поворачиваться.
+	//
+	// Раньше (Stage ≤4.14) сюда напрямую писалось сырое направление коррекции
+	// без какого-либо ограничения по скорости разворота — приемлемо, пока
+	// коррекция сама менялась медленно, но диагностика (Stage 4.15) нашла:
+	// в первые секунды после отделения (унаследованная от связки ориентация
+	// ещё далека от новой цели) и при малочисленной (3 камеры) конечной
+	// группе разворотного импульса корпус раскручивало до 20-30°/с —
+	// автопилот гонялся за мгновенно скачущей целью тем же способом, что
+	// уже чинили здесь для Coast и посадочного импульса (см. их историю),
+	// но сам разворотный импульс этим приёмом ещё не был накрыт. Это и есть
+	// первопричина того, что бустер входил в Coast уже вращающимся —
+	// а не начинал его почти неподвижным, как должен по физике манёвра.
+	boostbackCommandedDir  physics.Vec3
+	boostbackCommandedRate float64
+
+	// outboundSpeed — модуль горизонтальной скорости в момент отделения, м/с.
+	// Используется только как признак "было ли вообще горизонтальное
+	// движение" в boostbackTarget.
+	outboundSpeed float64
+
+	// boostbackStartElapsed — модельное время начала разворотного импульса,
+	// с. Разворотный импульс стартует сразу при отделении, так что
+	// формально это то же самое, что elapsed в момент создания Booster —
+	// но отдельное поле нужно, чтобы boostbackEngineGroup мог отсчитывать
+	// время манёвра, не путая его с абсолютным модельным временем.
+	boostbackStartElapsed float64
+
+	// coastCommandedDir, coastCommandedRate — состояние генератора цели Coast:
+	// не сама ориентация корпуса, а reference-траектория, которую он
+	// отслеживает. Boostback (Stage 4.10) тоже наводится замкнутым циклом
+	// (см. boostbackTarget), но по ЧИСТО горизонтальной цели — переход на
+	// Coast, нацеленный на ретроград ПОЛНОЙ ТЕКУЩЕЙ скорости (заметная
+	// вертикальная составляющая к концу импульса), всё ещё может дать
+	// заметный скачок цели за один такт. Мгновенная передача такой
+	// цели автопилоту (или её линейный доворот за произвольно выбранное
+	// время) — тот же класс ошибки, что уже чинили внутри самого Boostback
+	// (см. boostbackTarget): автопилот либо не успевает, либо успевает
+	// разогнаться и проскакивает мимо выравнивания с накопленной угловой
+	// скоростью — см. boosterCoastTarget, там разобрано, почему нужен именно
+	// motion-profile с торможением по остающемуся углу (ω²/2α), а не то и
+	// другое.
+	coastCommandedDir  physics.Vec3
+	coastCommandedRate float64
+
+	// Stage 4.14 (реверт): финальный перевод coastCommandedDir обратно в
+	// Pitch/Yaw через PitchAzimuth (Atan2 по горизонтальным East/North
+	// составляющим) у полюса (тангаж Coast 85-90°) даёт скачок Yaw до
+	// 180° на возмущении долей см/с — синтетика и живой прогон это
+	// подтвердили буквально (target-jump 132° → 0.19° после замены на
+	// параллельный перенос поперечной оси и построение через
+	// QuaternionFromBasis вместо Euler). НО canonical A/B на этом же
+	// прогоне показал: стабильный, не скачущий target не снижает roll к
+	// зажиганию посадочного импульса, а РЕЗКО его ухудшает — omegaRoll
+	// 0.20→1.82 рад/с, tilt 6.9°→139-162° (почти кувырок), что напрямую
+	// сломало TestLandingSequence_A/B (группа зависает на 13, ни разу не
+	// уменьшается). Причина: старый скачущий target заставлял решётчатые
+	// рули (T-раскладка 0°/90°/180°, см. Stage 4.13.5 механизм B —
+	// структурная, не зависящая от Euler-полюса связность крена с
+	// тангажом/рысканием) менять знак команды достаточно часто, чтобы их
+	// паразитный вклад в крен СЛУЧАЙНО самогасился; стабильный target
+	// держит рули в одном, устойчивом положении весь Coast, и тот же
+	// паразитный вклад перестаёт гаситься, накапливаясь монотонно все
+	// ~200+ секунд участка. Это НЕ баг реализации этой стадии (проверено:
+	// унификация параллельного переноса в один проход за такт не изменила
+	// результат) — это разоблачение уже известного (Stage 4.13.5) механизма
+	// B, который старый баг ранее случайно маскировал. Синтетические тесты
+	// на непрерывность target (Pitch/Yaw/Roll-скачок, зеркальные
+	// возмущения, знак кватерниона) остаются доказательством: сингулярность
+	// в построении target реальна и чинится ровно так, как здесь описано —
+	// но чинить её раньше, чем механизм B (cross-axis утечка крена
+	// T-раскладки рулей/allocator'а), нельзя: гейт "roll должен снизиться
+	// или остаться сопоставимым" не пройден, откат обязателен.
+	// См. отчёт Stage 4.14 в истории чата для полных чисел.
+
+	// landingBurnStartAltitude — высота в момент повторного розжига камер
+	// на посадочный импульс, м. Используется только для телеметрии/логов —
+	// выбор числа работающих камер (13/5/3) больше не зависит от доли этой
+	// высоты, см. updateLandingEngineGroup.
+	landingBurnStartAltitude float64
+
+	// landingGroupDwell — сколько секунд подряд держится условие
+	// "текущая группа посадочного импульса избыточна, а следующая, меньшая,
+	// физически справится" — см. updateLandingEngineGroup. Обнуляется, как
+	// только условие перестаёт выполняться; переход происходит только
+	// после того, как оно продержалось landingGroupDwellTime подряд.
+	landingGroupDwell float64
+
+	// landingRequiredThrustLast — ПОЛНАЯ (3D, вертикаль+горизонталь)
+	// требуемая тяга (Н, модуль вектора landingDesiredThrust), которую
+	// guidance запросило на последнем такте — та же величина, которую
+	// updateLandingEngineGroup сравнивает с physical envelope каждой
+	// группы, и которую landingThrottle делит на располагаемую тягу (см.
+	// BoosterTelemetry). До Stage 4.4 здесь была только вертикальная
+	// составляющая (landingRequiredThrust) — теперь sequencing и throttle
+	// обязаны видеть полный вектор, а не только его вертикальную часть
+	// (см. landingDesiredThrust, п.23 Stage 4.4: "Проверить transition
+	// feasibility уже с полной thrust magnitude").
+	landingRequiredThrustLast float64
+
+	// landingStoppingMarginLast — запас высоты (м) сверх кинематически
+	// необходимого тормозного пути ТЕКУЩЕЙ группы на её максимуме газа,
+	// на последнем такте (см. landingStoppingMargin) — отрицательный
+	// означает, что группа физически не успевает погасить скорость до
+	// касания даже на полном газе (см. BoosterTelemetry, п.7,13 Stage 4.3).
+	landingStoppingMarginLast float64
+
+	// landingAccelBudgetSmoothed — сглаженный по времени эталон
+	// располагаемого замедления профиля торможения, м/с² (см.
+	// landingAccelBudget). Ноль означает "ещё не инициализирован" — первый
+	// вызов на посадочном импульсе просто берёт сырое значение без
+	// сглаживания.
+	landingAccelBudgetSmoothed float64
+
+	// landingCommandedDir, landingCommandedRate — motion-profile цели
+	// ориентации посадочного импульса (см. landingBurnTarget) — тот же
+	// приём, что coastCommandedDir/coastCommandedRate на Coast: цель не
+	// прыгает к desired thrust direction мгновенно, а разгоняется/
+	// тормозит с ограничением по располагаемому угловому ускорению.
+	// Нулевой Vec3 означает "ещё не инициализирован".
+	landingCommandedDir  physics.Vec3
+	landingCommandedRate float64
+
+	// landingDesiredThrustLast — последний посчитанный 3D вектор требуемой
+	// тяги (Н, локальные оси East/North/Up), см. landingDesiredThrust.
+	// Диагностика/наблюдаемость (Stage 4.4, п.31).
+	landingDesiredThrustLast physics.Vec3
+
+	// landingGuidanceSaturatedLast сообщает, что на последнем такте
+	// горизонтальная часть требуемой тяги была урезана ради вертикальной
+	// безопасности (см. landingDesiredThrust, п.8-9,29 Stage 4.4).
+	landingGuidanceSaturatedLast bool
+
+	// landingAngularStoppingMarginLast — запас (рад) между текущим
+	// накопленным углом до цели ориентации и угловым тормозным путём на
+	// располагаемом угловом ускорении, на последнем такте (см.
+	// landingBurnTarget, п.15 Stage 4.4). Отрицательный — пора тормозить
+	// разворот, иначе будет overshoot.
+	landingAngularStoppingMarginLast float64
+
+	// landingControlMarginLast — запас (Н·м) между реально располагаемым
+	// корректирующим моментом и предсказанным аэродинамическим моментом
+	// для ПРИНЯТОГО (после возможного урезания по authority) кандидата
+	// направления, на последнем такте — см. landingAuthorityConstrainedThrust,
+	// Stage 4.6. Отрицательный означает, что даже после урезания
+	// горизонтальной коррекции до нуля состояние вне authority — честно
+	// показывается, не маскируется.
+	landingControlMarginLast float64
+
+	// landingMarginLimitedLast сообщает, что на последнем такте
+	// горизонтальная часть требуемой тяги была урезана ИМЕННО из-за
+	// нехватки authority (в отличие от landingGuidanceSaturatedLast —
+	// та про нехватку располагаемой ТЯГИ группы, эта про нехватку
+	// корректирующего МОМЕНТА против аэродинамики) — Stage 4.6.
+	landingMarginLimitedLast bool
+
+	// landingRollAtIgnition — Stage 4.9, п.A1: крен корпуса (град.,
+	// physics.Attitude.Roll convention) в момент захвата ignition
+	// (landingCommandedDir впервые становится ненулевым в landingBurnTarget).
+	// Используется как ЗАФИКСИРОВАННАЯ цель по крену на весь посадочный
+	// импульс — раньше цель безусловно требовала Roll=0 (абсолютное
+	// выравнивание), хотя миссии крен посадочного импульса физически
+	// безразличен. Stage 4.8 A/B на canonical seed 1 показал: погоня за
+	// Roll=0 от типичных ~137°, унаследованных с Boostback/Coast,
+	// разгоняла ωroll до −64°/с и гироскопически (Ixx≪Iyy=Izz)
+	// раскачивала тангаж — фиксация крена на факте ignition снижает max
+	// ωroll и max суммарное ω в разы, ничего не теряя (терминальное
+	// выравнивание крена — отдельная будущая задача, не эта).
+	landingRollAtIgnition float64
+
+	// landingGroupIndices — geometry-driven (не index-driven) состав каждой
+	// группы посадочной последовательности landingEngineSequence,
+	// параллельный ей по индексу: landingGroupIndices[i] — индексы в
+	// b.engineLayout для группы landingEngineSequence[i]. Вычисляется один
+	// раз в NewBooster (см. landingGroupEngineIndices) вместо прежнего
+	// engines[0:n] — Stage 4.8 нашла, что engines[0:5] (3 центральных + 2
+	// физически СОСЕДНИХ камеры среднего кольца) занимает ранг 859/1287 по
+	// симметрии pitch/yaw authority среди всех возможных пятёрок, да ещё
+	// и даёт ненулевой паразитный момент при нулевом gimbal. Каждая
+	// следующая (по возрастанию размера) группа содержит предыдущую
+	// целиком — иначе даунселект гасил бы уже работающие камеры и разжигал
+	// вместо них другие, остывшие с самого начала импульса.
+	landingGroupIndices [][]int
+
+	// landingGroupIndex — позиция ТЕКУЩЕЙ активной группы в
+	// landingEngineSequence/landingGroupIndices, -1 до первого розжига
+	// посадочного импульса.
+	landingGroupIndex int
+
+	// landingRequiredTorquePrev — b.attitude.RequestedTorque.Norm() на
+	// предыдущем такте (Н·м) — нужен updateLandingEngineGroup для
+	// одношаговой экстраполяции требуемого момента вперёд (см. п.A2
+	// Stage 4.9): Stage 4.8 audit нашёл, что required растёт неравномерно
+	// (скачком сразу после даунселекта), и сравнение со СВЕЖИМ (на этот
+	// такт устаревшим) значением систематически опаздывало бы именно там,
+	// где рост момента максимален.
+	landingRequiredTorquePrev float64
+
+	elapsed float64
+
+	// Ускорения предыдущего шага — тот же приём, что и у Simulation:
+	// гидростатический напор в баках считается по ним, до того как тяга
+	// текущего шага известна.
+	prevAxialAccel   float64
+	prevLateralAccel float64
+	prevAngularAccel float64
+
+	// toppleTilt — накопленный угол завала после приводнения, градусы.
+	toppleTilt float64
+
+	// splashSpeed — вертикальная скорость в момент касания воды, м/с.
+	splashSpeed float64
+
+	// splashHorizontalSpeed, splashTotalSpeed — Stage 4.12.5: горизонтальная
+	// (ground-relative) и полная (√(h²+z²)) скорость в момент касания —
+	// см. checkSplashdown. До Stage 4.12.5 soft/hard классификация
+	// приводнения (checkSplashdown, softLimit) смотрела ТОЛЬКО на
+	// splashSpeed (вертикаль) — приводнение с малым Vz, но большим
+	// Vh (Stage 4.11/4.12 canonical: Vh=86-173 м/с при Vz~69-110) логировалось
+	// бы как "мягкое", хотя полная скорость касания была далека от мягкой.
+	// Оба поля хранятся отдельно (не смешаны в одно число) — ноль, а не
+	// NaN: 0 м/с горизонтальной скорости при касании — осмысленная,
+	// достижимая величина, а не "не определено".
+	splashHorizontalSpeed float64
+	splashTotalSpeed      float64
+
+	// filteredThrottle — сглаженная уставка тяги на посадочном импульсе.
+	//
+	// Расписание скорости (landingThrottle) пересчитывает потребную тягу
+	// заново каждый такт по текущим высоте и скорости снижения — без
+	// памяти о предыдущей команде. Турбонасос отзывается на команду не
+	// мгновенно (доли секунды на раскрутку), и при высокой тяговооружённости
+	// почти пустой ступени это запаздывание раскачивает контур: команда скачет вслед за виражами, которые сама же
+	// и вызвала на предыдущем такте, снижение колеблется вместо того, чтобы
+	// монотонно падать, и бустер приходит к воде на десятках метров в секунду
+	// вместо считаных. Фильтр — тот же приём, что уже применяется в контуре
+	// РСУ/ориентации (residualFilterTime в attitude_dynamics.go): не мешает
+	// схождению, но не даёт команде дёргаться быстрее, чем агрегат физически
+	// успевает отозваться.
+	filteredThrottle float64
+
+	rng *rand.Rand
+}
+
+// NewBooster создаёт бустер в момент отделения и сразу начинает разворотный
+// импульс.
+func NewBooster(cfg vehicle.Config, position, velocity physics.Vec3, elapsed float64,
+	rng, sensorRng *rand.Rand, ambientTemp float64, stackOrientation physics.Quaternion) *Booster {
+
+	b := &Booster{
+		Config: cfg,
+		state: VehicleState{
+			Position: position,
+			Velocity: velocity,
+			FuelMass: cfg.FirstStage.FuelReserve,
+		},
+		phase:                 BoosterBoostback,
+		rng:                   rng,
+		elapsed:               elapsed,
+		boostbackStartElapsed: elapsed,
+		// launchTarget — Stage 4.11, п.1; Stage 4.12, п.1: ЕДИНАЯ цель
+		// возврата/посадки. cfg.LaunchLatitude/LaunchLongitude — те же
+		// координаты, из которых Simulation строит s.state.Position на t=0
+		// (simulation.go:NewSimulationWithSeed) — Geodetic, не ECI: не
+		// дрейфует от дальнейшего вращения Земли, в отличие от сравнения в
+		// инерциальных координатах напрямую.
+		launchTarget: physics.Geodetic{
+			Latitude:  cfg.LaunchLatitude,
+			Longitude: cfg.LaunchLongitude,
+		},
+		landingMissDistanceLast:    math.NaN(),
+		boostbackPredictedMissPrev: math.NaN(),
+	}
+
+	// Карта камер — тот же Layout, что строит рендерер (vehicle.NewLayout),
+	// не отдельная физическая копия: раньше физика и 3D-сцена расходились
+	// (рендерер рисовал 13 качающихся камер, физика знала только один
+	// агрегатный угол на всю ступень, см. Stage 4.5) — теперь оба читают
+	// одну и ту же геометрию.
+	for _, stage := range vehicle.NewLayout(cfg).Stages {
+		if stage.Index == 1 {
+			b.engineLayout = stage.Engines
+			break
+		}
+	}
+
+	// Stage 4.12.5: ground-relative (не сырая ECI) горизонталь — velocity
+	// параметр здесь ECI, и его горизонтальная часть включает вклад
+	// вращения Земли (~420 м/с на широте площадки на высоте отделения,
+	// physics.CorotatingVelocity — не пренебрежимо против ~1178 м/с
+	// ground-relative горизонтальной скорости на этой же секунде). До этой
+	// правки outboundHorizontal строилась из ECI-горизонтали — влияло
+	// только на то, как downrange/crossrange (телеметрия, не сама величина
+	// промаха) разложены по опорной оси, но ось "куда полетели от площадки"
+	// обязана быть ground-relative по смыслу.
+	up := position.Unit()
+	groundVelocity := velocity.Sub(physics.CorotatingVelocity(position))
+	horizontal := groundVelocity.Sub(up.Scale(groundVelocity.Dot(up)))
+	b.outboundSpeed = horizontal.Norm()
+	if b.outboundSpeed > 1e-3 {
+		b.outboundHorizontal = horizontal.Unit()
+	}
+
+	// boostbackCommandedDir — Stage 4.10/4.15: НЕ вычисляется здесь заранее —
+	// начальное значение нулевое, первый же вызов boostbackTarget заполнит
+	// его от ТЕКУЩЕЙ ориентации корпуса (та же, что и в этот момент), а
+	// дальше motion-profile довернёт его к закрытому циклу наведения
+	// (перерасчёт цели каждый такт от текущей скорости), не обгоняя
+	// физическую способность корпуса поворачиваться.
+
+	// EngineCount — все камеры первой ступени, а не только те, что горят
+	// прямо сейчас: их физическая масса (см. updateAttitude) никуда не
+	// девается, пока часть из них не работает, а розжиг/останов отдельных
+	// камер — дело setEngineGroup, не числа объектов в модели.
+	b.propulsion = NewPropulsionSystem(StageProps{
+		StructureMass:      cfg.FirstStage.DryMass,
+		PropellantMass:     cfg.FirstStage.FuelReserve,
+		MixtureRatio:       cfg.FirstStage.MixtureRatio,
+		EngineCount:        int(cfg.FirstStage.EngineCount),
+		StagePrefix:        "S1",
+		EngineConfig:       vehicle.FirstStageEngineConfig(cfg),
+		FuelTankHeight:     cfg.FirstStage.FuelTankHeight,
+		OxTankHeight:       cfg.FirstStage.OxTankHeight,
+		FuelTankPressure:   cfg.FirstStage.FuelTankPressure,
+		OxTankPressure:     cfg.FirstStage.OxTankPressure,
+		FuelPressurantMass: cfg.FirstStage.FuelPressurantMass,
+		OxPressurantMass:   cfg.FirstStage.OxPressurantMass,
+	}, rng, sensorRng, ambientTemp)
+
+	// Синхронизация физической нумерации (Stage 4.10, п.1): propulsion
+	// строит камеры плоским циклом, ничего не зная про кольца/геометрию,
+	// и до этой синхронизации нумеровал бы их простым порядковым номером
+	// (S1-1..S1-33 по позиции), расходясь с b.engineLayout там, где у неё
+	// физический номер переставлен (маневренное кольцо, см.
+	// vehicle.innerRingEngineNumberBySlot). Индекс массива здесь всё ещё
+	// используется — но только КАК КЛЮЧ выравнивания "i-й построенный
+	// двигатель propulsion = i-я запись engineLayout" (оба построены одним
+	// проходом по тем же 33 камерам в одном порядке), а не как источник
+	// самого номера: номер и ID берутся из engineLayout, а не из i+1.
+	for i := range b.propulsion.Engines {
+		if i >= len(b.engineLayout) {
+			break
+		}
+		b.propulsion.Engines[i].Number = b.engineLayout[i].EngineNumber
+		b.propulsion.Engines[i].ID = b.engineLayout[i].ID
+	}
+
+	b.setEngineGroup(boosterBoostbackHigh)
+
+	// Первые hotStageEngines камер (flight_phases.go) физически не гасли
+	// ни на миг: горячее разделение держит их на пониженной тяге прямо
+	// до отрыва, отделение лишь просит у них полный газ вместо опорного.
+	// У свежесозданной двигательной установки, однако, каждая камера —
+	// новый объект с нулевой раскруткой вала: без этой поправки все
+	// тридцать три, включая уже горящие пять, стартовали бы с одного и
+	// того же холодного нуля, и тяга проваливалась бы в ноль на секунду
+	// раскрутки турбонасоса именно там, где управляемость нужнее всего, —
+	// сразу после отделения. Раскрутка — по одной только угловой скорости
+	// вала: давление в камере и тяга у неё уже следствие текущих оборотов
+	// (Engine.Update), отдельного счётчика для них заводить не нужно.
+	for i := 0; i < hotStageEngines && i < len(b.propulsion.Engines); i++ {
+		tp := b.propulsion.Engines[i].Turbopump
+		tp.Speed = tp.Config.DesignSpeed
+	}
+
+	// Контур наведения настроен по требуемому угловому ускорению, а не по
+	// углу качания напрямую (см. комментарий у Bandwidth в
+	// AttitudeControlConfig), и от этого не зависит ни от массы, ни от тяги —
+	// тот же DefaultAttitudeControl(), что и у корабля, годится без отдельной
+	// подгонки под три/тринадцать/тридцать три камеры. Раньше Config
+	// у бустера не заполнялся вовсе (только RCSMoment ниже) — при нулевых
+	// Bandwidth/Damping/MaxGimbal автопилот не выдавал вообще никакой
+	// команды, и корпус неуправляемо раскачивался одной лишь аэродинамикой.
+	b.attitude.Config = DefaultAttitudeControl()
+	if cfg.MaxGimbalDegrees > 0 {
+		b.attitude.Config.MaxGimbal = cfg.MaxGimbalDegrees * physics.DegToRad
+	}
+
+	// Ориентация в момент отделения — не заново вычисленный ретроград, а та,
+	// что была у связки долю секунды назад: до отделения бустер и корабль —
+	// одно тело, и разворот к цели разворотного импульса начинается отсюда,
+	// небыстрым разворотом камерами (см. GimbalRate), как это и происходит
+	// в реальности. Раньше здесь стояла retrogradeGroundAttitudeFromVectors —
+	// корпус в момент создания Booster мгновенно оказывался в целевой
+	// ориентации без какого-либо разворота, чего на видео реальных пусков
+	// не видно: бустер после расхождения ещё какое-то время летит почти
+	// вдоль прежнего курса, довернувшись к цели уже потом.
+	b.attitude.Orientation = stackOrientation
+	b.attitude.Omega = physics.Vec3{}
+	b.attitude.GimbalPitch, b.attitude.GimbalYaw, b.attitude.GimbalRoll = 0, 0, 0
+	b.attitude.initialised = true
+	b.attitude.Surfaces = NewSurfaceSet(vehicle.GridFins(cfg.FirstStageLength, cfg.Diameter/2))
+	b.attitude.Surfaces.Deployed = true
+	// Момент газоотвода — своя, не связанная с рабочим телом величина
+	// (плечо × тяга сопел стравливания); доступность газа проверяется
+	// отдельно каждый такт от остатка наддува в баках — см. updateAttitude.
+	b.attitude.Config.RCSMoment = cfg.RCSMoment
+
+	// Явный, найденный по физической нумерации состав посадочных групп
+	// (Stage 4.10, п.2) — вычисляется один раз здесь же, по уже
+	// синхронизированному b.engineLayout.
+	b.landingGroupIndices = b.buildLandingGroupIndices()
+	b.landingGroupIndex = -1
+
+	log.Printf("🪂 Бустер начинает возврат на T+%.1f с: высота %.1f км, скорость %.0f м/с",
+		elapsed, (position.Norm()-physics.EarthRadius)/1000, velocity.Norm())
+
+	return b
+}
+
+// Alive сообщает, продолжает ли бустер лететь (или уже разрушился).
+func (b *Booster) Alive() bool {
+	return b != nil && b.phase != BoosterDestroyed
+}
+
+// dryMass возвращает сухую массу бустера, кг.
+func (b *Booster) dryMass() float64 {
+	return b.propulsion.DryMass()
+}
+
+// setEngineGroup зажигает первые n камер по порядковому номеру и гасит
+// остальные — n=0 останавливает все. Первые камеры по нумерации
+// (firstStageEngineLayout, layout.go) — это внутреннее кольцо, то самое
+// центральное и качающееся: любой набор от n=3 и выше всегда включает его
+// целиком, так что управление по каналам тангажа/рыскания не пропадает
+// ни при одном сокращении. Двигатель можно зажечь повторно (Engine.Start
+// сбрасывает счётчик с розжига, только если он не уже работает) — здесь
+// это используется буквально: посадочный импульс на Coast гаснет полностью
+// и разжигается заново, а не тлеет остаток пути на утеплённых камерах.
+func (b *Booster) setEngineGroup(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > len(b.propulsion.Engines) {
+		n = len(b.propulsion.Engines)
+	}
+	for i, e := range b.propulsion.Engines {
+		if i < n {
+			e.Start()
+		} else {
+			e.Stop()
+		}
+	}
+	b.propulsion.Commissioned = n
+}
+
+// setEngineGroupIndices зажигает РОВНО камеры из idx (по индексу в
+// b.propulsion.Engines/b.engineLayout) и гасит остальные — geometry-driven
+// аналог setEngineGroup для посадочной последовательности (Stage 4.9, п.A3,
+// см. landingGroupIndices/landingGroupEngineIndices): состав группы задан
+// явным списком индексов, а не порядковым срезом "первые n".
+func (b *Booster) setEngineGroupIndices(idx []int) {
+	active := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		active[i] = true
+	}
+	for i, e := range b.propulsion.Engines {
+		if active[i] {
+			e.Start()
+		} else {
+			e.Stop()
+		}
+	}
+	b.propulsion.Commissioned = len(idx)
+}
+
+// landingGroup13EngineNumbers, landingGroup5EngineNumbers,
+// landingGroup3EngineNumbers — Stage 4.10, п.2: явные ФИЗИЧЕСКИЕ номера
+// камер (vehicle.EngineLayout.EngineNumber) для каждой группы посадочной
+// последовательности — найденная схема, не index-driven правило (никаких
+// engines[:5]/i<n). Пятёрка — три центральных (1,2,3) плюс два камеры
+// маневренного кольца, №6 и №12, СПЕЦИАЛЬНО положенные диаметрально
+// противоположно друг другу перестановкой номеров внутри кольца (см.
+// vehicle.innerRingEngineNumberBySlot) — раньше здесь стоял geometry-search
+// (Stage 4.9, bestSymmetricSubset), с приходом найденной физической схемы
+// он не нужен: состав задан напрямую.
+var (
+	landingGroup13EngineNumbers = []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
+	landingGroup5EngineNumbers  = []int{1, 2, 3, 6, 12}
+	landingGroup3EngineNumbers  = []int{1, 2, 3}
+)
+
+// engineIndexByNumber ищет индекс в b.engineLayout (и, по построению
+// NewBooster, синхронно в b.propulsion.Engines) камеры с физическим
+// номером n — Stage 4.10, п.1: поиск по номеру, а НЕ предположение
+// index==number-1, что и делает код независимым от порядка укладки.
+// -1, если камера с таким номером не найдена.
+func (b *Booster) engineIndexByNumber(n int) int {
+	for i, e := range b.engineLayout {
+		if e.EngineNumber == n {
+			return i
+		}
+	}
+	return -1
+}
+
+// engineIndicesByNumbers переводит список физических номеров в список
+// индексов массива (см. engineIndexByNumber) — номера, для которых камера
+// не найдена, молча пропускаются: вызывающий код (buildLandingGroupIndices)
+// логирует итоговую длину отдельно, несовпадение сразу видно по regression
+// тестам geometry↔EngineNumber (landing_group_geometry_test.go).
+func (b *Booster) engineIndicesByNumbers(numbers []int) []int {
+	idx := make([]int, 0, len(numbers))
+	for _, n := range numbers {
+		if i := b.engineIndexByNumber(n); i >= 0 {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+// buildLandingGroupIndices — Stage 4.10, п.2: состав каждой группы
+// landingEngineSequence (13→5→3) по явным физическим номерам, параллельно
+// ей по индексу.
+func (b *Booster) buildLandingGroupIndices() [][]int {
+	bySize := map[int][]int{
+		boosterLandingHigh: landingGroup13EngineNumbers,
+		boosterLandingMid:  landingGroup5EngineNumbers,
+		boosterLandingLow:  landingGroup3EngineNumbers,
+	}
+	result := make([][]int, len(landingEngineSequence))
+	for i, n := range landingEngineSequence {
+		result[i] = b.engineIndicesByNumbers(bySize[n])
+	}
+	return result
+}
+
+// Продолжительность каждой ступени разворотного импульса по числу камер,
+// секунды — по хронометражу реальных пусков Super Heavy V3: тридцать три
+// камеры десять секунд, тринадцать ещё десять, центральная тройка — тоже
+// около десяти, и на этом манёвр закончен (камеры гасятся полностью, см.
+// boostbackTotalDuration) — не "тройка до самого конца, сколько бы он ни
+// длился". Весь манёвр в сумме — порядка тридцати секунд, а не полторы-две
+// минуты.
+const (
+	boostbackHighDuration = 10.0
+	boostbackMidDuration  = 10.0
+	boostbackLowDuration  = 10.0
+
+	// boostbackTotalDuration — плановая продолжительность всего разворотного
+	// импульса, с. Как и число камер на каждой ступени, это не кинематика
+	// (не "пока не погасим снос"), а тепловой/структурный бюджет манёвра —
+	// реальный Super Heavy жжёт по плану, а не до сходимости к нулю. Этим
+	// планом одновременно и решается вопрос "сколько держать центральную
+	// тройку" (см. историю updatePhase, случай BoosterBoostback): раньше
+	// тройка держалась, пока не сойдётся горизонтальный тренд/апоцентр или
+	// не кончится топливо — на располагаемой тяге всего трёх камер это
+	// растягивало манёвр до 130+с вместо плановых тридцати.
+	boostbackTotalDuration = boostbackHighDuration + boostbackMidDuration + boostbackLowDuration
+)
+
+// boostbackEngineGroup выбирает число работающих камер разворотного
+// импульса по времени с начала манёвра — ступенчато, как и в реальности,
+// а не от того, сколько горизонтальной скорости ещё гасить: то, что реально
+// определяет число камер, — тепловой и структурный бюджет манёвра
+// (расход топлива и время его подачи), а не мгновенная кинематика.
+func (b *Booster) boostbackEngineGroup(sinceStart float64) int {
+	switch {
+	case sinceStart < boostbackHighDuration:
+		return boosterBoostbackHigh
+	case sinceStart < boostbackHighDuration+boostbackMidDuration:
+		return boosterBoostbackMid
+	case sinceStart < boostbackTotalDuration:
+		return boosterBoostbackLow
+	default:
+		return 0
+	}
+}
+
+// landingEngineSequence — штатная последовательность групп посадочного
+// импульса, каждая элемент строго меньше предыдущего. Переход по ней
+// НЕОБРАТИМ — см. updateLandingEngineGroup.
+var landingEngineSequence = []int{boosterLandingHigh, boosterLandingMid, boosterLandingLow}
+
+// landingGroupDwellTime — сколько секунд подряд условие даунселекта должно
+// держаться, прежде чем группа реально уменьшится, секунды. Не выдумана
+// произвольно: тот же порядок величины, что throttleFilterTime
+// (throttleCommand) — команда тяги сама сглажена с этой постоянной времени,
+// и решение "какая группа вообще нужна" не должно реагировать быстрее, чем
+// сама тяга успевает измениться в ответ на предыдущий такт. Реагировать на
+// одно-двухтактный выброс required (шум профиля, переходный процесс после
+// предыдущего переключения) означало бы вернуть в другой форме ту же
+// хрупкость, которую убирает необратимость перехода.
+const landingGroupDwellTime = throttleFilterTime
+
+// boostbackShutdownDwellTime — Stage 4.11, п.8: сколько секунд подряд
+// прогнозируемый промах (landingPredictedImpact) должен РАСТИ, прежде чем
+// Boostback реально остановится — тот же приём и то же обоснование, что
+// landingGroupDwellTime: защита от одиночного шумного такта, а не magic
+// distance threshold (задание явно требует не задавать порог по расстоянию
+// заранее — критерий здесь чисто по тренду, эта константа лишь фильтрует
+// шум самого тренда).
+const boostbackShutdownDwellTime = 0.5
+
+// landingTouchdownSpeed — целевая вертикальная скорость касания воды, м/с.
+const landingTouchdownSpeed = 3.0
+
+// landingFeedbackGain — коэффициент обратной связи по ошибке скорости
+// относительно эталонного профиля vRef(h) (landingRequiredThrust), 1/с.
+const landingFeedbackGain = 1.6
+
+// updateLandingAccelBudget обновляет сглаженный эталон располагаемого
+// замедления (b.landingAccelBudgetSmoothed, читает landingAccelBudget) —
+// доля landingDecelBudget от максимума ТЕКУЩЕЙ группы камер, сглаженная той
+// же постоянной времени, что и throttleFilterTime/landingGroupDwellTime.
+// Вызывается РОВНО ОДИН РАЗ за такт, из Step, до updatePhase/
+// throttleCommand — НЕ из landingRequiredThrust самого по себе: тот
+// вызывается дважды за такт по независимым причинам (updateLandingEngineGroup
+// и throttleCommand), и если бы сглаживание срабатывало при каждом из этих
+// вызовов, экспонента применялась бы к одному и тому же интервалу dt дважды,
+// вдвое искажая постоянную времени.
+//
+// Раньше эталон пересчитывался заново каждый такт БЕЗ памяти о предыдущем
+// значении: на каждом даунселекте (13→5, 5→3) число камер падает скачком —
+// и без сглаживания эталон падал вместе с ним, хотя ничего в действительном
+// кинематическом состоянии аппарата скачком не менялось. Разрыв между всё
+// ещё высокой фактической скоростью и резко просевшим эталоном контур
+// воспринимал как огромную ошибку слежения — и требовал тягу, кратно
+// превышающую физический Tmax НОВОЙ группы (см. диагностику Stage 4.3,
+// TestZZVerticalTimeline: 160+ МН требуемой тяги при физическом
+// Tmax(5)≈13 МН сразу после перехода 13→5). Контур на несколько секунд
+// садился на полный газ не потому что это требовалось кинематически, а
+// потому что сам эталон торможения был искусственно разрывным на границе
+// групп.
+//
+// Заморозка эталона на терминальной (3-камерной) группе на весь импульс —
+// первая опробованная и отклонённая альтернатива: она делает весь профиль
+// настолько консервативным, что 13/5-камерная фаза тормозит намного
+// сильнее, чем нужно на её собственном участке, проскакивает целевую
+// скорость с большим запасом высоты ещё в воздухе, и оставшийся путь
+// превращается в многоминутное почти-зависание на малой тяге, выжигающее
+// топливо впустую вместо посадки. Сглаживание по времени, а не заморозка на
+// одной группе, даёт то же самое (никакого мгновенного скачка на границе
+// даунселекта), но каждая фаза импульса по-прежнему тормозит на СВОЁМ
+// собственном, а не на чужом заниженном бюджете большую часть времени —
+// разрыв гасится только на несколько секунд вокруг самого перехода.
+func (b *Booster) updateLandingAccelBudget(nav orbit.NavState, dt float64) {
+	mass := b.dryMass() + b.state.FuelMass
+	if mass <= 0 {
+		return
+	}
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	g := physics.GravityMagnitudeAtAltitude(nav.Altitude)
+	drag := b.dragDecel(nav)
+	engines := float64(b.propulsion.Commissioned)
+	aMax := perEngine*engines/mass - g + drag
+	if aMax < 0.5 {
+		aMax = 0.5
+	}
+	raw := landingDecelBudget * aMax
+
+	if b.landingAccelBudgetSmoothed <= 0 || dt <= 0 {
+		b.landingAccelBudgetSmoothed = raw
+	} else {
+		decay := math.Exp(-dt / throttleFilterTime)
+		b.landingAccelBudgetSmoothed = raw + (b.landingAccelBudgetSmoothed-raw)*decay
+	}
+}
+
+// landingAccelBudget возвращает текущий (уже сглаженный за этот такт, см.
+// updateLandingAccelBudget) эталон располагаемого замедления, м/с².
+func (b *Booster) landingAccelBudget() float64 {
+	return b.landingAccelBudgetSmoothed
+}
+
+// landingRequiredThrust возвращает ВЕРТИКАЛЬНУЮ составляющую требуемой тяги
+// (Н) — то, что профиль торможения хочет получить по оси "вверх" ПРЯМО
+// СЕЙЧАС. До Stage 4.4 это было единственным входом в landingThrottle и
+// в updateLandingEngineGroup — теперь это только вертикальная часть
+// полного 3D вектора (см. landingDesiredThrust): guidance формирует
+// desired thrust vector из вертикальной И горизонтальной задачи разом,
+// а не считает вертикальную составляющую единственной. Сама формула этой
+// вертикальной составляющей не изменилась — Stage 4.3 продолжает работать
+// как есть (п.4 Stage 4.4: "не выбрасывать уже рабочую vertical guidance").
+//
+// Тот же гладкий профиль v(h)=√(vt²+2·decel·h), что и раньше (см. историю
+// в landingAccelBudget), с постоянным коэффициентом обратной связи gain —
+// с двумя изменениями против исходной версии:
+//
+//  1. decel теперь берётся из landingAccelBudget — сглаженного по времени,
+//     а не пересчитываемого заново каждый такт из ТЕКУЩЕЙ группы, эталона
+//     (устраняет разрыв на границе даунселекта, см. её комментарий);
+//  2. в want добавлено СЛАГАЕМОЕ обратной связи по упреждению (feed-forward)
+//     decel — раньше при точном слежении (descent==target) want вырождался
+//     ровно в g, то есть контур требовал только зависания, а не продолжения
+//     торможения: как только фактическая скорость догоняла эталон, контур
+//     переставал просить тормозить дальше, хотя сам эталон v(h) построен из
+//     допущения о ПОСТОЯННОМ торможении decel до конца импульса. Именно
+//     этим объяснялось поведение части посадочных seeds (см. Stage 4.3,
+//     TestZZVerticalTimeline, seed 2): контур нагонял эталон, зависал на
+//     скорости ~130 м/с на добрых 700 м высоты вместо продолжения
+//     торможения, и добивал остаток пути практически без изменения
+//     скорости — вплоть до жёсткого приводнения на той же скорости.
+func (b *Booster) landingRequiredThrust(nav orbit.NavState) float64 {
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	mass := b.dryMass() + b.state.FuelMass
+	if perEngine <= 0 || mass <= 0 {
+		return 0
+	}
+	descent := -nav.RadialVelocity
+	g := physics.GravityMagnitudeAtAltitude(nav.Altitude)
+	drag := b.dragDecel(nav)
+
+	decel := b.landingAccelBudget()
+	target := landingTouchdownSpeed
+	if nav.Altitude > 0 {
+		target = math.Sqrt(landingTouchdownSpeed*landingTouchdownSpeed + 2*decel*nav.Altitude)
+	}
+
+	// Stage 4.15: доля упреждения (decel), а не жёсткий переключатель "выше
+	// touchdownSpeed — добавить decel целиком, ниже — не добавлять вовсе".
+	// Резкое переключение ровно на пороге, помноженное на располагаемую
+	// тягу большой (ещё не даунселекченной) группы и на задержку сглаживания
+	// дросселя (throttleFilterTime — реальная тяга отзывается на команду не
+	// мгновенно), даёт вот что: пока фактическое снижение подходит к порогу
+	// сверху, контур ещё просит decel упреждением целиком; в момент пересечения
+	// порога команда мгновенно падает на decel, но ПРИВОД ещё секунду с
+	// лишним продолжает выдавать прежнюю, более высокую тягу — и на большой
+	// группе камер (тринадцать, а не три) этой секунды с лишним хватает,
+	// чтобы проскочить не просто ниже touchdownSpeed, а от десятков м/с
+	// снижения в набор высоты в разы быстрее, чем touchdownSpeed допускает.
+	// Измерено: снижение 43.9 → −13.3 м/с за два такта (seed с 13
+	// работающими камерами, ещё не даунселекченными к моменту касания) —
+	// бустер не касается, а взмывает обратно на километры, дожигая на этом
+	// остаток топлива вместо посадки.
+	//
+	// Линейная доля на том же горизонте, что и сама задержка отклика
+	// (decel·throttleFilterTime — на сколько снижение падает всего за одну
+	// постоянную времени фильтра при уже применяемом decel, а не
+	// произвольно выбранная полоса) снимает упреждение ПОСТЕПЕННО, пока
+	// фактическое снижение ещё выше порога, — привод успевает отследить
+	// снижающуюся команду, вместо того чтобы узнать о нём постфактум.
+	feedforwardFraction := 1.0
+	if band := decel * throttleFilterTime; band > 0 {
+		feedforwardFraction = physics.Clamp((descent-landingTouchdownSpeed)/band, 0, 1)
+	}
+	want := g + landingFeedbackGain*(descent-target) + decel*feedforwardFraction
+	if want < g {
+		want = g
+	}
+
+	need := want - drag
+	return math.Max(need*mass, 0)
+}
+
+// landingMinStoppingTime — нижний предел горизонта, на который guidance
+// планирует погасить горизонтальную скорость, с (см. landingStoppingTime).
+// Та же величина, что throttleFilterTime/landingGroupDwellTime — нельзя
+// требовать погасить снос быстрее, чем сама тяга успевает измениться в
+// ответ на предыдущую команду, и она же защищает формулу от деления на
+// исчезающе малое время у самой земли.
+const landingMinStoppingTime = throttleFilterTime
+
+// landingStoppingTime возвращает физически обоснованный горизонт (с) до
+// касания при уже работающем профиле вертикального торможения
+// (landingAccelBudget) — время, за которое вертикальный канал САМ планирует
+// погасить снижение с текущей скорости до landingTouchdownSpeed. Используется
+// как знаменатель a_h≈-v_h/t_remaining при гашении горизонтальной скорости
+// (landingHorizontalAccelDemand, п.5 Stage 4.4) — не отдельный магический
+// коэффициент Kv, а прямое следствие того, сколько времени вообще остаётся
+// до касания при уже посчитанном вертикальном профиле.
+// Горизонт берётся по ПОЛНОЙ скорости подхода (снижение и снос), а не по
+// одному снижению: это время — знаменатель требуемого бокового ускорения
+// в landingHorizontalAccelDemand, и если снижение уже погашено (или мало) к
+// моменту, когда снос всё ещё велик, "время до касания по одной вертикали"
+// ничего не говорит о том, что снос тоже нужно успеть погасить — короткий
+// горизонт от почти нулевого снижения требовал бы от бокового канала
+// нефизичного ускорения, хотя высоты и тяги может быть достаточно.
+func (b *Booster) landingStoppingTime(nav orbit.NavState) float64 {
+	descent := -nav.RadialVelocity
+	horiz := landingHorizontalVelocity(nav).Norm()
+	speed := math.Hypot(descent, horiz)
+	decel := b.landingAccelBudget()
+	remaining := speed - landingTouchdownSpeed
+	if decel <= 0 || remaining <= 0 {
+		return landingMinStoppingTime
+	}
+	t := remaining / decel
+	if t < landingMinStoppingTime {
+		return landingMinStoppingTime
+	}
+	return t
+}
+
+// landingHorizontalVelocity возвращает горизонтальную (восток/север)
+// составляющую скорости относительно поверхности, м/с, в инерциальных
+// осях — та часть GroundRelativeVelocity, что лежит в местной горизонтальной
+// плоскости.
+func landingHorizontalVelocity(nav orbit.NavState) physics.Vec3 {
+	e, n, _ := nav.Frame.Decompose(nav.GroundRelativeVelocity)
+	return nav.Frame.East.Scale(e).Add(nav.Frame.North.Scale(n))
+}
+
+// landingHorizontalPositionError — Stage 4.12, п.1,4: горизонтальная
+// (East/North в местных осях ТЕКУЩЕЙ позиции, nav.Frame) ошибка положения
+// относительно ЕДИНОЙ цели возврата launchTarget (Stage 4.11, п.1) —
+// вектор current−target, м. Сравнение — во вращающейся (Earth-fixed)
+// системе (Geodetic/ECEF), тот же приём, что landingMiss/groundMissAgainst
+// (Stage 4.11): сравнивать позиции напрямую в ECI, не переведя в Earth-fixed
+// систему на текущий момент, значило бы получить дрейфующую от вращения
+// Земли ошибку — при таймингах посадочного импульса (десятки секунд) это
+// не главный источник ошибки, но принцип тот же, что и у Boostback,
+// нарушать который не нужно только потому, что здесь дистанции меньше.
+func (b *Booster) landingHorizontalPositionError(nav orbit.NavState) physics.Vec3 {
+	targetECEF := physics.GeodeticToECEF(b.launchTarget)
+	currentECEF := physics.ECIToECEF(b.state.Position, b.elapsed)
+	localAtCurrent := physics.NewLocalFrame(currentECEF)
+	e, n, _ := localAtCurrent.Decompose(currentECEF.Sub(targetECEF))
+	// e,n — скалярные величины (проекции на East/North в ТОЙ ЖЕ точке) —
+	// физически те же направления что nav.Frame.East/North (тот же приём,
+	// что boostbackTarget, Stage 4.11: перенос скалярных коэффициентов на
+	// ECI-базис безопасен, сами базисные векторы пересчитывать не нужно).
+	return nav.Frame.East.Scale(e).Add(nav.Frame.North.Scale(n))
+}
+
+// landingHorizontalAccelDemand — п.5 Stage 4.4: погасить снос к нулю за
+// физически обоснованный горизонт landingStoppingTime. Форма
+// a_h≈-v_h/t_remaining, а не -Kv·v_h с произвольно подобранным Kv.
+//
+// Stage 4.12, п.4 попыталась расширить эту задачу до "прийти в launchTarget
+// ОДНОВРЕМЕННО с Vh→0" — стандартное (не подобранное) minimum-energy
+// решение краевой задачи x(T)=0,v(T)=0 при известном T даёт
+// a0=-4v0/T-6x0/T² (вывод: ускорение линейно по времени, из
+// x(T)=x0+v0T+½a0T²+⅙jT³=0 и v(T)=v0+a0T+½jT²=0, исключить джерк j).
+// Диагностика (Stage 4.12, canonical seed 1) нашла: T здесь — тот же
+// landingStoppingTime, что и вертикальный канал, то есть считанные секунды
+// (6-8с у ignition в этом сценарии) — а унаследованный от Boostback (Stage
+// 4.11) промах порядка километров. При такой геометрии член 6x0/T² уже при
+// x0~200м (не говоря о километрах) требует ~19 м/с² горизонтального
+// ускорения — заметная доля доступной тяги, а при x0~4.4км — сотни м/с²:
+// физически недостижимо. Магнитуда сама по себе урезается существующим
+// hAvail-ограничением (landingDesiredThrust) и authority-constraint (Stage
+// 4.6), но НАПРАВЛЕНИЕ "естественной" цели при этом продолжает бешено
+// колебаться (десятки градусов за секунды, вслед за быстро меняющимся
+// x0/T0) — тот же класс задачи, что Stage 4.7 уже разбирала (attitude
+// tracking цели, которая сама движется быстрее, чем корпус успевает
+// поворачиваться) и там же нашла, что попытки чинить это в самом
+// attitude-контуре (braking-aware, gyro-FF) делают только хуже. Canonical
+// A/B: miss distance действительно упал (5.2км→1.1км), но touchdown speed
+// выросла почти втрое (69→205 м/с, из них Vh=173 м/с) — первый же gate
+// задания ("touchdown speed не должен ухудшиться") провален, откат к
+// Stage 4.11 закону по тому же принципу, что уже применялся в Stage 4.7
+// (эксперимент, честно проваливший свой acceptance test, не остаётся в
+// production). Вывод (см. отчёт Stage 4.12): при текущем vertical-channel
+// time-to-go эта форма закона практически применима примерно до
+// x0~50-100м — заметно меньше, чем реально оставляет Boostback+Coast+Entry
+// сейчас; чтобы задействовать её пользу, нужно либо начинать позиционную
+// коррекцию раньше LandingBurn (Coast/Entry, вне рамок этой стадии), либо
+// сокращать промах Boostback ещё сильнее (тоже вне рамок — "не тюнить
+// Boostback ради сантиметров", но и не для километров тем более).
+// landingHorizontalPositionError (см. выше) не удалена — используется как
+// permanent telemetry (BoosterTelemetry.HorizontalPositionError), задел
+// для этой будущей работы.
+func (b *Booster) landingHorizontalAccelDemand(nav orbit.NavState) physics.Vec3 {
+	vh := landingHorizontalVelocity(nav)
+	if vh.Norm() < 1e-6 {
+		return physics.Vec3{}
+	}
+	t := b.landingStoppingTime(nav)
+	return vh.Scale(-1 / t)
+}
+
+// landingDesiredThrust строит полный 3D требуемый вектор тяги (Н, местные
+// оси East/North/Up) — п.3,6 Stage 4.4: guidance сначала решает, какое
+// ускорение нужно (вертикальное — Stage 4.3, landingRequiredThrust;
+// горизонтальное — landingHorizontalAccelDemand), а уже ИЗ этого вектора
+// потом строится desired body attitude (landingBurnTarget), а не наоборот.
+//
+// Вертикальная составляющая вектора — landingRequiredThrust КАК ЕСТЬ (её
+// физический смысл не меняется: требуемая тяга ВДОЛЬ ВЕРТИКАЛИ). При
+// сложении с горизонтальной составляющей модуль результирующего вектора
+// автоматически оказывается больше вертикальной части на фактор 1/cosθ,
+// где θ — угол результирующего вектора от вертикали (п.7 Stage 4.4) — это
+// не отдельная формула, а прямое следствие геометрии сложения векторов:
+// если вертикальная компонента должна остаться Tz, а горизонтальная — Th,
+// модуль (Tz,Th) обязан быть Tz/cosθ, где θ=atan2(Th,Tz).
+//
+// Приоритет — вертикальная безопасность (п.9 Stage 4.4): если полного
+// вектора не хватает физической тяги ТЕКУЩЕЙ группы на максимуме газа,
+// урезается ТОЛЬКО горизонтальная часть, вертикальная остаётся нетронутой
+// (в её собственном, отдельном, насыщении на 100% газа современем
+// разбирается landingThrottle/updateLandingEngineGroup, как и раньше).
+// saturated=true означает, что горизонтальная часть была урезана —
+// выставляется явно, не молча (п.8,13,29 Stage 4.4: "Не генерировать
+// невозможную команду", "не NaN").
+func (b *Booster) landingDesiredThrust(nav orbit.NavState) (vec physics.Vec3, saturated bool) {
+	mass := b.dryMass() + b.state.FuelMass
+	if mass <= 0 {
+		return physics.Vec3{}, false
+	}
+
+	tVertical := b.landingRequiredThrust(nav)
+	tHorizontal := b.landingHorizontalAccelDemand(nav).Scale(mass)
+
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	tMaxGroup := perEngine * float64(b.propulsion.Commissioned)
+
+	if tMaxGroup > 0 {
+		hAvail := math.Sqrt(math.Max(tMaxGroup*tMaxGroup-tVertical*tVertical, 0))
+		if hMag := tHorizontal.Norm(); hMag > hAvail {
+			saturated = true
+			if hMag > 1e-9 {
+				tHorizontal = tHorizontal.Scale(hAvail / hMag)
+			} else {
+				tHorizontal = physics.Vec3{}
+			}
+		}
+	}
+
+	vec = nav.Frame.Up.Scale(tVertical).Add(tHorizontal)
+	return vec, saturated
+}
+
+// -----------------------------------------------------------------------------
+// Stage 4.6 — authority-constrained q-aware guidance.
+//
+// Stage 4.4 приводило desired thrust vector напрямую в attitude target,
+// не спрашивая, способен ли корпус физически ДЕРЖАТЬ получающийся наклон
+// против аэродинамического момента. Диагностика Stage 4.5 (реальный
+// per-engine TVC, не агрегатное приближение) и Stage 4.5.5 (timing audit,
+// исключивший частоту/задержку контура как причину) показали: на q≈50-80
+// кПа AeroTorque достигает 134-215 МН·м, а максимум TVC+рулей — порядка
+// 96.6 МН·м на группе 13 — устойчивый физический дефицит, не артефакт
+// реализации. Guidance, требующее наклона, для которого это правда,
+// закладывает переворот ДО того, как автопилот вообще начнёт отрабатывать
+// команду — снаружи это выглядит как "не справился с манёвром", а причина
+// снаружи невидима: манёвр физически невозможен ещё на этапе постановки
+// задачи.
+//
+// Здесь — не жёсткий порог по AoA/tilt (запрещено явно, п. Stage 4.6:
+// "не вводить фиксированные maxAoA/maxTilt"), а прямая проверка: для
+// КАНДИДАТА направления тела/тяги предсказать AoA и аэродинамический
+// момент от него на ТЕКУЩЕМ q, сравнить с РЕАЛЬНО располагаемым
+// корректирующим моментом (тот же per-engine allocator и та же формула
+// авторитета рулей, что использует настоящий контур — не отдельная
+// линейная оценка) — и если запас отрицательный, уменьшить именно
+// горизонтальную (боковую) часть требуемой тяги, а не порезать её
+// произвольно по углу. По мере падения q (либо приближения угла ошибки
+// к нулю) аэродинамический момент естественно падает, и разрешённая
+// горизонтальная коррекция растёт сама — без отдельного q-порога.
+// -----------------------------------------------------------------------------
+
+// landingPredictedAoAAndAeroTorque — предсказанные угол атаки (градусы) и
+// модуль аэродинамического момента (Н·м) для КАНДИДАТА направления тела
+// candidateDir (мировые/местные оси, как nav.Frame), при текущей скорости
+// потока и скоростном напоре — БЕЗ построения кватерниона кандидата: модуль
+// AerodynamicTorque зависит только от угла атаки и q (см. её формулу — плечо
+// вдоль продольной оси, поперечная сила перпендикулярна), поэтому
+// синтетический airflow с ТЕМ ЖЕ модулем и ТЕМ ЖЕ углом к продольной оси,
+// что и реальный, даёт ту же величину момента, каким бы ни было
+// произвольное направление "по часам" в поперечной плоскости.
+func (b *Booster) landingPredictedAoAAndAeroTorque(nav orbit.NavState, candidateDir physics.Vec3, mach float64) (aoaDeg, torque float64) {
+	speed := nav.AirRelativeVelocity.Norm()
+	if speed < 1 || nav.DynamicPressure <= 0 || candidateDir.Norm() < 1e-9 {
+		return 0, 0
+	}
+	aoaDeg = physics.AngleOfAttack(candidateDir, nav.AirRelativeVelocity)
+	alpha := aoaDeg * physics.DegToRad
+	syntheticFlow := physics.Vec3{X: math.Cos(alpha), Y: math.Sin(alpha)}.Scale(speed)
+
+	shape := physics.AeroShape{
+		Length:       b.Config.FirstStageLength,
+		Radius:       b.Config.Diameter / 2,
+		CenterOfMass: b.centerOfMassFraction(),
+	}
+	t := shape.AerodynamicTorque(nav.DynamicPressure, syntheticFlow, b.attitude.Omega, mach)
+	return aoaDeg, t.Norm()
+}
+
+// landingAvailableCorrectiveTorque — реально располагаемый корректирующий
+// момент ТЕКУЩЕЙ группы камер плюс рулей, Н·м — не сумма абсолютных
+// максимумов по осям, а НАПРАВЛЕННЫЙ замер (тот же приём, что и authority
+// map Stage 4.5: пробный запрос на заведомо недостижимую цель в одну
+// сторону, измеряется реально достигнутое через настоящий, не линейный,
+// engineForceTorque). Берётся МИНИМУМ из pitch- и yaw-направленного TVC
+// авторитета — консервативная (никогда не завышающая) оценка вместо
+// честного 3D-разложения оси коррекции: у группы 5 (несимметричный
+// префикс маневренной тринадцатки, см. Stage 4.5 authority map) pitch и
+// yaw авторитет заметно различаются, и брать больший означал бы иногда
+// переоценивать реально доступное.
+func (b *Booster) landingAvailableCorrectiveTorque(nav orbit.NavState, mach float64) float64 {
+	indices := make([]int, 0, len(b.propulsion.Engines))
+	for i, e := range b.propulsion.Engines {
+		if e.Running {
+			indices = append(indices, i)
+		}
+	}
+	return b.availableCorrectiveTorqueFor(nav, mach, indices)
+}
+
+// availableCorrectiveTorqueFor — то же, что landingAvailableCorrectiveTorque,
+// но для ПРОИЗВОЛЬНОГО набора камер indices (индексы в b.engineLayout), а не
+// обязательно текущего активного — Stage 4.9, п.A2: нужен, чтобы ПРЕДСКАЗАТЬ
+// располагаемый момент СЛЕДУЮЩЕЙ (ещё не зажжённой) посадочной группы перед
+// даунселектом, не мутируя реальное состояние двигательной установки.
+func (b *Booster) availableCorrectiveTorqueFor(nav orbit.NavState, mach float64, indices []int) float64 {
+	if len(indices) == 0 || len(b.engineLayout) == 0 {
+		return 0
+	}
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	if perEngine <= 0 {
+		return 0
+	}
+
+	engines := make([]EngineActuator, 0, len(indices))
+	for _, i := range indices {
+		if i < 0 || i >= len(b.engineLayout) {
+			continue
+		}
+		engines = append(engines, EngineActuator{
+			ID:      b.engineLayout[i].ID,
+			RadialX: b.engineLayout[i].X,
+			RadialY: b.engineLayout[i].Y,
+			Gimbal:  b.engineLayout[i].Gimbal,
+			Thrust:  perEngine,
+		})
+	}
+	if len(engines) == 0 {
+		return 0
+	}
+	arm := b.gimbalArm()
+	maxGimbal := b.attitude.Config.MaxGimbal
+	forceScale := perEngine * float64(len(engines))
+	torqueScale := forceScale * arm * math.Sin(maxGimbal)
+
+	probe := func(axis physics.Vec3) float64 {
+		gimbal := allocateEngineGimbal(engines, arm, physics.Vec3{}, axis.Scale(1e12), forceScale, torqueScale, maxGimbal)
+		_, achieved := engineForceTorque(engines, gimbal, arm)
+		return math.Abs(achieved.Dot(axis.Unit()))
+	}
+	tvc := math.Min(probe(physics.Vec3{Y: 1}), probe(physics.Vec3{Z: 1}))
+
+	fins := 0.0
+	if b.attitude.Surfaces != nil && b.attitude.Surfaces.Count() > 0 {
+		airBody := b.attitude.Orientation.RotateInverse(nav.AirRelativeVelocity)
+		comFromNose := b.centerOfMassFraction() * b.Config.FirstStageLength
+		fins = b.attitude.Surfaces.PitchAuthority(airBody, nav.DynamicPressure, mach, comFromNose)
+	}
+	return tvc + fins
+}
+
+// landingAuthorityConstrainedThrust — п. Stage 4.6: то же candidate thrust
+// vector, что и Stage 4.4 (landingDesiredThrust, не изменена), но с
+// дополнительным ограничением по РЕАЛЬНОЙ authority: если предсказанный
+// AeroTorque для кандидата направления превышает landingAvailableCorrectiveTorque,
+// горизонтальная часть уменьшается (бинарный поиск по масштабу k∈[0,1]),
+// пока запас не станет неотрицательным — вертикальная составляющая не
+// трогается (та же вертикальная безопасность первым приоритетом, что и в
+// landingDesiredThrust). Если margin отрицателен уже при k=0 (кандидат —
+// чистая вертикаль), это явный диагностический факт "даже без горизонтальной
+// коррекции текущее состояние вне authority" — marginLimited=true и margin
+// возвращаются вызывающей стороне, а не скрываются.
+func (b *Booster) landingAuthorityConstrainedThrust(nav orbit.NavState) (vec physics.Vec3, saturated, marginLimited bool, margin float64) {
+	desired, saturated := b.landingDesiredThrust(nav)
+
+	mach := 0.0
+	if ss := physics.Atmosphere(nav.Altitude).SoundSpeed; ss > 0 {
+		mach = nav.AirRelativeVelocity.Norm() / ss
+	}
+	available := b.landingAvailableCorrectiveTorque(nav, mach)
+
+	tVertical := nav.Frame.Up.Scale(desired.Dot(nav.Frame.Up))
+	tHorizontal := desired.Sub(tVertical)
+
+	candidateAt := func(k float64) physics.Vec3 {
+		return tVertical.Add(tHorizontal.Scale(k))
+	}
+	marginAt := func(k float64) float64 {
+		dir := candidateAt(k)
+		if dir.Norm() < 1e-9 {
+			dir = nav.Frame.Up
+		}
+		_, aero := b.landingPredictedAoAAndAeroTorque(nav, dir, mach)
+		return available - aero
+	}
+
+	margin = marginAt(1)
+	if margin >= 0 || tHorizontal.Norm() < 1e-6 {
+		return desired, saturated, margin < 0, margin
+	}
+
+	marginLimited = true
+	marginAtZero := marginAt(0)
+	if marginAtZero < 0 {
+		// Даже чистая вертикаль вне authority на этом такте — уменьшать
+		// больше нечего, честно возвращаем k=0 и отрицательный margin
+		// (см. п. "если даже authority-constrained guidance теряет
+		// контроль" — это тот самый диагностируемый случай, не маскируется).
+		return tVertical, saturated, true, marginAtZero
+	}
+
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 12; i++ {
+		mid := (lo + hi) / 2
+		if marginAt(mid) >= 0 {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	vec = candidateAt(lo)
+	return vec, saturated, true, marginAt(lo)
+}
+
+// groupAccelEnvelope возвращает [aMin,aMax] — вертикальное замедление (м/с²,
+// положительное тормозит снижение), которое даёт группа из n камер на
+// MinThrottle/MaxThrottle соответственно, при текущей массе/высоте/
+// сопротивлении. В отличие от простого тягового envelope (Tmin/Tmax в
+// updateLandingEngineGroup), тяга здесь уже переведена в ускорение с учётом
+// веса и сопротивления — величина, которой в конечном счёте оперирует
+// кинематика тормозного пути (landingStoppingDistance).
+func (b *Booster) groupAccelEnvelope(nav orbit.NavState, n int) (aMin, aMax float64) {
+	mass := b.dryMass() + b.state.FuelMass
+	if mass <= 0 || n <= 0 || len(b.propulsion.Engines) == 0 {
+		return 0, 0
+	}
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	minThrottle := b.propulsion.Engines[0].Config.MinThrottle
+	g := physics.GravityMagnitudeAtAltitude(nav.Altitude)
+	drag := b.dragDecel(nav)
+	aMin = perEngine*float64(n)*minThrottle/mass - g + drag
+	aMax = perEngine*float64(n)/mass - g + drag
+	return aMin, aMax
+}
+
+// landingStoppingDistance — кинематическое расстояние (м), нужное, чтобы
+// постоянным замедлением aDecel погасить скорость от vz до
+// landingTouchdownSpeed. +Inf при aDecel<=0 (группа вообще не может
+// тормозить сильнее веса) — вызывающий код обязан явно проверить знак,
+// а не подставлять это дальше вслепую (см. п.18 Stage 4.3: "impossible
+// state" обязана быть явно видна, а не превращаться в NaN/выдуманную тягу).
+func landingStoppingDistance(vz, aDecel float64) float64 {
+	if aDecel <= 0 {
+		return math.Inf(1)
+	}
+	remaining := vz*vz - landingTouchdownSpeed*landingTouchdownSpeed
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining / (2 * aDecel)
+}
+
+// landingStoppingMargin — запас высоты (м) сверх кинематически необходимого
+// тормозного пути при постоянном замедлении aDecel: положительный — есть
+// запас, отрицательный — на этом замедлении аппарат физически не успевает
+// погасить скорость до касания (см. п.7-9 Stage 4.3).
+func (b *Booster) landingStoppingMargin(nav orbit.NavState, aDecel float64) float64 {
+	return nav.Altitude - landingStoppingDistance(-nav.RadialVelocity, aDecel)
+}
+
+// updateLandingEngineGroup продвигает НЕОБРАТИМУЮ последовательность групп
+// посадочного импульса (landingEngineSequence, 13→5→3). Раньше
+// landingEngineGroup(altitude) пересчитывал число камер заново каждый такт
+// из доли оставшейся высоты — и мог вернуть БОЛЬШУЮ группу, если высота
+// вдруг снова растёт. Именно так и происходило: посадочный импульс на
+// заниженной (из-за MinThrottle-пола, см. propulsion/engine.go) тяге
+// разгонял бустер обратно вверх, доля высоты возвращалась выше 0.15, и
+// все тринадцать камер зажигались заново, хотя формально «уменьшенная»
+// группа уже была выбрана раньше, — reboost кормил сам себя.
+//
+// Состояние группы — уже персистентное b.propulsion.Commissioned; эта
+// функция только решает, когда его УМЕНЬШИТЬ, и никогда не увеличивает.
+// Переход обоснован, только если ВСЕ условия верны разом:
+//
+//   - текущая группа избыточна даже на полу газа (required меньше её
+//     физического минимума Tmin) — то есть держать её дальше значит
+//     гарантированно тормозить/разгонять сильнее, чем просит профиль;
+//   - следующая, меньшая группа физически способна выдать столько же
+//     на максимуме газа (required не больше её Tmax) — иначе даунселект
+//     сам создал бы дефицит тяги там, где её уже не хватает;
+//   - следующая группа на СВОЁМ максимуме газа успевает погасить текущую
+//     вертикальную скорость до landingTouchdownSpeed раньше, чем кончится
+//     высота (landingStoppingMargin >= 0) — простая кинематическая
+//     look-ahead проверка (п.9-10 Stage 4.3), не полноценный MPC: она не
+//     предсказывает будущую траекторию тактами вперёд, а спрашивает
+//     "если с этой секунды жать в пол максимумом следующей группы —
+//     хватит ли высоты вообще". Первые два условия сравнивают ТЯГУ на
+//     этот такт, это условие — единственное, что смотрит вперёд по всему
+//     оставшемуся участку.
+//
+// Второе и третье условия вместе и есть проверка feasibility следующего
+// участка траектории, а не просто "текущая группа больше не нужна":
+// сокращать число камер, не убедившись, что оставшихся хватит и по тяге, и
+// по кинематике торможения, значило бы менять один дефицит тяги на другой.
+
+// landingGroupShouldDownselect — чистая (без побочных эффектов) проверка
+// обоснованности перехода current→next при заданной потребной тяге
+// required и физических границах обеих групп: минимуме текущей
+// (minCurrent = Tmin(current)) и максимуме следующей (maxNext = Tmax(next)).
+// Вынесена отдельно от updateLandingEngineGroup, чтобы её можно было
+// проверить детерминированно, без построения NavState/Booster.
+func landingGroupShouldDownselect(required, minCurrent, maxNext float64) bool {
+	return required < minCurrent && required <= maxNext
+}
+func (b *Booster) updateLandingEngineGroup(nav orbit.NavState, dt float64) {
+	// Эталон замедления обновляется здесь, а не в landingRequiredThrust
+	// самой по себе (та вызывается ещё раз ниже по такту, из
+	// throttleCommand→landingThrottle) — иначе экспоненциальное сглаживание
+	// срабатывало бы дважды за один и тот же dt (см. updateLandingAccelBudget).
+	// Вызов до early return по терминальной группе намеренно: эталон должен
+	// продолжать обновляться и на терминальной (3-камерной) группе, даже
+	// когда дальше даунселектить некуда.
+	b.updateLandingAccelBudget(nav, dt)
+
+	// Stage 4.9, п.A2: одношаговая экстраполяция потребного углового
+	// момента вперёд по измеренной скорости роста — b.attitude.RequestedTorque
+	// на этом такте ещё держит значение ПРЕДЫДУЩЕГО такта (updateAttitude
+	// вызывается позже в Step), тот же лаг, что уже используют
+	// landingRequiredThrustLast и остальные величины этой функции. Stage
+	// 4.8 audit нашёл: required растёт скачком сразу после даунселекта
+	// (с ~3е7 до ~1e8 Н·м за 2-3 такта) — сравнение только с текущим,
+	// уже устаревшим на dt значением систематически опаздывало бы именно
+	// там, где рост момента максимален. Экстраполяция берётся, только
+	// когда момент РАСТЁТ — при спаде используется как есть, без
+	// дополнительного (необоснованного) запаса.
+	requiredTorqueNow := b.attitude.RequestedTorque.Norm()
+	requiredTorqueRate := 0.0
+	if dt > 0 {
+		requiredTorqueRate = (requiredTorqueNow - b.landingRequiredTorquePrev) / dt
+	}
+	predictedRequiredTorque := requiredTorqueNow
+	if requiredTorqueRate > 0 {
+		predictedRequiredTorque += requiredTorqueRate * dt
+	}
+	b.landingRequiredTorquePrev = requiredTorqueNow
+
+	current := b.propulsion.Commissioned
+	idx := -1
+	for i, n := range landingEngineSequence {
+		if n == current {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		// Ещё не зажжена (n=0 до первого розжига) — некому даунселектить.
+		b.landingGroupDwell = 0
+		return
+	}
+
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	if perEngine <= 0 || len(b.propulsion.Engines) == 0 {
+		b.landingGroupDwell = 0
+		return
+	}
+	minThrottle := b.propulsion.Engines[0].Config.MinThrottle
+
+	// Полный 3D вектор (вертикаль+горизонталь, уже ограниченный по
+	// authority — см. landingAuthorityConstrainedThrust, Stage 4.6), а не
+	// только вертикальная составляющая — feasibility перехода обязана
+	// видеть ту же тягу, которую реально попросит guidance (п.23 Stage 4.4).
+	desired, _, _, _ := b.landingAuthorityConstrainedThrust(nav)
+	required := desired.Norm()
+	b.landingRequiredThrustLast = required
+
+	if idx >= len(landingEngineSequence)-1 {
+		// Уже терминальная группа (3) — даунселектить некуда, продолжаем
+		// гореть на ней до касания (у бустера нет отдельного entry burn —
+		// только boostback и единственный посадочный импульс).
+		b.landingGroupDwell = 0
+		return
+	}
+
+	next := landingEngineSequence[idx+1]
+	minCurrent := perEngine * float64(current) * minThrottle
+	maxNext := perEngine * float64(next)
+
+	if !landingGroupShouldDownselect(required, minCurrent, maxNext) {
+		b.landingGroupDwell = 0
+		return
+	}
+
+	_, aMaxNext := b.groupAccelEnvelope(nav, next)
+	marginNext := b.landingStoppingMargin(nav, aMaxNext)
+	if marginNext < 0 {
+		// Следующая группа на своём максимуме газа физически не успевает
+		// погасить текущую вертикальную скорость до высоты 0 (см. п.9-10
+		// Stage 4.3) — переход откладывается: даунселект здесь создал бы
+		// группу, которая сама не может довести аппарат до цели, что хуже,
+		// чем задержка перехода (необратимость запрещает откатиться назад
+		// после ошибочного даунселекта — см. её же комментарий выше).
+		b.landingGroupDwell = 0
+		return
+	}
+
+	// Stage 4.9, п.A2 — attitude-aware даунселект: 13→5→3 раньше проверялся
+	// только по тяге/кинематике торможения (три условия выше), НИКОГДА не
+	// глядя на угловую authority. Stage 4.8 audit нашёл, что при живом
+	// production seed это давало переход РОВНО на грани (запас по моменту
+	// ≈0 в момент самого перехода) и затем многократный, глубокий дефицит
+	// (predicted required превышал available на 50-90 МН·м уже через 2-3
+	// такта) — то есть переход по тяге проходил там, где по ориентации
+	// он ещё физически преждевременен. Тот же predictedRequiredTorque
+	// (одношаговая экстраполяция, см. выше) сравнивается с directional
+	// available СЛЕДУЮЩЕЙ группы — без мутации b.propulsion.Commissioned
+	// (availableCorrectiveTorqueFor принимает индексы явно).
+	mach := 0.0
+	if ss := physics.Atmosphere(nav.Altitude).SoundSpeed; ss > 0 {
+		mach = nav.AirRelativeVelocity.Norm() / ss
+	}
+	availableNext := b.availableCorrectiveTorqueFor(nav, mach, b.landingGroupIndices[idx+1])
+	if availableNext < predictedRequiredTorque {
+		b.landingGroupDwell = 0
+		return
+	}
+
+	b.landingGroupDwell += dt
+	if b.landingGroupDwell < landingGroupDwellTime {
+		return
+	}
+
+	log.Printf("🔽 Посадочный импульс: группа %d→%d на T+%.1f с (высота %.0f м, "+
+		"требуется %.2f МН; минимум группы %d — %.2f МН, максимум группы %d — %.2f МН; "+
+		"угловой момент: потребно %.2f МН·м [прогноз], доступно у %d — %.2f МН·м)",
+		current, next, b.elapsed, nav.Altitude, required/1e6,
+		current, minCurrent/1e6, next, maxNext/1e6,
+		predictedRequiredTorque/1e6, next, availableNext/1e6)
+	b.landingGroupIndex = idx + 1
+	b.setEngineGroupIndices(b.landingGroupIndices[idx+1])
+	b.landingGroupDwell = 0
+}
+
+// windVelocity возвращает скорость воздуха относительно вращающейся Земли.
+func (b *Booster) windVelocity(wind env.WindModel, altitude float64) physics.Vec3 {
+	if wind == nil {
+		return physics.Vec3{}
+	}
+	return wind.Velocity(b.state.Position, altitude, b.elapsed)
+}
+
+// bodyAngleOfAttack возвращает угол между продольной осью и потоком, градусы.
+func (b *Booster) bodyAngleOfAttack(airRelative physics.Vec3) float64 {
+	forward := b.attitude.Orientation.Rotate(physics.Vec3{X: 1})
+	return physics.AngleOfAttack(forward, airRelative)
+}
+
+// -----------------------------------------------------------------------------
+// Stage 4.11 — return-to-launch-site guidance + permanent landing miss
+// telemetry.
+//
+// LandingTargetPosition = LaunchPosition (п.1) — launchTarget (NewBooster),
+// а не b.target (штатная точка приводнения Stage 4.3-4.6, не менялась).
+// Сравнение позиций — во ВРАЩАЮЩЕЙСЯ (Earth-fixed) системе: Geodetic/ECEF,
+// никогда напрямую в ECI, иначе результат дрейфовал бы с вращением Земли
+// (см. п.1 задания).
+// -----------------------------------------------------------------------------
+
+// groundMissAgainst — Stage 4.11, п.2: горизонтальное расстояние (м) от
+// positionECI (в момент elapsedAt) до target (Geodetic), плюс разложение
+// смещения на downrange/crossrange относительно опорного направления
+// refBearingECI (единичный вектор в ECI на момент elapsedAt — обычно
+// b.outboundHorizontal на T+boostbackStartElapsed, направление, в котором
+// бустер улетел от площадки; при возврате К ТОЙ ЖЕ точке "downrange" —
+// остаток смещения ВДОЛЬ этого направления (положительный — тело всё ещё
+// смещено в сторону, куда улетело), "crossrange" — боковой промах поперёк
+// него).
+//
+// Раскладка на местную касательную плоскость (ENU в точке target, ECEF) —
+// приближение плоской Земли, точное для расстояний, малых по сравнению
+// с радиусом Земли (десятки км при возврате на площадку, а не полпланеты).
+// Для самого расстояния используется честная сферическая формула
+// (greatCircleDistance, scene.go) — она уже используется для того же рода
+// величины (Downrange в SceneTelemetry) и не завязана на приближение.
+func groundMissAgainst(positionECI physics.Vec3, elapsedAt float64, target physics.Geodetic,
+	refBearingECI physics.Vec3, refBearingAt float64) (horizontalDistance, downrange, crossrange float64) {
+
+	geo := physics.ECIToGeodetic(positionECI, elapsedAt)
+	horizontalDistance = greatCircleDistance(target.Latitude, target.Longitude, geo.Latitude, geo.Longitude)
+
+	targetECEF := physics.GeodeticToECEF(target)
+	currentECEF := physics.ECIToECEF(positionECI, elapsedAt)
+	localAtTarget := physics.NewLocalFrame(targetECEF)
+	oe, on, _ := localAtTarget.Decompose(currentECEF.Sub(targetECEF))
+
+	if refBearingECI == (physics.Vec3{}) {
+		return horizontalDistance, math.Hypot(oe, on), 0
+	}
+	refECEF := physics.ECIToECEF(refBearingECI, refBearingAt)
+	re, rn, _ := localAtTarget.Decompose(refECEF)
+	refNorm := math.Hypot(re, rn)
+	if refNorm < 1e-9 {
+		return horizontalDistance, math.Hypot(oe, on), 0
+	}
+	ue, un := re/refNorm, rn/refNorm
+	downrange = oe*ue + on*un
+	crossrange = oe*(-un) + on*ue
+	return horizontalDistance, downrange, crossrange
+}
+
+// landingMiss — Stage 4.11, п.2: те же три величины для ТЕКУЩЕГО положения
+// бустера относительно launchTarget, вдоль исходного курса отлёта
+// (b.outboundHorizontal) — используется и постоянной телеметрией
+// (boosterTelemetry), и приводнением (checkSplashdown), и predicted-impact
+// диагностикой (landingPredictedImpact).
+func (b *Booster) landingMiss(positionECI physics.Vec3, elapsedAt float64) (horizontalDistance, downrange, crossrange float64) {
+	return groundMissAgainst(positionECI, elapsedAt, b.launchTarget, b.outboundHorizontal, b.boostbackStartElapsed)
+}
+
+// predictBallisticImpactSteps, predictBallisticImpactDt — Stage 4.11, п.5:
+// шаг и предел числа шагов простого баллистического прогноза. dt=1с —
+// прогноз не участвует в самой физике (не влияет на состояние аппарата),
+// это только оценка для guidance/диагностики, точность в доли секунды ей
+// не нужна; maxSteps=2000 (>33 мин) — с большим запасом покрывает время от
+// separation/boostback до реального приводнения (в изученных прогонах —
+// единицы минут).
+const (
+	predictBallisticImpactDt    = 1.0
+	predictBallisticImpactSteps = 2000
+)
+
+// predictBallisticImpact — Stage 4.11, п.5: простая forward-prediction —
+// "current state → coast/atmospheric propagation → predicted ground
+// intercept" из задания, упрощённая до ЧИСТОЙ баллистики (гравитация,
+// physics.GravityAcceleration — та же модель с J2, что использует основной
+// интегратор, без тяги и без атмосферного сопротивления). Тот же класс
+// приближения, что "instantaneous impact point" в реальных системах
+// безопасности полигона: быстро и достаточно для замкнутого контура
+// коррекции, не полноценный оптимизатор с атмосферной моделью (см. явное
+// требование задания "не строить сразу"). Возвращает ECI-положение точки
+// пересечения с поверхностью и модельное время (с) ОТ ТЕКУЩЕГО момента —
+// вызывающий код обязан прибавить его к текущему elapsed, чтобы получить
+// АБСОЛЮТНОЕ время для дальнейшего ECIToGeodetic (вращение Земли за время
+// прогноза учитывается ИМЕННО через это — прогноз в ECI его не видит, но
+// перевод результата в Earth-fixed систему на правильный момент времени
+// — видит).
+//
+// Известное, осознанное упрощение: без сопротивления атмосферы прогноз
+// систематически ПЕРЕОЦЕНИВАЕТ дальность (тело с большой площадью и
+// заметным Cx теряет заметную часть горизонтальной скорости на спуске
+// через плотные слои, чего эта модель не видит) — величина этого
+// смещения измеряется и явно указывается в отчёте (Stage 4.11, п.3),
+// а не молчаливо принимается за точный прогноз.
+func predictBallisticImpact(position, velocity physics.Vec3) (impactECI physics.Vec3, flightTime float64, ok bool) {
+	pos, vel := position, velocity
+	for i := 0; i < predictBallisticImpactSteps; i++ {
+		acc := physics.GravityAcceleration(pos)
+		vel = vel.Add(acc.Scale(predictBallisticImpactDt))
+		pos = pos.Add(vel.Scale(predictBallisticImpactDt))
+		flightTime += predictBallisticImpactDt
+		if pos.Norm() <= physics.EarthRadius {
+			return pos, flightTime, true
+		}
+	}
+	return pos, flightTime, false
+}
+
+// landingPredictedImpact — Stage 4.11, п.5,6: баллистический прогноз точки
+// посадки ОТ ТЕКУЩЕГО состояния бустера (predictBallisticImpact) и промах,
+// который он бы дал относительно launchTarget — используется и Boostback
+// guidance (closed-loop, п.4,6), и диагностикой (п.3,10).
+func (b *Booster) landingPredictedImpact(elapsedNow float64) (impactMiss, impactDownrange, impactCrossrange, flightTime float64, ok bool) {
+	impactECI, dt, ok := predictBallisticImpact(b.state.Position, b.state.Velocity)
+	if !ok {
+		return 0, 0, 0, dt, false
+	}
+	impactMiss, impactDownrange, impactCrossrange = b.landingMiss(impactECI, elapsedNow+dt)
+	return impactMiss, impactDownrange, impactCrossrange, dt, true
+}
+
+// Step продвигает состояние бустера на dt секунд. Вызывается из того же
+// такта, что и шаг основной симуляции — «одновременность» получается тем,
+// что оба тела шагают одним и тем же интервалом на одном и том же таймере,
+// без отдельных горутин.
+func (b *Booster) Step(dt float64, elapsed float64, wind env.WindModel, densityFactor float64, overrides control.Overrides) {
+	if !b.Alive() {
+		return
+	}
+
+	altitude := b.state.Altitude()
+	windVel := b.windVelocity(wind, altitude)
+	nav := orbit.NewNavState(b.state.Position, b.state.Velocity, windVel,
+		b.dryMass()+b.state.FuelMass, b.propulsion.TotalThrust, cfgVacuumISP(b.Config),
+		elapsed, orbit.PhaseEntry)
+
+	atm := physics.Atmosphere(nav.Altitude)
+	atm.Density *= densityFactor
+
+	if b.phase == BoosterSplashdown {
+		b.advanceTopple(dt)
+		b.elapsed = elapsed
+		return
+	}
+
+	b.updatePhase(nav, dt)
+
+	target := b.landingTarget(nav, dt)
+	throttle := b.throttleCommand(nav, dt)
+
+	b.propulsion.Update(dt, throttle, PropulsionEnvironment{
+		Overrides:       overrides,
+		AmbientPressure: atm.Pressure,
+		StructureTemperature: physics.EffectiveEnvironmentTemperature(
+			nav.Altitude, nav.AirRelativeVelocity.Norm()),
+		AxialAcceleration:   b.prevAxialAccel,
+		LateralAcceleration: b.prevLateralAccel,
+		AngularAcceleration: b.prevAngularAccel,
+		Gravity:             physics.GravityMagnitudeAtAltitude(nav.Altitude),
+	})
+
+	b.updateAttitude(dt, target, nav, atm)
+
+	thrustDir := b.attitude.ThrustDirection()
+	radius := b.Config.Diameter / 2
+
+	// Решётчатые рули только что отработали момент (b.updateAttitude выше,
+	// через SurfaceSet.UpdateTorque) — та же физическая сила, из которой
+	// этот момент построен, осталась в b.attitude.Surfaces.Force, связанные
+	// оси. Переносится в мировые тем же поворотом, что и остальные
+	// связанные величины (см. ThrustDirection) — без него рули создавали бы
+	// момент, как будто вызывающая его сила на поступательное движение
+	// корпуса не действует, что нефизично (см. ForceModel.FinForce).
+	var finForceWorld physics.Vec3
+	if b.attitude.Surfaces != nil {
+		finForceWorld = b.attitude.Orientation.Rotate(b.attitude.Surfaces.Force)
+	}
+
+	fm := ForceModel{
+		DryMass:       b.dryMass(),
+		Thrust:        b.propulsion.TotalThrust,
+		ThrustDir:     thrustDir,
+		MassFlow:      b.propulsion.TotalFuelFlow + b.propulsion.TotalOxFlow,
+		Area:          math.Pi * radius * radius,
+		Wind:          windVel,
+		DensityFactor: densityFactor,
+		SideArea:      b.Config.FirstStageLength * b.Config.Diameter,
+		AngleOfAttack: b.bodyAngleOfAttack(nav.AirRelativeVelocity),
+		FinForce:      finForceWorld,
+	}
+
+	next := RK4Step(b.state, fm, dt)
+	if next.Position.IsFinite() && next.Velocity.IsFinite() {
+		b.state = next
+	}
+	b.elapsed = elapsed
+	b.state.FuelMass = b.propulsion.PropellantMass()
+
+	acc := fm.Evaluate(b.state)
+	apparent := acc.Total.Sub(acc.Gravity)
+	forward := b.attitude.Orientation.Rotate(physics.Vec3{X: 1})
+	axial := apparent.Dot(forward)
+	b.prevAxialAccel = math.Max(0, axial)
+	b.prevLateralAccel = apparent.Sub(forward.Scale(axial)).Norm()
+	b.prevAngularAccel = 0
+
+	// Проверка касания воды идёт по свежему, только что проинтегрированному
+	// состоянию, а не по nav, собранному в начале такта: тот устаревает
+	// ровно на этот шаг, и на скорости в десятки метров в секунду скорость
+	// касания, снятая по нему, уже не соответствует действительности —
+	// та же причина, по которой Simulation.step() проверяет столкновение
+	// по s.state.Altitude() напрямую, а не по вошедшему в такт nav.
+	b.checkSplashdown()
+	b.checkStructuralFailure()
+}
+
+// boosterMaxSpinRate — предельная угловая скорость корпуса, рад/с, выше
+// которой центробежные и поперечные нагрузки разрушают ступень. То же
+// значение и то же условие, что и у пассивно падающей отработавшей ступени
+// (env.SpentStage.Limits.MaxSpinRate) — это тот же физический корпус,
+// просто с работающим автопилотом вместо баллистики.
+//
+// Без этого предела автопилот, не справившийся с манёвром (недостаточная
+// власть решётчатых рулей и двигателей ориентации против аэродинамического
+// момента статически неустойчивого корпуса на сверхзвуке), уводил угловую
+// скорость в буквальном смысле в бесконечность: шаг интегрирования вращения
+// (10 мс) рассчитан на постоянную времени в доли секунды, а не на корпус,
+// делающий по несколько оборотов за миллисекунды, — за пределом
+// применимости дискретизации решение не имеет физического смысла и растёт
+// без остановки. Настоящая конструкция столько не выдержит и разрушится
+// задолго до этого: предел останавливает интегрирование там, где кончается
+// физика, а не там, где кончается число с плавающей запятой.
+const boosterMaxSpinRate = 3.5
+
+// checkStructuralFailure переводит бустер в BoosterDestroyed, если корпус
+// раскрутило быстрее предела прочности.
+func (b *Booster) checkStructuralFailure() {
+	if b.phase == BoosterSplashdown || b.phase == BoosterDestroyed {
+		return
+	}
+	if b.attitude.Omega.Norm() <= boosterMaxSpinRate {
+		return
+	}
+	b.phase = BoosterDestroyed
+	b.propulsion.StopAll()
+	log.Printf("💥 Бустер разрушился на T+%.1f с в полёте: автопилот не справился "+
+		"с манёвром, корпус раскрутило свыше %.1f рад/с", b.elapsed, boosterMaxSpinRate)
+}
+
+// updatePhase проверяет условия перехода между фазами возврата.
+func (b *Booster) updatePhase(nav orbit.NavState, dt float64) {
+	switch b.phase {
+	case BoosterBoostback:
+		b.setEngineGroup(b.boostbackEngineGroup(b.elapsed - b.boostbackStartElapsed))
+
+		// Stage 4.11, п.8 (пересмотрено Stage 4.15): shutdown criterion — по
+		// тренду ТЕКУЩЕЙ горизонтальной ошибки положения
+		// (landingHorizontalPositionError), а не по пересечению нуля
+		// горизонтальной скорости (Stage ≤4.10, "промежуточная архитектура"
+		// по формулировке задания). Пока коррекция ЕЩЁ уменьшает
+		// расстояние до цели — гореть целесообразно; как только оно
+		// начинает расти (корпус уже пролетел мимо цели, а не подлетает к
+		// ней) — продолжать значит переусердствовать.
+		//
+		// Раньше (Stage 4.11-4.14) здесь стоял прогнозируемый БАЛЛИСТИЧЕСКИЙ
+		// промах (landingPredictedImpact: "если прекратить тягу прямо
+		// сейчас, куда унесёт по инерции") — уместно для guidance, целившей
+		// именно в эту прогнозную точку (см. историю ≤Stage 4.14). Stage
+		// 4.15 сменила сам закон наведения на профиль торможения
+		// (boostbackAccelCommand: скорость, СОРАЗМЕРНАЯ оставшемуся
+		// расстоянию, а не "разогнаться так, чтобы баллистика сама донесла
+		// до цели") — и прогнозируемая точка падения при такой, нарочно
+		// умеренной, скорости почти всегда "уходит мимо" цели (тело ещё
+		// высоко, баллистика без дальнейшей тяги унесла бы его дальше, чем
+		// целится ТЕКУЩИЙ, ещё не завершённый манёвр) — старый критерий
+		// поэтому останавливал разворотный импульс сильно раньше, чем он
+		// реально исчерпал топливо, даже когда фактическое расстояние до
+		// цели ещё уверенно сокращалось. Текущая ошибка положения не имеет
+		// этого искажения: она растёт ровно тогда, когда корпус физически
+		// начинает удаляться от цели, а не когда это "предсказывает"
+		// гипотетическая баллистика.
+		//
+		// Диагностика (Stage 4.11, зафиксировано числами) нашла: сразу
+		// после отделения корпус ещё физически не довернулся к новой
+		// цели (унаследованная со связки ориентация — см. NewBooster,
+		// комментарий у stackOrientation) — тяга первые секунды продолжает
+		// уходить в СТАРОМ направлении (измерено: cos угла между
+		// ThrustDirection и boostbackCommandedDir ≈ −0.6, то есть камеры
+		// толкают почти НАВСТРЕЧУ требуемой коррекции), и прогнозируемый
+		// промах в эту переходную секунду естественно растёт — это не
+		// "коррекция уже не помогает", а "коррекция ещё не приложена". Без
+		// этого гейта детектор тренда останавливал манёвр почти мгновенно
+		// (< 1 с после отделения), ещё до всякого реального разворота.
+		// Отсюда — trendGate: тренд оценивается, только когда тяга УЖЕ
+		// направлена преимущественно в сторону коррекции (cmdAlign>0, не
+		// magic distance — чисто знак, "помогает или мешает"), а не с
+		// первого такта. Дебаунс (boostbackMissWorsening) поверх этого —
+		// та же защита от одиночного шумного такта, что landingGroupDwell.
+		// Stage 4.15: сравнение — с СЫРЫМ (не сглаженным motion-profile'ем)
+		// направлением коррекции (boostbackNaturalDir), а не с
+		// b.boostbackCommandedDir: тот теперь сам — reference корпуса,
+		// нарочно совпадающий с ТЕКУЩЕЙ ориентацией в момент инициализации
+		// (см. boostbackTarget) и потому тождественно "выровненный" с
+		// текущей тягой всегда, независимо от того, помогает ли она в
+		// действительности — сравнение против него сделало бы trendGate
+		// бесполезным именно тогда, когда он нужнее всего (первые такты
+		// после отделения).
+		shutdownByMiss := false
+		thrustDir := b.attitude.ThrustDirection()
+		cmdAlign := 0.0
+		if dir, ok := b.boostbackNaturalDir(nav); ok {
+			cmdAlign = thrustDir.Dot(dir)
+		}
+		if impactMiss, _, _, _, ok := b.landingPredictedImpact(b.elapsed); ok {
+			trendGate := cmdAlign > 0
+			if trendGate && !math.IsNaN(b.boostbackPredictedMissPrev) && impactMiss > b.boostbackPredictedMissPrev {
+				b.boostbackMissWorsening += dt
+			} else {
+				b.boostbackMissWorsening = 0
+			}
+			if trendGate {
+				b.boostbackPredictedMissPrev = impactMiss
+			} else {
+				// Пока тяга ещё не помогает коррекции, эталон для сравнения
+				// не копится — иначе первый же такт после открытия gate
+				// сравнивался бы с устаревшим "домача-коррекционным"
+				// значением и мог бы ложно сработать как "рост".
+				b.boostbackPredictedMissPrev = math.NaN()
+			}
+			if b.boostbackMissWorsening >= boostbackShutdownDwellTime {
+				shutdownByMiss = true
+			}
+		}
+
+		// apoapsisOK — гейт поверх shutdownByMiss: горизонтальный критерий
+		// ничего не знает про апоцентр (см. boostbackVerticalAccelCommand),
+		// и без этой проверки выключил бы импульс по горизонтальному тренду
+		// даже тогда, когда вертикальная скорость всё ещё требует правки.
+		// Если разворот уже пройден (vert<=0) или цель не задана — нечего
+		// проверять, гейт открыт.
+		apoapsisOK := true
+		if target := b.Config.BoosterTargetApoapsis; target > 0 {
+			if vert := b.state.Velocity.Dot(nav.Frame.Up); vert > 0 {
+				el := physics.ElementsFromState(b.state.Position, b.state.Velocity, b.elapsed)
+				apoapsisOK = !el.Elliptical || el.ApoapsisAltitude <= target
+			}
+		}
+
+		// Плановое время манёвра истекло (см. boostbackTotalDuration) —
+		// центральная тройка не держится до кинематической сходимости,
+		// сколько бы это ни заняло, а гасится по тому же плану, что и
+		// переходы 33→13→3 выше (тепловой/структурный бюджет, не мгновенная
+		// кинематика). Без этого условия тройка тянула манёвр до 130+с на
+		// одной лишь себе (что реальный Super Heavy не делает).
+		sinceStart := b.elapsed - b.boostbackStartElapsed
+		timeUp := sinceStart >= boostbackTotalDuration
+
+		reserve := boosterFuelReserveFraction * b.Config.FirstStage.FuelReserve
+		if (shutdownByMiss && apoapsisOK) || timeUp || b.propulsion.PropellantMass() <= reserve {
+			b.phase = BoosterCoast
+			// Coast — баллистика без тяги: все камеры глушатся, посадочный
+			// импульс начнётся не продолжением их работы, а отдельным
+			// повторным розжигом (см. случай BoosterCoast ниже).
+			b.setEngineGroup(0)
+
+			// Отправная точка motion-profile цели Coast: сама ориентация,
+			// доставшаяся от Boostback, и нулевая начальная скорость
+			// довороти — см. boosterCoastTarget.
+			b.coastCommandedDir = b.attitude.Orientation.Rotate(physics.Vec3{X: 1})
+			b.coastCommandedRate = 0
+			log.Printf("🔄 Бустер завершил разворотный импульс на T+%.1f с: "+
+				"высота %.1f км, остаток топлива %.1f т",
+				b.elapsed, nav.Altitude/1000, b.propulsion.PropellantMass()/1000)
+		}
+
+	case BoosterCoast:
+		if nav.Altitude <= b.landingBurnIgnitionAltitude(nav) {
+			b.phase = BoosterLandingBurn
+			b.landingBurnStartAltitude = nav.Altitude
+			// landingEngineSequence[0] == boosterLandingHigh (13) — инвариант
+			// самой последовательности, см. её объявление.
+			b.landingGroupIndex = 0
+			b.setEngineGroupIndices(b.landingGroupIndices[0])
+
+			// Импульс без тяги (Coast) — десятки секунд без осевого ускорения,
+			// топливо в баках успевает разойтись: без осадки повторный розжиг
+			// у самой воды идёт с кавитацией — камеры формально "работают",
+			// команда честно держится, а реальной тяги нет, и снижение не
+			// гасится вовсе. Настоящие носители перед повторным розжигом
+			// именно поэтому дают короткий осадочный импульс двигателями
+			// ориентации; здесь тот же манёвр — мгновенным приведением уровня
+			// осадки к единице прямо к моменту розжига, не смоделированным
+			// отдельно расходом газа наддува на осадку (тот уже учтён общим
+			// бюджетом ориентации, см. ventGas).
+			b.propulsion.FuelTank.Settled = 1
+			b.propulsion.OxTank.Settled = 1
+
+			log.Printf("🔥 Посадочный импульс бустера на T+%.1f с: "+
+				"высота %.0f м, снижение %.0f м/с",
+				b.elapsed, nav.Altitude, -nav.RadialVelocity)
+		}
+
+	case BoosterLandingBurn:
+		b.updateLandingEngineGroup(nav, dt)
+	}
+}
+
+// landingTarget возвращает потребную ориентацию корпуса.
+//
+// К посадочному импульсу (LandingBurn) снос уже погашен почти целиком,
+// а вертикальная скорость ещё огромна — но по мере того как её гасит сам
+// импульс, соотношение обращается: остаток горизонтального сноса, который
+// вначале тонул в вертикальной скорости, перестаёт быть пренебрежимым,
+// и угол места вектора скорости стремительно уходит от вертикали к
+// горизонту. Цель ориентации вслед за ним кладёт корпус набок, автопилот
+// гоняется за этим разворотом, и в возникающий крен утекает именно то,
+// что должно было тормозить: тяга уходит вбок и вместо гашения снижения
+// даёт то самое биение скорости, что и наблюдалось (снижение не падало
+// монотонно, а раскачивалось). У корабля та же причина решена тем же
+// способом — ниже 200 м угол места зафиксирован в вертикали
+// (entry.go:entryTarget, PhaseLandingBurn). Здесь порог не высотный,
+// а фазовый: весь посадочный импульс — чистое торможение вниз, без
+// активного гашения остаточного сноса. Курс всё равно пересчитывается
+// каждый такт, как и у корабля, — он от соотношения вертикальной
+// и горизонтальной скорости не зависит и остаётся надёжным.
+//
+// Разворотный импульс (Boostback) — отдельный случай, см. boostbackTarget
+// (Stage 4.10): closed-loop, цель пересчитывается каждый такт от текущей
+// горизонтальной скорости, но вертикаль не трогает вовсе.
+//
+// Coast (случай по умолчанию) идёт не точным ретроградом (нулевой угол
+// атаки), а с постоянным смещением на boosterCoastAngleOfAttack — см.
+// boosterCoastTarget, там же и почему.
+func (b *Booster) landingTarget(nav orbit.NavState, dt float64) physics.Attitude {
+	switch b.phase {
+	case BoosterLandingBurn:
+		return b.landingBurnTarget(nav, dt)
+	case BoosterBoostback:
+		return b.boostbackTarget(nav, dt)
+	}
+	return b.boosterCoastTarget(nav, dt)
+}
+
+// landingBurnTarget — п.3,10,14-18 Stage 4.4: цель ориентации посадочного
+// импульса строится из требуемого 3D вектора тяги (landingDesiredThrust),
+// а не назначается фиксированной вертикалью независимо от горизонтальной
+// скорости, как было раньше (см. историю ниже). Автопилоту, как и на Coast
+// (boosterCoastTarget), передаётся не сам desired-вектор напрямую, а его
+// motion-profile — reference-направление, которое само разгоняется и
+// тормозит с ограничением по располагаемому угловому ускорению и не может
+// обогнать физическую способность корпуса поворачиваться (landingCommandedDir/
+// landingCommandedRate — тот же приём и то же обоснование, что и у
+// coastCommandedDir/coastCommandedRate).
+//
+// Раньше цель здесь была безусловно {Pitch:90, Yaw:азимут скорости} —
+// строго вертикальная НЕЗАВИСИМО от горизонтальной скорости. Диагностика
+// (Stage 4.4, TestZZ3DBaseline, до этой правки) показала: на части seeds
+// после ignition остаётся 90-170 м/с горизонтальной скорости, и требование
+// держать строгую вертикаль означает держать курс поперёк реального
+// потока. Угол атаки на ignition ~170° (нос почти точно против потока —
+// штатно для двигателей вниз) начинал СНИЖАТЬСЯ по мере того, как
+// аэродинамический момент статически неустойчивого корпуса уводил корпус
+// от вертикали быстрее, чем органы управления успевали удержать (момент от
+// потока на пике превышал располагаемый управляющий в 2+ раза) — борьба
+// шла не за посадку, а за невозможную задачу "стоять вертикально в
+// потоке, идущем по диагонали". Итог: body tilt рос от самого ignition, а
+// не с какого-то позднего момента, доходя до 100-170°, угол атаки
+// проваливался к нулю (нос уже по потоку, двигатели не первые) — вместо
+// посадки получался переворот двигателями вверх.
+// reorientAngularAccel возвращает располагаемое угловое ускорение прямо
+// сейчас, рад/с² — q-aware (п.13-14 Stage 4.4), а НЕ структурный потолок
+// MaxAngularAccel: тот описывает, на что автопилот в принципе способен ПРИ
+// НУЛЕВОМ аэродинамическом моменте, а не то, сколько реально остаётся после
+// того, как аэродинамика уже забрала часть располагаемого момента качания
+// камер. Диагностика (Stage 4.4, TestZZ3DBaseline) показала: на высоком q
+// аэродинамический момент (b.attitude.AeroTorque, уже посчитан на предыдущем
+// такте) регулярно ПРЕВЫШАЕТ момент, который могут дать камеры на предельном
+// отклонении (thrust·arm·sin(MaxGimbal)) — в 2-5 раз на пике. Motion-profile,
+// paced по MaxAngularAccel независимо от этого, весь такт продолжал уводить
+// цель вперёд, хотя корпус физически не мог за ней угнаться — и как раз
+// это, а не сам факт ненулевого наклона, раскручивало корпус мимо цели.
+//
+// Общий для LandingBurn (см. landingBurnTarget) и Boostback (см.
+// boostbackTarget, Stage 4.15: та же причина овершута и колебаний на
+// разворотном импульсе, что Stage 4.4 нашла и починила здесь) — оба фазы
+// работают тем же самым исполнительным органом (качание камер плюс рули)
+// против той же самой аэродинамики, разница только в том, что тяга и число
+// камер другие; сама формула не должна дублироваться в двух местах и
+// расходиться при будущей правке.
+//
+// Если аэродинамика уже забрала весь момент или больше — margin<=0, alpha
+// падает почти до нуля, и motion-profile перестаёт уводить цель дальше,
+// пока запас не появится (аэродинамика ослабнет с падением q или самого
+// угла рассогласования) — то есть именно "не требовать мгновенного
+// вращения при большом q", без отдельно прибитого порога по AoA/q.
+func (b *Booster) reorientAngularAccel() float64 {
+	// RCSMoment — момент газоотвода (b.attitude.Config.RCSMoment, уже
+	// обнулённый updateAttitude, если газа наддува не осталось) — на Coast
+	// (двигатели не работают, gimbalTorque=0) это на большой высоте
+	// ЕДИНСТВЕННЫЙ источник авторитета: решётчатые рули почти бесполезны в
+	// разрежённых слоях (SurfaceAuthority там ничтожен). Опустить его здесь
+	// значило бы, что Coast на высоте будет считать располагаемое ускорение
+	// нулевым (пол coastReorientMinAlpha) и почти не доворачивать корпус,
+	// пока не спустится в плотные слои, — и приходить туда с накопленным,
+	// ещё не выбранным довортом именно тогда, когда аэродинамика уже сама
+	// отбирает часть авторитета (см. её же вычитание ниже).
+	gimbalTorque := b.propulsion.TotalThrust * b.gimbalArm() * math.Sin(b.attitude.Config.MaxGimbal)
+	angularAuthority := gimbalTorque + b.attitude.SurfaceAuthority
+	angularTorqueMargin := angularAuthority - b.attitude.AeroTorque.Norm()
+
+	alpha := coastReorientMinAlpha
+	if inertia := b.attitude.Inertia.Iyy; inertia > 0 && angularTorqueMargin > 0 {
+		if a := angularTorqueMargin / inertia; a > alpha {
+			alpha = a
+		}
+	}
+	if ceiling := b.attitude.Config.MaxAngularAccel; ceiling > 0 && alpha > ceiling {
+		alpha = ceiling
+	}
+	return alpha
+}
+
+func (b *Booster) landingBurnTarget(nav orbit.NavState, dt float64) physics.Attitude {
+	desired, saturated, marginLimited, margin := b.landingAuthorityConstrainedThrust(nav)
+	b.landingDesiredThrustLast = desired
+	b.landingGuidanceSaturatedLast = saturated
+	b.landingMarginLimitedLast = marginLimited
+	b.landingControlMarginLast = margin
+
+	natural := desired
+	if n := natural.Norm(); n > 1e-6 {
+		natural = natural.Scale(1 / n)
+	} else {
+		natural = nav.Frame.Up
+	}
+
+	if b.landingCommandedDir == (physics.Vec3{}) {
+		b.landingCommandedDir = natural
+		b.landingAngularStoppingMarginLast = 0
+		// Stage 4.9, п.A1: крен фиксируется на факте на этот самый момент
+		// (ignition), а не безусловно требуется к нулю — см. поле
+		// landingRollAtIgnition и его комментарий у объявления.
+		b.landingRollAtIgnition = b.attitude.Orientation.AttitudeIn(nav.Frame).Roll
+		pitch, azimuth := nav.Frame.PitchAzimuth(natural)
+		return physics.Attitude{Pitch: pitch, Yaw: azimuth, Roll: b.landingRollAtIgnition}
+	}
+
+	current := b.landingCommandedDir.Unit()
+	remaining := math.Acos(physics.Clamp(current.Dot(natural), -1, 1))
+
+	// Располагаемое угловое ускорение — q-aware (п.13-14 Stage 4.4), см.
+	// reorientAngularAccel — общий для Boostback/LandingBurn расчёт.
+	alpha := b.reorientAngularAccel()
+
+	// Угловой тормозной путь (п.15 Stage 4.4) — тот же приём, что и в
+	// boosterCoastTarget: если оставшийся угол меньше того, что профиль
+	// пройдёт на своей текущей угловой скорости, не долетев до цели раньше,
+	// чем скорость упадёт до нуля, пора тормозить, а не продолжать разгон.
+	// Именно это останавливает overshoot через вертикаль (рост тангажа,
+	// потом "проскок" мимо цели с накопленным ω — см. п.15,20 Stage 4.4).
+	stopAngle := b.landingCommandedRate * b.landingCommandedRate / (2 * alpha)
+	b.landingAngularStoppingMarginLast = remaining - stopAngle
+	if stopAngle >= remaining {
+		b.landingCommandedRate = math.Max(0, b.landingCommandedRate-alpha*dt)
+	} else {
+		b.landingCommandedRate += alpha * dt
+	}
+
+	step := math.Min(b.landingCommandedRate*dt, remaining)
+	if remaining > 1e-9 {
+		axis := current.Cross(natural)
+		if axis.Norm() > 1e-9 {
+			turn := physics.QuaternionFromAxisAngle(axis, step)
+			b.landingCommandedDir = turn.Rotate(current)
+		}
+	}
+
+	pitch, azimuth := nav.Frame.PitchAzimuth(b.landingCommandedDir)
+	return physics.Attitude{Pitch: pitch, Yaw: azimuth, Roll: b.landingRollAtIgnition}
+}
+
+// boosterCoastAngleOfAttack — ПОТОЛОК отклонения цели ориентации на Coast от
+// точного ретрограда скорости, градусы — реально используемое значение
+// (boosterCoastAoAOffset) урезается вниз от него q-aware проверкой
+// authority, никогда не сверху: это не "рабочий угол", а "дальше некуда,
+// корпус и так уже почти боком к потоку".
+//
+// Точный ретроград — нулевой угол атаки: корпус подставляет потоку только
+// площадь миделя (63.6 м² при диаметре 9 м), борт (639 м² при длине 71 м —
+// на порядок больше) в сопротивление вообще не входит. Настоящий booster
+// (в отличие от корабля, у которого есть отдельный, куда более резкий
+// "belly flop") на спуске так не летит — но и не держит какой-то один
+// малый фиксированный угол: у него нет отдельного entry burn (в отличие от
+// Falcon 9 — только Boostback и Landing Burn), то есть ВЕСЬ путь от конца
+// Boostback до розжига посадочного импульса реальный аппарат гасит
+// исключительно этим самым аэродинамическим торможением, без какой-либо
+// тяги. Раньше здесь стоял фиксированный потолок 10° (эффективная площадь
+// 63.6·cos10°+639·sin10°≈174 м², втрое больше миделя) — Stage 4.17 нашла,
+// что при этом бустер разгоняется на Coast почти баллистически (до
+// 1358 м/с к 36 км), то есть 10° само по себе — не "потолок по authority",
+// а произвольно заниженная константа, отбирающая КРАТНО больше
+// располагаемого сопротивления, чем реально позволяет управление. Потолок
+// поднят до практического предела (борт поперёк потока, 90° — площадь
+// 639 м², почти в четыре раза больше площади при 10°): САМ угол
+// по-прежнему решает boosterCoastAoAOffset по НАСТОЯЩЕЙ располагаемой
+// authority на каждый такт, а не по этой константе, — она лишь снимает
+// искусственный потолок там, где authority давно позволяла бы больше.
+const boosterCoastAngleOfAttack = 2.0
+
+// coastReorientMinAlpha — нижний предел располагаемого углового ускорения
+// при построении motion-profile (см. boosterCoastTarget), рад/с². Нужен
+// только чтобы не делить на ноль в вырожденном случае (нулевой момент
+// инерции на первом такте или полностью выработанный газ наддува) —
+// величина ниже любого физически осмысленного значения на этом участке
+// (реальное располагаемое ускорение — порядка 10⁻³ рад/с², см. ниже),
+// значит на выбор профиля она не влияет, а только страхует.
+const coastReorientMinAlpha = 1e-5
+
+// boosterCoastTarget возвращает ориентацию Coast — ретроград текущей
+// скорости с постоянным отклонением по тангажу на boosterCoastAngleOfAttack
+// (см. константу) — НЕ отдаётся автопилоту напрямую. Между этой "конечной"
+// целью (natural, ниже) и её реальной ориентацией на конец Boostback лежит
+// motion-profile: reference-точка (coastCommandedDir), которая сама
+// разгоняется и тормозит с ограничением по располагаемому угловому
+// ускорению, и именно её отслеживает автопилот через landingTarget.
+//
+// Раньше цель либо передавалась мгновенно (скачок до ~130°, который
+// автопилот с его полосой пропускания отработать не может), либо
+// доворачивалась линейно за фиксированные 20 секунд — число, подобранное
+// произвольно, а не выведенное из реальной физики корпуса. Трассировка
+// показала: при располагаемом моменте газоотвода/рулей ~10⁵-10⁶ Н·м и
+// инерции корпуса ~10⁸ кг·м² реальное угловое ускорение — порядка
+// 10⁻³ рад/с², и 20-секундный доворот требует темпа, которого корпус
+// физически не может дать. Автопилот в ответ выходит на упор (насыщение
+// РСУ), корпус разгоняется медленнее цели, не успевает погасить набранную
+// скорость к моменту, когда линейная цель "приходит" к ретрограду, и
+// проскакивает мимо выравнивания с накопленным ω — именно это раскручивало
+// бустер на растущем скоростном напоре, а не сама аэродинамика.
+//
+// Формула торможения — классический stopping distance: если остающийся
+// угол до цели меньше того, что можно пройти при текущей скорости профиля,
+// не долетев до цели раньше, чем скорость упадёт до нуля (ω²/2α), пора
+// тормозить, а не продолжать разгон. Профиль тем самым приходит к цели
+// сам почти с нулевой скоростью — до того, как её вообще потребует
+// формальный критерий "ошибка мала" (который сам по себе ничего не
+// говорит о том, с какой скоростью корпус в этот момент вращается).
+// coastAvailableTorque возвращает располагаемый корректирующий момент (Н·м)
+// на Coast прямо сейчас — газоотвод (b.attitude.Config.RCSMoment, уже
+// обнулённый, если газа нет) плюс решётчатые рули (PitchAuthority, растущие
+// с q). Двигатели не работают (Commissioned=0), поэтому, в отличие от
+// landingAvailableCorrectiveTorque/availableCorrectiveTorqueFor (те строят
+// список ИМЕННО работающих камер и при пустом списке честно возвращают 0 —
+// корректно для посадочного импульса, но здесь превратило бы Coast в "нет
+// авторитета вообще"), TVC-часть здесь не считается вовсе.
+func (b *Booster) coastAvailableTorque(nav orbit.NavState, mach float64) float64 {
+	fins := 0.0
+	if b.attitude.Surfaces != nil && b.attitude.Surfaces.Count() > 0 {
+		airBody := b.attitude.Orientation.RotateInverse(nav.AirRelativeVelocity)
+		comFromNose := b.centerOfMassFraction() * b.Config.FirstStageLength
+		fins = b.attitude.Surfaces.PitchAuthority(airBody, nav.DynamicPressure, mach, comFromNose)
+	}
+	return fins + b.attitude.Config.RCSMoment
+}
+
+// boosterCoastAoAOffset возвращает ФАКТИЧЕСКИ допустимое отклонение по
+// тангажу (град., 0…boosterCoastAngleOfAttack) от ретрограда — Stage 4.15,
+// тот же q-aware приём, что Stage 4.6 уже применяет к посадочному импульсу
+// (landingAuthorityConstrainedThrust): полный boosterCoastAngleOfAttack
+// добавляет сопротивление (см. её комментарий), но и добавляет
+// аэродинамический момент — на большом q статически неустойчивого корпуса
+// этот момент, поверх момента от самого ретрограда, может превысить
+// available (coastAvailableTorque), которым на Coast распоряжаются только
+// рули и газоотвод (никакого качания камер — двигатели не работают). Если
+// полный офсет не помещается в располагаемый момент — бинарный поиск
+// наибольшего офсета, что ещё помещается (0, если даже чистый ретроград
+// вне authority — тогда урезать больше нечего, честно 0, а не отрицательное
+// число).
+func (b *Booster) boosterCoastAoAOffset(nav orbit.NavState, retrograde physics.Attitude, mach float64) float64 {
+	available := b.coastAvailableTorque(nav, mach)
+	torqueAt := func(offsetDeg float64) float64 {
+		dir := nav.Frame.Direction(retrograde.Pitch+offsetDeg, retrograde.Yaw)
+		_, torque := b.landingPredictedAoAAndAeroTorque(nav, dir, mach)
+		return torque
+	}
+	if torqueAt(boosterCoastAngleOfAttack) <= available {
+		return boosterCoastAngleOfAttack
+	}
+	if torqueAt(0) > available {
+		return 0
+	}
+	lo, hi := 0.0, boosterCoastAngleOfAttack
+	for i := 0; i < 12; i++ {
+		mid := (lo + hi) / 2
+		if torqueAt(mid) <= available {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func (b *Booster) boosterCoastTarget(nav orbit.NavState, dt float64) physics.Attitude {
+	mach := 0.0
+	if ss := physics.Atmosphere(nav.Altitude).SoundSpeed; ss > 0 {
+		mach = nav.AirRelativeVelocity.Norm() / ss
+	}
+
+	target := retrogradeGroundAttitude(nav)
+	target.Pitch += b.boosterCoastAoAOffset(nav, target, mach)
+	natural := nav.Frame.Direction(target.Pitch, target.Yaw)
+
+	if b.coastCommandedDir == (physics.Vec3{}) {
+		// Ещё не инициализирован (защита; updatePhase всегда успевает
+		// это сделать раньше первого вызова на Coast) — цель без профиля,
+		// лучше, чем нулевой вектор.
+		return target
+	}
+
+	current := b.coastCommandedDir.Unit()
+	nat := natural.Unit()
+	remaining := math.Acos(physics.Clamp(current.Dot(nat), -1, 1))
+
+	// Располагаемое угловое ускорение — тот же q-aware расчёт
+	// (reorientAngularAccel), что и у Boostback/LandingBurn: за вычетом
+	// ТЕКУЩЕГО аэродинамического момента, а не только "сколько вообще есть
+	// момента газоотвода/рулей на бумаге" (см. её комментарий — тот же
+	// класс бага, что Stage 4.4 уже нашла и починила для посадочного
+	// импульса: profile, paced независимо от аэродинамики, продолжает
+	// уводить цель вперёд, хотя корпус физически не поспевает за ней,
+	// именно когда аэродинамика уже забрала часть момента).
+	alpha := b.reorientAngularAccel()
+
+	stopAngle := b.coastCommandedRate * b.coastCommandedRate / (2 * alpha)
+	if stopAngle >= remaining {
+		b.coastCommandedRate = math.Max(0, b.coastCommandedRate-alpha*dt)
+	} else {
+		b.coastCommandedRate += alpha * dt
+	}
+
+	step := math.Min(b.coastCommandedRate*dt, remaining)
+	if remaining > 1e-9 {
+		axis := current.Cross(nat)
+		if axis.Norm() > 1e-9 {
+			turn := physics.QuaternionFromAxisAngle(axis, step)
+			b.coastCommandedDir = turn.Rotate(current)
+		}
+	}
+
+	pitch, azimuth := nav.Frame.PitchAzimuth(b.coastCommandedDir)
+	return physics.Attitude{Pitch: pitch, Yaw: azimuth, Roll: 0}
+}
+
+// boostbackTarget — Stage 4.11, п.4,6: return-to-launch-site closed-loop
+// наведение. Каждый такт заново, от ТЕКУЩЕГО состояния:
+//
+//	текущее положение+скорость → баллистический прогноз посадки
+//	(predictBallisticImpact, учитывает и гравитацию, и вращение Земли —
+//	см. landingPredictedImpact) → промах относительно launchTarget
+//	(LandingTargetPosition = LaunchPosition, п.1) → требуемая горизонтальная
+//	коррекция (направление, уменьшающее ИМЕННО этот промах) → направление
+//	тяги.
+//
+// Stage 4.10 целился не в точку, а в условие "Vh≈0" (проекция горизонтальной
+// скорости на курс отлёта обнулена) — Stage 4.11, п.3 (baseline) измерил,
+// куда это реально возвращает booster: промах ~69 км, из которых ~41 км —
+// БОКОВОЙ (crossrange), который Vh≈0-критерий в принципе не мог видеть —
+// он следит только за ОДНОЙ осью (проекцией на курс отлёта), а не за полным
+// 2D промахом. Здесь цель — не обнулить одну компоненту скорости, а
+// уменьшить прогнозируемое расстояние ДО ПЛОЩАДКИ целиком.
+//
+// Коррекция, как и в Stage 4.10, остаётся ЧИСТО ГОРИЗОНТАЛЬНОЙ (nav.Frame.
+// East/North — по построению ортогональны местной вертикали, Up в неё не
+// входит вовсе) — т.7 задания ("не возвращать старую ошибку с большим
+// отрицательным vertical ΔV") выполняется тем же способом, что в Stage
+// 4.10: вертикаль в цель просто не входит, а не отдельно балансируется.
+//
+// Почему это не повторяет отвергнутую (Stage ≤4.9) ошибку "цель прыгает на
+// 180° в середине манёвра": там проблема была в том, что цель продолжала
+// жить ПОСЛЕ пересечения нуля скорости, требуя мгновенного разворота на
+// пол-оборота. Здесь цель — направление коррекции промаха, а не ретроград
+// чего-либо; оно плавно вращается по мере того, как меняется взаимное
+// положение прогнозируемой точки падения и площадки, и манёвр
+// останавливается (см. updatePhase, случай BoosterBoostback) как только
+// продолжение горения перестаёт УМЕНЬШАТЬ этот промах — то есть до всякой
+// нужды в развороте на большой угол.
+//
+// На случай, если прогноз не сошёлся (не должно происходить в штатном
+// полёте) или горизонтальная поправка выродилась (шум близ самого минимума
+// промаха) — natural держится равным прежнему commandedDir (последнее
+// надёжно вычисленное направление, тот же приём, что и раньше), и
+// motion-profile ниже честно никуда не тянет (remaining≈0).
+//
+// Stage 4.15: raw-направление коррекции (natural) больше не идёт в
+// автопилот напрямую — между ним и командой лежит тот же motion-profile
+// (commandedDir/commandedRate, ограничение по reorientAngularAccel), что
+// уже применяется на Coast (boosterCoastTarget) и посадочном импульсе
+// (landingBurnTarget). Раньше (Stage ≤4.14) его не было: цель прыгала
+// мгновенно вслед за пересчитанным на этом такте прогнозом падения,
+// а прогноз в первые секунды после отделения (корпус ещё смотрит старым
+// курсом) и при малочисленной завершающей группе камер меняется резко —
+// диагностика (Stage 4.15) измерила раскрутку корпуса до 20-30°/с уже
+// на разворотном импульсе, то есть ДО Coast, куда этот остаточный спин
+// затем переносился почти без демпфирования (в разрежённых слоях управлять
+// нечем) и мешал всему последующему участку вплоть до посадочного импульса.
+// boostbackMissVector возвращает горизонтальный (East/North, местные оси
+// nav.Frame в ТЕКУЩЕЙ позиции) вектор промаха баллистического прогноза
+// падения относительно launchTarget, и баллистическое время до этого
+// падения (с) — общий, единожды посчитанный вход и для простого
+// "направление, уменьшающее промах" (см. её использование в updatePhase,
+// случай BoosterBoostback — сравнение РЕАЛЬНОГО направления тяги с
+// ИСТИННОЙ, ещё не сглаженной целью), и для rate-aware закона наведения
+// (boostbackAccelCommand). ok=false — прогноз не сошёлся, или поправка
+// выродилась (промах <1 м, шум близ самого минимума).
+func (b *Booster) boostbackMissVector(nav orbit.NavState) (miss physics.Vec3, flightTime float64, ok bool) {
+	impactECI, ft, predicted := predictBallisticImpact(b.state.Position, b.state.Velocity)
+	if !predicted {
+		return physics.Vec3{}, 0, false
+	}
+	currentECEF := physics.ECIToECEF(b.state.Position, b.elapsed)
+	impactECEF := physics.ECIToECEF(impactECI, b.elapsed+ft)
+	targetECEF := physics.GeodeticToECEF(b.launchTarget)
+	localAtCurrent := physics.NewLocalFrame(currentECEF)
+	me, mn, _ := localAtCurrent.Decompose(impactECEF.Sub(targetECEF))
+
+	if math.Hypot(me, mn) <= 1.0 {
+		return physics.Vec3{}, ft, false
+	}
+	// nav.Frame — ТА ЖЕ точка (текущая позиция), что localAtCurrent (просто
+	// в другой, ECEF, системе для самого смещения) — East/North физически
+	// то же направление в обеих, поэтому скалярные коэффициенты (me,mn)
+	// переносятся на ECI-базис nav.Frame напрямую, без отдельного
+	// пересчёта самих базисных векторов.
+	return nav.Frame.East.Scale(me).Add(nav.Frame.North.Scale(mn)), ft, true
+}
+
+// boostbackNaturalDir возвращает единичный вектор НАВСТРЕЧУ промаху (если
+// прогноз садится восточнее цели, направление тянет на запад, и т.д.) —
+// используется ТОЛЬКО updatePhase (случай BoosterBoostback) как чистый,
+// без учёта скорости закрытия, признак "помогает ли ТЕКУЩЕЕ направление
+// тяги в принципе" при оценке тренда прогнозируемого промаха — сравнение
+// с этим направлением, а не со сглаженным b.boostbackCommandedDir: в первые
+// такты после инициализации (см. boostbackTarget) commandedDir нарочно
+// совпадает с ТЕКУЩЕЙ ориентацией корпуса и ещё не отражает, куда на самом
+// деле нужно давить тягой, так что сравнение с ним было бы тождественно
+// "выровнено" независимо от того, помогает ли тяга в действительности.
+func (b *Booster) boostbackNaturalDir(nav orbit.NavState) (physics.Vec3, bool) {
+	miss, _, ok := b.boostbackMissVector(nav)
+	if !ok {
+		return physics.Vec3{}, false
+	}
+	return miss.Scale(-1 / miss.Norm()), true
+}
+
+// boostbackAvailableAccel возвращает общий бюджет ускорения (м/с²), которым
+// распоряжается boostbackAccelCommand на оба канала (горизонтальный снос и
+// вертикальный — апоцентр, см. boostbackVerticalAccelCommand) сразу, — доля
+// (landingDecelBudget, тот же коэффициент запаса, что и у вертикального
+// профиля посадочного импульса: реальная тяга время от времени проседает
+// ниже уставки сама по себе, и запас не даёт этим просадкам обернуться
+// потерей управляемости) от максимума ТЕКУЩЕЙ группы камер на ТЕКУЩЕЙ массе.
+func (b *Booster) boostbackAvailableAccel(nav orbit.NavState) float64 {
+	mass := b.dryMass() + b.state.FuelMass
+	if mass <= 0 {
+		return 0
+	}
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	aMax := perEngine * float64(b.propulsion.Commissioned) / mass
+	return landingDecelBudget * aMax
+}
+
+// boostbackAccelCommand возвращает требуемое ГОРИЗОНТАЛЬНОЕ ускорение
+// (м/с², местные оси nav.Frame) — Stage 4.15: та же форма закона, что уже
+// работает для ВЕРТИКАЛЬНОГО канала посадочного импульса
+// (landingRequiredThrust: гладкий профиль v(h)=√(vt²+2·decel·h), гасящий
+// разрыв между "нужно тормозить" и "долетели"), перенесённая на
+// ГОРИЗОНТАЛЬНУЮ задачу "долететь до launchTarget с нулевой скоростью
+// закрытия" — с той же самой физической интерпретацией: величина текущей
+// горизонтальной ошибки положения (landingHorizontalPositionError) играет
+// роль "высоты", а ЖЕЛАЕМАЯ скорость приближения к цели — роль ЖЕЛАЕМОЙ
+// вертикальной скорости на этой высоте.
+//
+// targetSpeed=√(2·aAvail·d) — та же кинематика тормозного пути, что и в
+// landingRequiredThrust (aAvail — boostbackAvailableAccel), а не подобранная
+// на глаз: скорость, с которой ЕЩЁ можно погасить оставшееся расстояние d
+// до нуля, не превышая располагаемое замедление. Обратная связь —
+// gain·(факт-цель), тот же коэффициент landingFeedbackGain, что и у
+// вертикального канала (тот же смысл: не гнаться за целью резче, чем
+// собственная погрешность привода/турбонасоса всё равно позволяет
+// удержать).
+//
+// Первые две версии этой правки (Stage 4.15) пробовали строить закон по
+// ПРОГНОЗИРУЕМОЙ точке падения (boostbackMissVector) — либо через
+// constant-jerk краевую задачу x(T)=0,v(T)=0 (см. историю
+// landingHorizontalAccelDemand в её старом виде), либо через прямое
+// пропорциональное затухание самого прогноза. Обе версии на практике гнали
+// разворотный импульс к тому, чтобы ТЕКУЩАЯ (position,velocity) сама
+// составляла корректную баллистическую траекторию перехвата цели — то есть
+// требовали НАБРАТЬ горизонтальную скорость, достаточную для попадания при
+// полностью безмоторном падении с текущей (обычно ещё большой) высоты, а
+// не малую скорость на конец импульса. Диагностика (Stage 4.15) измерила
+// это буквально: прогнозируемый промах монотонно и без овершута падал почти
+// до нуля (224930→304 м), а горизонтальная скорость при этом не гасла, а
+// РОСЛА (25→543 м/с) — потому что именно такая (растущая) скорость и
+// нужна для баллистического перехвата издалека. Реальному Boostback это не
+// нужно: посадочный импульс (не Boostback) отдельно гасит остаточный снос
+// перед касанием, а лишний накопленный снос — то, что вместо него
+// приходится гасить топливом позже, без выигрыша. Закон ниже, наоборот,
+// целится в СКОРОСТЬ, соразмерную ОСТАВШЕМУСЯ расстоянию при располагаемом
+// замедлении, — она естественно (как и v(h) вертикального канала) убывает к
+// нулю по мере приближения, а не растёт.
+func (b *Booster) boostbackAccelCommand(nav orbit.NavState) physics.Vec3 {
+	aAvail := b.boostbackAvailableAccel(nav)
+
+	// Апоцентр — в приоритете перед горизонтальным сносом: снос, недогашенный
+	// сейчас, ещё можно доправить позже (Coast под рулями, посадочный
+	// импульс), а апоцентр, которому не хватило тяги в разворотном импульсе,
+	// уже ничем после не наверстать (см. историю boostbackVerticalAccelCommand).
+	// Поэтому горизонтальный канал строит свой кинематический профиль не на
+	// полном бюджете, а на остатке от вертикального — при недостатке тяги
+	// снос временно тормозится слабее, а не наравне с апоцентром.
+	//
+	// Пропорциональное деление бюджета (без приоритета) пробовалось и
+	// отброшено: апоцентр сходится МЕДЛЕННЕЕ (меньше бюджета достаётся ему
+	// сразу), манёвр в целом получается ДОЛЬШЕ (T+309с против T+246с на
+	// тех же зёрнах), а не короче.
+	vertical := b.boostbackVerticalAccelCommand(nav)
+	verticalVec := nav.Frame.Up.Scale(vertical)
+
+	remaining := aAvail - math.Abs(vertical)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	posErr := b.landingHorizontalPositionError(nav)
+	d := posErr.Norm()
+	targetSpeed := math.Sqrt(2 * remaining * d)
+
+	var targetVel physics.Vec3
+	if d > 1e-6 {
+		targetVel = posErr.Scale(-targetSpeed / d)
+	}
+
+	v0 := landingHorizontalVelocity(nav)
+	horizontal := v0.Sub(targetVel).Scale(-landingFeedbackGain)
+
+	return horizontal.Add(verticalVec)
+}
+
+// boostbackVerticalAccelCommand возвращает требуемое ВЕРТИКАЛЬНОЕ (по
+// nav.Frame.Up, т.е. вдоль радиуса — м/с², отрицательное значит "гасить
+// подъём") ускорение разворотного импульса, нужное для того, чтобы плановый
+// апоцентр дуги возврата не превышал Config.BoosterTargetApoapsis (см. её
+// комментарий и IFT-14).
+//
+// До этой правки Boostback управлял только горизонтальным сносом (см. историю
+// boostbackAccelCommand выше, п. "т.7 задания") — вертикальная скорость
+// оставалась целиком на волю тяготения, и апоцентр получался тем, что
+// осталось от неё к моменту, когда горизонтальный критерий решит выключить
+// импульс: величина, зависящая от того, СКОЛЬКО СЕКУНД impульс успел
+// проработать, а не управляемая напрямую. Диагностика (два зерна с иначе
+// идентичным разделением) показала это буквально: зерно, чей импульс
+// случайно проработал на 42 с дольше, вошло в Coast с вертикальной
+// скоростью на ~400 м/с меньше — ровно то, что четыре десятка секунд
+// свободного торможения тяготением и должны снять (g·Δt) — и в результате
+// апоцентр и скорость входа в плотные слои у него оказались на порядок
+// ближе к реальным (по записям IFT), чем у второго. Реальный Super Heavy
+// не полагается на такую случайность: разворотный импульс гасит обе
+// составляющие снова.
+//
+// Апоцентр — не приближение (не "высота + v²/2g"), а точный кеплеров
+// апоцентр текущего вектора состояния (physics.ElementsFromState): он уже
+// учитывает и тангенциальную скорость, и её вклад в угловой момент. Метод —
+// бинарный поиск (тот же приём, что boosterCoastAoAOffset): наибольшая
+// вертикальная скорость, при которой апоцентр ЭТОЙ ЖЕ орбиты (с текущей
+// тангенциальной составляющей, которую отдельно правит горизонтальный канал)
+// не превышает цель. Радиальная скорость (вдоль nav.Frame.Up ≡ r̂) не влияет
+// на угловой момент h=r×v (радиальная составляющая параллельна r и не
+// участвует в произведении) — апоцентр меняется от неё монотонно через
+// энергию, поэтому поиск корректен без дополнительных оговорок.
+func (b *Booster) boostbackVerticalAccelCommand(nav orbit.NavState) float64 {
+	target := b.Config.BoosterTargetApoapsis
+	if target <= 0 {
+		return 0
+	}
+
+	pos := b.state.Position
+	vel := b.state.Velocity
+	up := nav.Frame.Up
+	vertical := vel.Dot(up)
+
+	apoapsisAt := func(v float64) float64 {
+		trial := vel.Add(up.Scale(v - vertical))
+		e := physics.ElementsFromState(pos, trial, b.elapsed)
+		if !e.Elliptical {
+			return math.Inf(1)
+		}
+		return e.ApoapsisAltitude
+	}
+
+	if vertical <= 0 || apoapsisAt(vertical) <= target {
+		// Уже не набирает высоту, либо и без поправки апоцентр в норме —
+		// править нечего (об уже пройденном апоцентре Coast позаботится
+		// сам, атмосферным торможением).
+		return 0
+	}
+
+	targetVert := 0.0
+	if apoapsisAt(0) > target {
+		// Даже полное гашение вертикальной скорости не укладывается в цель
+		// (весь избыток — в тангенциальной составляющей, которой здесь не
+		// распоряжаются) — честный предел: гасить дальше нечем.
+		targetVert = 0
+	} else {
+		lo, hi := 0.0, vertical
+		for i := 0; i < 24; i++ {
+			mid := (lo + hi) / 2
+			if apoapsisAt(mid) <= target {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		targetVert = lo
+	}
+
+	return -landingFeedbackGain * (vertical - targetVert)
+}
+
+func (b *Booster) boostbackTarget(nav orbit.NavState, dt float64) physics.Attitude {
+	if b.boostbackCommandedDir == (physics.Vec3{}) {
+		// Ещё не инициализирован: разворот начинается с ТЕКУЩЕЙ ориентации
+		// корпуса (унаследованной от связки, см. NewBooster), а не со
+		// мгновенного скачка на пересчитанную цель — то же обоснование, что
+		// и у coastCommandedDir/landingCommandedDir при первой инициализации.
+		b.boostbackCommandedDir = b.attitude.Orientation.Rotate(physics.Vec3{X: 1})
+	}
+
+	natural := b.boostbackCommandedDir
+	if accel := b.boostbackAccelCommand(nav); accel.Norm() > 1e-6 {
+		natural = accel
+	}
+
+	current := b.boostbackCommandedDir.Unit()
+	nat := natural.Unit()
+	remaining := math.Acos(physics.Clamp(current.Dot(nat), -1, 1))
+
+	alpha := b.reorientAngularAccel()
+	stopAngle := b.boostbackCommandedRate * b.boostbackCommandedRate / (2 * alpha)
+	if stopAngle >= remaining {
+		b.boostbackCommandedRate = math.Max(0, b.boostbackCommandedRate-alpha*dt)
+	} else {
+		b.boostbackCommandedRate += alpha * dt
+	}
+
+	step := math.Min(b.boostbackCommandedRate*dt, remaining)
+	if remaining > 1e-9 {
+		axis := current.Cross(nat)
+		if axis.Norm() > 1e-9 {
+			turn := physics.QuaternionFromAxisAngle(axis, step)
+			b.boostbackCommandedDir = turn.Rotate(current)
+		}
+	}
+
+	pitch, azimuth := nav.Frame.PitchAzimuth(b.boostbackCommandedDir)
+	return physics.Attitude{Pitch: pitch, Yaw: azimuth, Roll: 0}
+}
+
+// boostbackThrottle возвращает уставку тяги разворотного импульса —
+// Stage 4.15: доля от требуемой (boostbackAccelCommand) к располагаемой
+// тяге ТЕКУЩЕЙ группы камер, а не безусловно 1.0 (как было раньше на всём
+// протяжении Boostback). Тот же приём, что и landingThrottle: закон
+// наведения теперь сам говорит, СКОЛЬКО ускорения нужно, а не только куда
+// его направить — жечь на полную независимо от этого значило бы всегда
+// перегонять требуемую (x,v)→(0,0) траекторию мимо цели (см. историю
+// boostbackAccelCommand).
+func (b *Booster) boostbackThrottle(nav orbit.NavState) float64 {
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	available := perEngine * float64(b.propulsion.Commissioned)
+	if available <= 0 {
+		return 1.0
+	}
+	mass := b.dryMass() + b.state.FuelMass
+	required := b.boostbackAccelCommand(nav).Norm() * mass
+	return physics.Clamp(required/available, 0, 1)
+}
+
+// throttleCommand возвращает уставку тяги для текущей фазы.
+func (b *Booster) throttleCommand(nav orbit.NavState, dt float64) float64 {
+	switch b.phase {
+	case BoosterBoostback:
+		return b.boostbackThrottle(nav)
+	case BoosterLandingBurn:
+		raw := b.landingThrottle(nav)
+
+		// Сглаживание: без него команда пересчитывается заново каждый такт
+		// без памяти о предыдущей, турбонасос не успевает отозваться,
+		// и контур раскачивается вместо того, чтобы монотонно гасить
+		// снижение (см. filteredThrottle).
+		if dt > 0 {
+			decay := math.Exp(-dt / throttleFilterTime)
+			b.filteredThrottle = raw + (b.filteredThrottle-raw)*decay
+		} else {
+			b.filteredThrottle = raw
+		}
+		return physics.Clamp(b.filteredThrottle, 0, 1)
+	default:
+		b.filteredThrottle = 0
+		return 0
+	}
+}
+
+// dragDecel возвращает дополнительное замедление от лобового сопротивления
+// при текущей скорости и высоте, м/с².
+//
+// Посадочный импульс идёт почти вертикально (Pitch 90 — см. landingTarget
+// для LandingBurn), корпус подставлен потоку вдоль оси, и на входе в
+// плотные слои на сверхзвуке-трансзвуке сопротивление тормозит не хуже
+// части камер. landingThrottle до этой поправки считал располагаемое
+// замедление только от тяги, как в вакууме: нижний предел дросселирования
+// держался дольше, чем можно было себе позволить, — фактическое торможение
+// (тяга плюс сопротивление) обгоняло график ещё в воздухе, снижение
+// проваливалось за целевую скорость с большим запасом высоты, и бустер
+// вместо касания начинал всплывать, а после — терял ориентацию на новом,
+// никем не рассчитанном участке подъёма.
+func (b *Booster) dragDecel(nav orbit.NavState) float64 {
+	speed := nav.AirRelativeVelocity.Norm()
+	if speed < 1 || nav.DynamicPressure <= 0 {
+		return 0
+	}
+	mass := b.dryMass() + b.state.FuelMass
+	if mass <= 0 {
+		return 0
+	}
+	mach := speed / physics.Atmosphere(nav.Altitude).SoundSpeed
+	radius := b.Config.Diameter / 2
+	drag := nav.DynamicPressure * physics.DragCoefficient(mach) * math.Pi * radius * radius
+	return drag / mass
+}
+
+// landingThrottle возвращает уставку тяги на посадочном импульсе.
+//
+// Расписание корабля (entry.go:updateLandingBurn) переключает формулу
+// на границе фиксированной высоты flare — у корабля с его тягой и массой
+// это сходится, а у бустера с его втрое большей тяговооружённостью разрыв
+// формулы на границе раскачивал контур.
+//
+// Точная (без запаса) формула тормозного пути — need = g + (v²-vt²)/(2h) —
+// раскачивала контур ещё сильнее, и не из-за запаздывания турбонасоса:
+// её чувствительность к текущей скорости растёт как 1/h, и у самой воды
+// уходит в бесконечность. Любое отставание привода от команды (а оно есть
+// всегда — сглаживание ниже существует именно поэтому) означает, что
+// фактическая скорость чуть-чуть разошлась с той, что формула считает
+// точной траекторией, — а на такой чувствительности даже маленькое
+// расхождение требует уже совсем другой тяги. Экспериментально: без
+// запаса контур не просто колебался, а раскачивался нарастающе, и бустер
+// пришёл к воде на 159 м/с — хуже, чем без каких-либо доработок вовсе.
+//
+// Здесь — тот же гладкий профиль торможения v(h) = √(touchdown² + 2·a·h),
+// что и раньше, с постоянным (не растущим к земле) коэффициентом обратной
+// связи gain: по высоте гасит расхождение, но не усиливает его сам
+// с приближением к воде. Доля a от располагаемого запаса замедления
+// (decelBudget) взята заметно ниже единицы: реальная тяговая установка
+// время от времени проседает по тяге ниже уставки (турбонасос, качество
+// горения) сама по себе, безотносительно к тому, что просит эта формула, —
+// запас в графике торможения гасит эти просадки, не давая им превратиться
+// в набор скорости, который нечем компенсировать у самой воды. Ниже
+// формула отдельно не позволяет себе просить тягу меньше зависания, пока
+// цель ещё не достигнута, так что чрезмерный запас не грозит зависанием
+// в воздухе — только более ранним стартом полного торможения.
+//
+// Вертикальная составляющая формулы (want/need) вынесена в
+// landingRequiredThrust; здесь required — модуль ПОЛНОГО 3D вектора
+// (landingDesiredThrust, вертикаль+горизонталь, см. Stage 4.4) делится на
+// располагаемую тягу ТЕКУЩЕЙ группы, получая долю газа. До Stage 4.4 здесь
+// участвовала только вертикальная составляющая — если тратить часть тяги
+// на горизонтальную коррекцию, а дроссель считать только по вертикали,
+// суммарная тяга systематически недотягивала бы и до вертикальной, и до
+// горизонтальной цели разом. Число работающих камер само уже не
+// выбирается по ходу этой функции: оно решено раньше, в
+// updateLandingEngineGroup (необратимый даунселект по physical envelope
+// каждой группы — не по доле оставшейся высоты, как было исторически, см.
+// её комментарий).
+func (b *Booster) landingThrottle(nav orbit.NavState) float64 {
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(nav.Altitude).Pressure)
+	engines := float64(b.propulsion.Commissioned)
+	available := perEngine * engines
+	if available <= 0 {
+		return 0
+	}
+
+	desired, _, _, _ := b.landingAuthorityConstrainedThrust(nav)
+	required := desired.Norm()
+	b.landingRequiredThrustLast = required
+
+	_, aMaxCurrent := b.groupAccelEnvelope(nav, b.propulsion.Commissioned)
+	b.landingStoppingMarginLast = b.landingStoppingMargin(nav, aMaxCurrent)
+
+	return physics.Clamp(required/available, 0, 1)
+}
+
+// checkSplashdown фиксирует касание воды.
+func (b *Booster) checkSplashdown() {
+	if b.phase != BoosterLandingBurn || b.state.Altitude() > 0 {
+		return
+	}
+
+	descent := -b.state.RadialVelocity()
+	b.splashSpeed = descent
+
+	// Горизонтальная (ground-relative — относительно ЧЕГО именно касаемся,
+	// не относительно воздуха/ветра) составляющая — Stage 4.12.5: до этой
+	// правки soft/hard решалось ТОЛЬКО по вертикали (см. комментарий у
+	// splashHorizontalSpeed) — прямая формула, не через nav (его на этом
+	// такте здесь нет), но идентичная landingHorizontalVelocity/
+	// boosterTelemetry.HorizontalVelocity по построению.
+	up := b.state.Position.Unit()
+	groundVelocity := b.state.Velocity.Sub(physics.CorotatingVelocity(b.state.Position))
+	horizontal := groundVelocity.Sub(up.Scale(groundVelocity.Dot(up)))
+	b.splashHorizontalSpeed = horizontal.Norm()
+	b.splashTotalSpeed = math.Hypot(b.splashHorizontalSpeed, descent)
+
+	b.phase = BoosterSplashdown
+	b.propulsion.StopAll()
+
+	// LandingMissDistance (Stage 4.11, п.2) — обязательная метрика КАЖДОГО
+	// приводнения: горизонтальное расстояние от фактической точки касания
+	// до launchTarget. Разброс скорости приводнения (splashSpeed) и разброс
+	// точки приводнения (missDistance) — разные задачи (см. п.10 задания:
+	// можно мягко сесть далеко от площадки или точно попасть, но разбиться) —
+	// обе обязаны быть видны, ни одна не маскирует другую.
+	missDistance, _, _ := b.landingMiss(b.state.Position, b.elapsed)
+	b.landingMissDistanceLast = missDistance
+
+	// Stage 4.12.5: классификация — по ПОЛНОЙ скорости касания, не только
+	// по вертикали (см. комментарий у splashHorizontalSpeed) — иначе
+	// приводнение, скользящее боком на 100+ м/с при Vz=2 м/с, честно
+	// разрушающее корпус, логировалось бы как "мягкое".
+	const softLimit = 5.0
+	if b.splashTotalSpeed <= softLimit {
+		log.Printf("🌊 Бустер мягко приводнился на T+%.1f с: скорость %.1f м/с (верт. %.1f, гор. %.1f), промах %.0f м — "+
+			"опор нет, на плаву не удержится, заваливается",
+			b.elapsed, b.splashTotalSpeed, descent, b.splashHorizontalSpeed, missDistance)
+	} else {
+		log.Printf("💥 Бустер жёстко ударился о воду на T+%.1f с: скорость %.1f м/с (верт. %.1f, гор. %.1f), промах %.0f м",
+			b.elapsed, b.splashTotalSpeed, descent, b.splashHorizontalSpeed, missDistance)
+	}
+}
+
+// advanceTopple ведёт заваливание после приводнения к разрушению — тот же
+// приём, что и holdLandedAttitude для опрокинувшегося корабля (entry.go),
+// только безусловный: опор нет, устоять не на чем в принципе.
+func (b *Booster) advanceTopple(dt float64) {
+	a := &b.attitude
+	a.ControlTorque = physics.Vec3{}
+	a.SurfaceTorque = physics.Vec3{}
+	a.AeroTorque = physics.Vec3{}
+	a.UsingRCS = false
+
+	const (
+		rate  = 0.55 // угловая скорость завала, рад/с
+		limit = 85.0 // до разрушения, градусы
+	)
+
+	if b.toppleTilt >= limit {
+		if b.phase != BoosterDestroyed {
+			b.phase = BoosterDestroyed
+			log.Printf("💥 Бустер разрушился на T+%.1f с после приводнения", b.elapsed)
+		}
+		a.Omega = physics.Vec3{}
+		return
+	}
+	b.toppleTilt += rate * physics.RadToDeg * dt
+
+	up := b.state.Position.Unit()
+	forward := a.Orientation.Rotate(physics.Vec3{X: 1})
+	lean := forward.Sub(up.Scale(forward.Dot(up)))
+
+	var omega physics.Vec3
+	if n := lean.Norm(); n > 1e-6 {
+		hinge := up.Cross(lean.Scale(1 / n))
+		omega = a.Orientation.RotateInverse(hinge.Scale(rate))
+	}
+	a.Omega = omega
+
+	q := a.Orientation.Add(a.Orientation.Derivative(a.Omega).Scale(dt))
+	a.Orientation = q.Normalized()
+}
+
+// updateAttitude продвигает угловое движение бустера на шаг — то же
+// разложение на тела (собственная конструкция+топливо, двигатели у хвоста),
+// что и у Simulation.updateAttitude, но без несомой массы: после отделения
+// бустер ничего не везёт.
+// centerOfMassFraction возвращает положение центра масс от носа, доля
+// длины ступени (0…1) — то же распределение масс корпуса/топлива/камер,
+// что updateAttitude передаёт в AttitudeInput.CenterOfMass, вынесенное в
+// отдельный метод, чтобы gimbalArm и landingAvailableCorrectiveTorque
+// (Stage 4.6) не дублировали формулу.
+func (b *Booster) centerOfMassFraction() float64 {
+	cfg := b.Config
+	propellant := b.propulsion.PropellantMass()
+	mass := b.dryMass() + propellant
+
+	engineMass := cfg.FirstStage.EngineMass * cfg.FirstStage.EngineCount
+	ownDryMass := cfg.FirstStage.DryMass
+	bodyMass := math.Max(0, ownDryMass+propellant-engineMass)
+
+	if mass <= 0 {
+		return 0.5
+	}
+	return (bodyMass*0.5 + engineMass) / mass
+}
+
+// gimbalArm возвращает плечо от центра масс до плоскости качания камер, м —
+// та же геометрия, что updateAttitude передаёт в AttitudeInput.GimbalArm,
+// вынесенная в отдельный метод, чтобы landingBurnTarget мог посчитать
+// располагаемый момент качания камер тем же способом, не дублируя формулу
+// (см. п.14 Stage 4.4 — q-aware attitude maneuver).
+func (b *Booster) gimbalArm() float64 {
+	return (1 - b.centerOfMassFraction()) * b.Config.FirstStageLength
+}
+
+func (b *Booster) updateAttitude(dt float64, target physics.Attitude,
+	nav orbit.NavState, atm physics.AtmosphereState) {
+
+	cfg := b.Config
+	propellant := b.propulsion.PropellantMass()
+	mass := b.dryMass() + propellant
+
+	length := cfg.FirstStageLength
+	// Масса всех камер у хвоста — не только работающих сейчас: недействующая
+	// камера никуда физически не девается, её масса остаётся на месте.
+	engineMass := cfg.FirstStage.EngineMass * cfg.FirstStage.EngineCount
+
+	com := b.centerOfMassFraction()
+	arm := b.gimbalArm()
+
+	// Газоотвод вместо отдельных блоков РСУ: доступность момента проверяется
+	// по остатку газа наддува в баках (см. комментарий у ventGasAvailable
+	// ниже), а не по выдуманному отдельному бюджету.
+	if cfg.RCSMoment > 0 {
+		b.attitude.Config.RCSMoment = cfg.RCSMoment
+		if !b.ventGasAvailable() {
+			b.attitude.Config.RCSMoment = 0
+		}
+	}
+
+	thrust := b.propulsion.TotalThrust
+
+	// Per-engine карта на этот такт (Stage 4.5): позиции неизменны
+	// (b.engineLayout), тяга каждой камеры — актуальная (0 у погашенных —
+	// см. п.20 Stage 4.5, "stopped engines stay stopped": Engine.Thrust у
+	// остановленной камеры уже 0 сам по себе, не нужен отдельный фильтр).
+	var engines []EngineActuator
+	if len(b.engineLayout) == len(b.propulsion.Engines) {
+		engines = make([]EngineActuator, len(b.propulsion.Engines))
+		for i, e := range b.propulsion.Engines {
+			engines[i] = EngineActuator{
+				ID:      e.ID,
+				RadialX: b.engineLayout[i].X,
+				RadialY: b.engineLayout[i].Y,
+				Gimbal:  b.engineLayout[i].Gimbal,
+				Thrust:  e.Thrust,
+			}
+		}
+	}
+
+	b.attitude.Update(dt, AttitudeInput{
+		Target:           target,
+		Frame:            nav.Frame,
+		AirRelative:      nav.AirRelativeVelocity,
+		DynamicPressure:  nav.DynamicPressure,
+		Mach:             machNumber(nav.AirRelativeVelocity.Norm(), atm.SoundSpeed),
+		Thrust:           thrust,
+		Mass:             mass,
+		CarriedMass:      0,
+		EngineMass:       engineMass,
+		Length:           length,
+		Radius:           cfg.Diameter / 2,
+		CenterOfMass:     com,
+		GimbalArm:        arm,
+		EngineRingRadius: cfg.EngineRingRadius,
+		Controllable:     thrust > 0,
+		Engines:          engines,
+	})
+
+	if b.attitude.UsingRCS && cfg.RCSMoment > 0 {
+		fraction := b.attitude.ControlTorque.Norm() / cfg.RCSMoment
+		b.ventGas(cfg.RCSPropellantFlow * fraction * dt)
+	}
+}
+
+// ventGasAvailable сообщает, есть ли ещё чем стравливать газ наддува для
+// ориентации на пассивном участке (Coast — единственная фаза, где движки
+// не работают и качать нечем).
+//
+// Раньше у бустера был отдельный, ничем не обеспеченный бюджет "топлива
+// РСУ" (rcsPropellant, свой бак, не связанный с остальной моделью). Реальный
+// Super Heavy отдельных блоков РСУ не несёт: на пассивном участке
+// ориентацией распоряжаются решётчатые рули и стравливание горячего газа
+// наддува баков (то же автогенное давление, что держит баки под тягой) —
+// см. комментарий у RCSMoment в vehicle/config.go, профиль "starship".
+// Источник здесь — тот же остаток наддува (PressurantRemaining), которым
+// уже распоряжается сама двигательная установка (propulsion/tank.go) для
+// поддержания давления в баках: отдельного счётчика заводить не нужно,
+// газ на ориентацию и газ на наддув баков — один и тот же ресурс.
+func (b *Booster) ventGasAvailable() bool {
+	return b.propulsion.FuelTank.PressurantRemaining > 0 ||
+		b.propulsion.OxTank.PressurantRemaining > 0
+}
+
+// ventGas расходует kg газа наддува на ориентацию, поровну (по доле
+// остатка) из баков горючего и окислителя — тем же газом, что держит
+// в них давление, а не из отдельного, ничем не обеспеченного бюджета.
+func (b *Booster) ventGas(kg float64) {
+	fuel := &b.propulsion.FuelTank.PressurantRemaining
+	ox := &b.propulsion.OxTank.PressurantRemaining
+	total := *fuel + *ox
+	if total <= 0 {
+		return
+	}
+	used := math.Min(total, kg)
+	*fuel -= used * (*fuel / total)
+	*ox -= used * (*ox / total)
+}
+
+// cfgVacuumISP возвращает удельный импульс первой ступени в вакууме —
+// нужен только для NavState.ISP (PEG у бустера не используется, поле
+// заполняется для единообразия с остальным кодом).
+func cfgVacuumISP(cfg vehicle.Config) float64 {
+	return cfg.FirstStage.VacuumISP
+}
+
+// -----------------------------------------------------------------------------
+// Телеметрия бустера.
+// -----------------------------------------------------------------------------
+
+// BoosterTelemetry — снимок состояния возвращающегося бустера.
+type BoosterTelemetry struct {
+	Phase string `json:"phase"`
+
+	Altitude         float64 `json:"altitude"`
+	Latitude         float64 `json:"lat"`
+	Longitude        float64 `json:"lon"`
+	VerticalVelocity float64 `json:"verticalVelocity"`
+
+	// TotalVelocity — Stage 4.12.5: ground-relative полная скорость
+	// (√(HorizontalVelocity²+VerticalVelocity²)), СОГласовано с обоими
+	// полями ниже — до этой правки здесь стояла сырая ECI-норма
+	// (b.state.Velocity.Norm()), включающая вклад вращения Земли
+	// (~420 м/с на широте площадки на высоте отделения от Boostback) — при
+	// низких скоростях посадочного участка эта разница уже не пренебрежима,
+	// и в паре с HorizontalVelocity/VerticalVelocity (обе ground-relative)
+	// давала телеметрию, где TotalVelocity²≠Horizontal²+Vertical² —
+	// ровно то смешение систем отсчёта, аудит которого потребовал Stage
+	// 4.12.5.
+	TotalVelocity float64 `json:"totalVelocity"`
+
+	Pitch float64 `json:"pitch"`
+	Yaw   float64 `json:"yaw"`
+	Roll  float64 `json:"roll"`
+
+	FuelMass float64 `json:"fuelMass"`
+	// Throttle — среднее по работающим двигателям ФАКТИЧЕСКИ применённое
+	// значение (e.AppliedThrottle, после клэмпа MinThrottle внутри
+	// Engine.Update), а не запрос наведения — так было и раньше. Отдельно
+	// от него — RequiredThrust/EngineGroup/ThrottleLimited ниже, чтобы
+	// запрос guidance, физическую границу группы и реальную отработку
+	// нельзя было спутать под одним числом (см. разбор посадочного
+	// reboost — их смешение и было первопричиной).
+	Throttle float64 `json:"throttle"`
+
+	// RequiredThrust — суммарная тяга (Н), которую профиль торможения
+	// (landingThrottle/landingRequiredThrust) запросил на этом такте, ДО
+	// деления на располагаемую тягу текущей группы. Заполняется только на
+	// посадочном импульсе.
+	RequiredThrust float64 `json:"requiredThrust,omitempty"`
+
+	// EngineGroup — текущая (персистентная, необратимо убывающая на
+	// посадочном импульсе) группа камер — см. updateLandingEngineGroup.
+	EngineGroup int `json:"engineGroup,omitempty"`
+
+	// ThrottleLimited сообщает, что хотя бы один работающий двигатель
+	// сейчас удерживается на MinThrottle выше того, что запросило
+	// наведение (propulsion.Engine.ThrottleLimited) — то есть реальная
+	// тяга больше, чем "хотело" наведение на этом такте.
+	ThrottleLimited bool `json:"throttleLimited,omitempty"`
+
+	// StoppingMargin — запас высоты (м) сверх кинематически необходимого
+	// тормозного пути ТЕКУЩЕЙ группы камер на её максимуме газа
+	// (landingStoppingMargin) — отрицательный означает, что группа
+	// физически не успевает погасить вертикальную скорость до касания
+	// даже на полном газе (см. Stage 4.3, п.7,13). Заполняется только на
+	// посадочном импульсе.
+	StoppingMargin float64 `json:"stoppingMargin,omitempty"`
+
+	// HorizontalVelocity — модуль горизонтальной (относительно поверхности)
+	// составляющей скорости, м/с (см. landingHorizontalVelocity, Stage 4.4).
+	HorizontalVelocity float64 `json:"horizontalVelocity,omitempty"`
+
+	// HorizontalPositionError — модуль горизонтальной ошибки положения
+	// относительно launchTarget, м (см. landingHorizontalPositionError,
+	// Stage 4.12) — заполняется только на посадочном импульсе. Не участвует
+	// в управлении (Stage 4.12 нашла: при текущем vertical time-to-go
+	// position-aware закон на унаследованных от Boostback километрах
+	// промаха ухудшает touchdown speed — откат к Stage 4.11), но остаётся
+	// permanent telemetry для будущей работы над этим промахом.
+	HorizontalPositionError float64 `json:"horizontalPositionError,omitempty"`
+
+	// BodyTilt — угол между фактическим направлением тяги (ThrustDirection)
+	// и местной вертикалью, градусы. 0 — корпус строго вертикален,
+	// 90 — лежит на боку, 180 — двигателями вверх (см. Stage 4.4, п.1,20).
+	BodyTilt float64 `json:"bodyTilt,omitempty"`
+
+	// TargetTilt — угол между КОМАНДНЫМ (motion-profile, landingCommandedDir)
+	// направлением ориентации и местной вертикалью, градусы. До Stage 4.4
+	// был тождественно 0 на посадочном импульсе (строго вертикальная цель
+	// независимо от горизонтальной скорости) — теперь следует за desired
+	// thrust vector.
+	TargetTilt float64 `json:"targetTilt,omitempty"`
+
+	// DesiredThrustMagnitude — модуль полного 3D требуемого вектора тяги
+	// (landingDesiredThrust), Н. Совпадает с RequiredThrust — отдельное
+	// поле для наглядности рядом с DesiredThrustTilt.
+	DesiredThrustMagnitude float64 `json:"desiredThrustMagnitude,omitempty"`
+
+	// DesiredThrustTilt — угол требуемого (ещё до motion-profile) вектора
+	// тяги от местной вертикали, градусы (см. Stage 4.4, п.7,10,31).
+	DesiredThrustTilt float64 `json:"desiredThrustTilt,omitempty"`
+
+	// AngularStoppingMargin — запас (градусы) между оставшимся углом до
+	// цели ориентации и угловым тормозным путём на располагаемом угловом
+	// ускорении (см. landingBurnTarget, п.15,31 Stage 4.4). Отрицательный —
+	// профиль уже тормозит разворот, чтобы не проскочить цель.
+	AngularStoppingMargin float64 `json:"angularStoppingMargin,omitempty"`
+
+	// LandingGuidanceSaturated сообщает, что горизонтальная часть
+	// требуемой тяги была урезана ради вертикальной безопасности (см.
+	// landingDesiredThrust, п.8-9,29,31 Stage 4.4).
+	LandingGuidanceSaturated bool `json:"landingGuidanceSaturated,omitempty"`
+
+	// ControlMargin — запас (Н·м) между реально располагаемым
+	// корректирующим моментом (TVC+рули) и предсказанным аэродинамическим
+	// моментом для ПРИНЯТОГО кандидата направления, на последнем такте
+	// (см. landingAuthorityConstrainedThrust, Stage 4.6). Отрицательный —
+	// состояние вне authority даже после урезания горизонтальной
+	// коррекции до нуля.
+	ControlMargin float64 `json:"controlMargin,omitempty"`
+
+	// AuthorityLimited сообщает, что горизонтальная коррекция была урезана
+	// ИМЕННО из-за нехватки корректирующего момента против аэродинамики
+	// (в отличие от LandingGuidanceSaturated — там про нехватку тяги),
+	// Stage 4.6.
+	AuthorityLimited bool `json:"authorityLimited,omitempty"`
+
+	EnginesRunning int               `json:"enginesRunning"`
+	Engines        []EngineTelemetry `json:"engines"`
+	GridFins       []FlapTelemetry   `json:"gridFins,omitempty"`
+
+	// VentGasMass — остаток газа наддува в баках, кг: тот же ресурс, что
+	// поддерживает в них давление, и он же питает стравливание для
+	// ориентации на пассивном участке (см. ventGasAvailable). Отдельных
+	// блоков РСУ у бустера нет.
+	VentGasMass float64 `json:"ventGasMass"`
+
+	// HorizontalDistanceToTarget, DownrangeError, CrossrangeError — Stage
+	// 4.11, п.2: permanent landing miss telemetry, весь возврат (не только
+	// посадочный импульс). Цель — launchTarget (LandingTargetPosition =
+	// LaunchPosition, п.1), НЕ b.target (штатная точка приводнения). Downrange
+	// — остаток смещения ВДОЛЬ исходного курса отлёта (положительный — тело
+	// ещё не долетело обратно), Crossrange — боковой промах поперёк него
+	// (см. landingMiss).
+	HorizontalDistanceToTarget float64 `json:"horizontalDistanceToTarget"`
+	DownrangeError             float64 `json:"downrangeError"`
+	CrossrangeError            float64 `json:"crossrangeError"`
+
+	// LandingMissDistance — Stage 4.11, п.2: горизонтальное расстояние (м)
+	// от ФАКТИЧЕСКОЙ точки касания до launchTarget — заполняется только
+	// после приводнения (см. checkSplashdown), NaN до этого момента (не
+	// ноль — ноль был бы осмысленным "промах нулевой", CLAUDE.md).
+	LandingMissDistance Float `json:"landingMissDistance"`
+
+	// Splashdown/Destroyed — итог возврата: коснулся ли воды и разрушился ли.
+	Splashdown bool `json:"splashdown"`
+	Destroyed  bool `json:"destroyed"`
+
+	// SplashSpeed — Stage 4.12.5: ПОЛНАЯ скорость касания (√(верт.²+гор.²)),
+	// не только вертикальная — до этой правки поле (и soft/hard
+	// классификация в checkSplashdown) молча игнорировали горизонтальную
+	// составляющую, из-за чего приводнение с малым Vz, но большой Vh
+	// (Stage 4.11/4.12 canonical seed: Vh=86-173 м/с) выглядело бы
+	// "мягким". SplashVerticalSpeed/SplashHorizontalSpeed — та же величина
+	// разложенной, если нужна именно вертикаль или именно снос отдельно.
+	SplashSpeed           float64 `json:"splashSpeed,omitempty"`
+	SplashVerticalSpeed   float64 `json:"splashVerticalSpeed,omitempty"`
+	SplashHorizontalSpeed float64 `json:"splashHorizontalSpeed,omitempty"`
+	Tilt                  float64 `json:"tilt"`
+
+	// Scene — оси корпуса и направление потока в местном горизонте, для
+	// одновременной отрисовки второго тела в 3D рядом с кораблём.
+	Scene SceneTelemetry `json:"scene"`
+}
+
+// Telemetry собирает снимок состояния бустера. b может быть nil — метод
+// написан как функция пакета, а не как метод с проверкой получателя, чтобы
+// вызывающая сторона могла писать `boosterTelemetry(s.booster, ...)`
+// единообразно с остальными nil-безопасными билдерами.
+func boosterTelemetry(b *Booster, elapsed float64) *BoosterTelemetry {
+	if b == nil {
+		return nil
+	}
+
+	geo := physics.ECIToGeodetic(b.state.Position, elapsed)
+	frame := physics.NewLocalFrame(b.state.Position)
+	attitude := b.attitude.AttitudeIn(frame)
+	body := b.attitude.Orientation.Body()
+
+	// Permanent landing miss telemetry (Stage 4.11, п.2) — на всём возврате,
+	// не только на посадочном импульсе.
+	missDistance, missDownrange, missCrossrange := b.landingMiss(b.state.Position, elapsed)
+
+	vRel := b.state.AirRelativeVelocity()
+
+	scene := SceneTelemetry{
+		Forward: toScene(frame, body.Forward),
+		Right:   toScene(frame, body.Right),
+		Down:    toScene(frame, body.Down),
+		Downrange: greatCircleDistance(
+			b.Config.LaunchLatitude, b.Config.LaunchLongitude,
+			geo.Latitude, geo.Longitude),
+	}
+	if speed := vRel.Norm(); speed > 1 {
+		scene.Airflow = toScene(frame, vRel.Scale(-1/speed))
+	}
+	if speed := b.state.Velocity.Norm(); speed > 1 {
+		scene.Velocity = toScene(frame, b.state.Velocity.Scale(1/speed))
+	}
+
+	// Паспортная тяга одной камеры на текущей высоте — знаменатель, по
+	// которому 3D-сцена решает, на сколько ярко и длинно рисовать факел
+	// (scene3d.js:engineFaces, ratio = thrust/maxThrust). Без неё поле
+	// оставалось нулевым, и ratio всегда считался нулём: факелы бустера
+	// рисовались одинаковой минимальной длины независимо от реальной тяги.
+	maxThrust := vehicle.ThrustAtAltitude(b.Config.FirstStage, physics.Atmosphere(b.state.Altitude()).Pressure)
+
+	// Горизонтальная скорость и углы наклона (Stage 4.4) — см.
+	// BoosterTelemetry.HorizontalVelocity/BodyTilt/TargetTilt/DesiredThrustTilt.
+	ground := b.state.Velocity.Sub(physics.CorotatingVelocity(b.state.Position))
+	ge, gn, _ := frame.Decompose(ground)
+	horizontalSpeed := math.Hypot(ge, gn)
+
+	// HorizontalPositionError (Stage 4.12) — только Frame нужен из
+	// NavState, остальные поля landingHorizontalPositionError не читает.
+	horizontalPositionError := b.landingHorizontalPositionError(orbit.NavState{Frame: frame}).Norm()
+
+	tiltFromUp := func(v physics.Vec3) float64 {
+		if v.Norm() < 1e-9 {
+			return 0
+		}
+		return math.Acos(physics.Clamp(v.Unit().Dot(frame.Up), -1, 1)) * physics.RadToDeg
+	}
+	bodyTilt := tiltFromUp(b.attitude.ThrustDirection())
+	targetTilt := tiltFromUp(b.landingCommandedDir)
+	desiredThrustTilt := tiltFromUp(b.landingDesiredThrustLast)
+
+	throttle := 0.0
+	running := 0
+	throttleLimited := false
+	engines := make([]EngineTelemetry, len(b.propulsion.Engines))
+	for i, e := range b.propulsion.Engines {
+		engines[i] = EngineTelemetry{
+			ID:        e.ID,
+			Running:   e.Running,
+			Thrust:    e.Thrust,
+			MaxThrust: maxThrust,
+			ISP:       e.SpecificImpulse,
+		}
+		if e.Chamber != nil {
+			engines[i].ChamberTemp = e.Chamber.Temperature - 273.15
+		}
+		if e.Turbopump != nil {
+			engines[i].TurbineTemp = e.Turbopump.BearingTemperature - 273.15
+		}
+		if e.Running {
+			running++
+			throttle += e.AppliedThrottle
+			if e.ThrottleLimited {
+				throttleLimited = true
+			}
+		}
+	}
+	if running > 0 {
+		throttle /= float64(running)
+	}
+
+	var gridFins []FlapTelemetry
+	if set := b.attitude.Surfaces; set != nil && set.Count() > 0 {
+		gridFins = make([]FlapTelemetry, 0, set.Count())
+		for i, surface := range set.Surfaces {
+			gridFins = append(gridFins, FlapTelemetry{
+				Name:       surface.Name,
+				Deflection: set.Deflection[i] * physics.RadToDeg,
+				Command:    set.Command[i] * physics.RadToDeg,
+				Limit:      surface.MaxDeflection * physics.RadToDeg,
+				Area:       surface.Area,
+				Manual:     set.Manual[i],
+				Jammed:     set.Jammed[i],
+			})
+		}
+	}
+
+	return &BoosterTelemetry{
+		Phase: b.phase.String(),
+
+		Altitude:         b.state.Altitude(),
+		Latitude:         geo.Latitude,
+		Longitude:        geo.Longitude,
+		VerticalVelocity: b.state.RadialVelocity(),
+		TotalVelocity:    math.Hypot(horizontalSpeed, b.state.RadialVelocity()),
+
+		Pitch: attitude.Pitch,
+		Yaw:   attitude.Yaw,
+		Roll:  attitude.Roll,
+
+		FuelMass: b.propulsion.PropellantMass(),
+		Throttle: throttle,
+
+		RequiredThrust:  b.landingRequiredThrustLast,
+		EngineGroup:     b.propulsion.Commissioned,
+		ThrottleLimited: throttleLimited,
+		StoppingMargin:  b.landingStoppingMarginLast,
+
+		HorizontalVelocity:       horizontalSpeed,
+		HorizontalPositionError:  horizontalPositionError,
+		BodyTilt:                 bodyTilt,
+		TargetTilt:               targetTilt,
+		DesiredThrustMagnitude:   b.landingDesiredThrustLast.Norm(),
+		DesiredThrustTilt:        desiredThrustTilt,
+		AngularStoppingMargin:    b.landingAngularStoppingMarginLast * physics.RadToDeg,
+		LandingGuidanceSaturated: b.landingGuidanceSaturatedLast,
+		ControlMargin:            b.landingControlMarginLast,
+		AuthorityLimited:         b.landingMarginLimitedLast,
+
+		EnginesRunning: running,
+		Engines:        engines,
+		GridFins:       gridFins,
+
+		VentGasMass: b.propulsion.FuelTank.PressurantRemaining + b.propulsion.OxTank.PressurantRemaining,
+
+		HorizontalDistanceToTarget: missDistance,
+		DownrangeError:             missDownrange,
+		CrossrangeError:            missCrossrange,
+		LandingMissDistance:        Float(b.landingMissDistanceLast),
+
+		Splashdown:            b.phase == BoosterSplashdown || b.phase == BoosterDestroyed,
+		Destroyed:             b.phase == BoosterDestroyed,
+		SplashSpeed:           b.splashTotalSpeed,
+		SplashVerticalSpeed:   b.splashSpeed,
+		SplashHorizontalSpeed: b.splashHorizontalSpeed,
+		Tilt:                  b.toppleTilt,
+
+		Scene: scene,
+	}
+}

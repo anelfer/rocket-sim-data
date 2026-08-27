@@ -178,3 +178,83 @@ func TestOrbitalDragDecaysOrbit(t *testing.T) {
 	t.Logf("Потеря удельной энергии за 20000 с на высоте 200 км: %.1f Дж/кг",
 		initial-final)
 }
+
+// -----------------------------------------------------------------------------
+// Stage 2: осевое сопротивление зависит от того, какой конец корпуса
+// встречает поток (physics.AxialDragCoefficient) — регрессия на прежнюю
+// orientation-blind модель (один и тот же DragCoefficient(mach) для 0° и
+// 180° угла атаки при одном |cos α|).
+// -----------------------------------------------------------------------------
+
+// TestDragArea_EngineFirstExceedsNoseFirst — п.3: при одинаковых Mach и
+// |cos α| (только знак угла атаки различается — 10° против 170°) сопротивление
+// теперь обязано различаться, и тупой торец (170°, engine-first) обязан
+// давать БОЛЬШЕЕ сопротивление, чем нос (10°, nose-first) — не совпадать,
+// как было раньше.
+func TestDragArea_EngineFirstExceedsNoseFirst(t *testing.T) {
+	fm := ForceModel{Area: 60, SideArea: 600}
+	const mach = 4.0
+
+	noseFirst := fm.dragArea(mach, 10) // |cos 10°| ≈ |cos 170°|
+	engineFirst := fm.dragArea(mach, 170)
+
+	if engineFirst <= noseFirst {
+		t.Errorf("engine-first dragArea=%.1f не больше nose-first dragArea=%.1f при |cos α| практически равных",
+			engineFirst, noseFirst)
+	}
+}
+
+// TestDragArea_NoseFirstAscentUnchanged — regression: п.6 "nose-first
+// regression" — прямой подъём (малые углы атаки, около 0°) обязан по-прежнему
+// использовать ту же кривую, что и раньше (DragCoefficient), Stage 2 не имеет
+// права менять сопротивление на активном участке.
+func TestDragArea_NoseFirstAscentUnchanged(t *testing.T) {
+	fm := ForceModel{Area: 60, SideArea: 600}
+	for _, mach := range []float64{0.5, 0.9, 1.0, 1.1, 2, 3, 5} {
+		for _, aoa := range []float64{0, 2, 5, 10} {
+			got := fm.dragArea(mach, aoa)
+			a := aoa * physics.DegToRad
+			want := physics.DragCoefficient(mach)*fm.Area*math.Abs(math.Cos(a)) +
+				1.4*fm.SideArea*math.Abs(math.Sin(a))
+			if math.Abs(got-want) > 1e-9*math.Max(1, want) {
+				t.Errorf("mach=%.1f aoa=%.0f: dragArea=%.4f, ожидалось (старая формула)=%.4f", mach, aoa, got, want)
+			}
+		}
+	}
+}
+
+// TestDragArea_ContinuousThroughOrientationTransition — п.10/12 "Transition
+// test": переход через 90° угла атаки (где выбор ориентации переключается)
+// не должен давать скачок силы — осевая проекция площади |cos α| сама
+// стремится к нулю на этой границе, гася разницу коэффициентов.
+func TestDragArea_ContinuousThroughOrientationTransition(t *testing.T) {
+	fm := ForceModel{Area: 60, SideArea: 600}
+	const mach = 3.0
+
+	var prev float64
+	first := true
+	const step = 0.05
+	for aoa := 85.0; aoa <= 95.0; aoa += step {
+		got := fm.dragArea(mach, aoa)
+		if !first && math.Abs(got-prev) > 5 {
+			t.Errorf("aoa=%.2f: скачок dragArea %.2f → %.2f при переходе через 90°", aoa, prev, got)
+		}
+		prev = got
+		first = false
+	}
+}
+
+// TestForceModelDrag_IsAlwaysDissipative — п.13: сила сопротивления не
+// должна добавлять энергии — F_D·V_air ≤ 0 — ни для nose-first, ни для
+// engine-first, ни при каком проверенном числе Маха.
+func TestForceModelDrag_IsAlwaysDissipative(t *testing.T) {
+	state := VehicleState{Position: physics.Vec3{X: physics.EarthRadius + 20000}}
+	for _, aoa := range []float64{0, 10, 45, 89, 91, 135, 170, 180} {
+		fm := ForceModel{DryMass: 500000, Area: 60, SideArea: 600, AngleOfAttack: aoa}
+		acc := fm.Evaluate(state)
+		vRel := state.AirRelativeVelocityWithWind(physics.Vec3{})
+		if dot := acc.Drag.Dot(vRel); dot > 1e-6 {
+			t.Errorf("aoa=%.0f: Drag·V_air=%.3e > 0 — сопротивление добавляет энергию", aoa, dot)
+		}
+	}
+}

@@ -33,15 +33,28 @@
 const S3 = {
   cam: { yaw: 2.2, pitch: 0.22, dist: 320 },
   zoom: 1,          // во сколько раз оператор приблизил камеру
-  fitStage: null,   // ступень, под которую подобрана дальность
+  // fit — дальность камеры отдельно для корабля и для бустера (режимы
+  // «Корабль»/«Бустер», см. renderBody): у одной и той же дальности
+  // подгонка под пятидесятиметровый корабль тут же сбивается подгонкой
+  // под семидесятиметровый бустер и наоборот. Режим «Оба» (renderBoth)
+  // этими слотами не пользуется — там дальность считается заново каждый
+  // раз под оба тела сразу, см. buildComboCamera.
+  fit: { ship: { key: null, base: null }, booster: { key: null, base: null } },
   drag: null,
-  track: [],        // след трассы: широта и долгота
+  track: [],        // след трассы корабля на мини-глобусе, широта и долгота
   lastTime: -1,
   ready: false,
   showGrid: true,
   showFlow: true,
   followFlow: false,
   bodyCam: true,    // камера привязана к корпусу, а не к горизонту
+
+  // cameraTarget — что показывать: 'ship' | 'booster' | 'both'. Переключается
+  // вкладками #scene-target (см. initScene3D/renderSceneTargetTabs), не
+  // связано с #vehicle-tabs в app.js (тот выбирает адресата команд,
+  // а не то, что рисует камера, — вещи разные: можно управлять кораблём,
+  // разглядывая при этом бустер).
+  cameraTarget: 'ship',
 
   // Буфер последних состояний и номер хода отрисовки.
   buf: [],
@@ -133,11 +146,52 @@ function initScene3D() {
     S3.cam.yaw = 2.2;
     S3.cam.pitch = 0.22;
     S3.zoom = 1;
-    S3.fitStage = null;
+    S3.fit.ship.key = null;
+    S3.fit.booster.key = null;
     drawScene3D();
   };
 
+  // Делегированный обработчик: сам #scene-target не пересоздаётся, кнопки
+  // внутри — каждый кадр (см. renderSceneTargetTabs), и обычный onclick
+  // на кнопке норовил потеряться между нажатием и отпусканием (та же
+  // гонка, что уже лечили у #vehicle-tabs и #engine-strip в app.js).
+  const targetNav = document.getElementById('scene-target');
+  if (targetNav) targetNav.addEventListener('pointerdown', e => {
+    const btn = e.target.closest('[data-target]');
+    if (btn && !btn.disabled) S3.cameraTarget = btn.dataset.target;
+  });
+
   S3.ready = true;
+}
+
+const SCENE_TARGETS = [
+  { id: 'ship', title: 'Корабль' },
+  { id: 'booster', title: 'Бустер' },
+  { id: 'both', title: 'Оба' },
+];
+
+/* Перерисовывает вкладки выбора тела — каждый кадр, а не один раз при
+   инициализации: доступность «Бустер»/«Оба» зависит от того, есть ли он
+   сейчас (после отделения), а это меняется по ходу полёта. */
+function renderSceneTargetTabs(haveBooster) {
+  const nav = document.getElementById('scene-target');
+  if (!nav) return;
+  for (const target of SCENE_TARGETS) {
+    let btn = nav.querySelector(`[data-target="${target.id}"]`);
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.className = 'tab';
+      btn.dataset.target = target.id;
+      btn.textContent = target.title;
+      nav.appendChild(btn);
+    }
+    const disabled = target.id !== 'ship' && !haveBooster;
+    btn.disabled = disabled;
+    btn.title = disabled
+      ? 'Бустер сейчас не летит: носитель без активного возврата либо ступени ещё не разделились'
+      : '';
+    btn.classList.toggle('active', S3.cameraTarget === target.id);
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -336,9 +390,10 @@ function blendFrames() {
   out.throttle = mix(a.throttle, b.throttle);
   out.mach = mix(a.mach, b.mach);
 
+  const toScene = u => ({ e: u.x, n: u.y, u: u.z });
+
   const sa = a.scene, sb = b.scene;
   if (sa && sb) {
-    const toScene = u => ({ e: u.x, n: u.y, u: u.z });
     out.scene = {
       forward: toScene(vec(sa.forward, sb.forward)),
       right: toScene(vec(sa.right, sb.right)),
@@ -353,6 +408,36 @@ function blendFrames() {
     out.flaps = b.flaps.map((f, i) => ({
       ...f, deflection: mix(a.flaps[i].deflection, f.deflection),
     }));
+  }
+
+  // Бустер теперь рисуется каждый кадр наравне с кораблём (см. renderBody
+  // в renderScene), а не только пока за ним следит камера, — без своей
+  // интерполяции его отрисовка дёргалась бы между снимками там, где
+  // корабль уже плавно скользит.
+  const ba = a.booster, bb = b.booster;
+  if (ba && bb) {
+    out.booster = { ...bb };
+    out.booster.altitude = mix(ba.altitude, bb.altitude);
+    out.booster.totalVelocity = mix(ba.totalVelocity, bb.totalVelocity);
+    out.booster.verticalVelocity = mix(ba.verticalVelocity, bb.verticalVelocity);
+
+    const bsa = ba.scene, bsb = bb.scene;
+    if (bsa && bsb) {
+      out.booster.scene = {
+        forward: toScene(vec(bsa.forward, bsb.forward)),
+        right: toScene(vec(bsa.right, bsb.right)),
+        down: toScene(vec(bsa.down, bsb.down)),
+        airflow: toScene(vec(bsa.airflow, bsb.airflow)),
+        velocity: toScene(vec(bsa.velocity, bsb.velocity)),
+        downrange: mix(bsa.downrange, bsb.downrange),
+      };
+    }
+
+    if (ba.gridFins && bb.gridFins && ba.gridFins.length === bb.gridFins.length) {
+      out.booster.gridFins = bb.gridFins.map((f, i) => ({
+        ...f, deflection: mix(ba.gridFins[i].deflection, f.deflection),
+      }));
+    }
   }
   return out;
 }
@@ -384,22 +469,165 @@ function renderScene() {
     return;
   }
 
-  collectTrack(t);
-  fitCamera(t);
+  // Что показывать, решает оператор через #scene-target (см. initScene3D)
+  // — «Корабль» / «Бустер» / «Оба», хранится в S3.cameraTarget. «Бустер»
+  // и «Оба» сами откатываются на корабль, пока бустера нет: смотреть там
+  // не на что, а не показывать вовсе — хуже, чем молча остаться на корабле.
+  const haveBooster = !!t.booster;
+  const mode = haveBooster ? S3.cameraTarget : 'ship';
+  renderSceneTargetTabs(haveBooster);
 
-  const cam = buildCamera(t, w, h);
-  if (window.__scene) window.__scene.cam = cam; // для стенда
+  let cam;
+  if (mode === 'both') {
+    cam = renderBoth(ctx, 0, 0, w, h, t);
+  } else if (mode === 'booster') {
+    cam = renderBody(ctx, 0, 0, w, h, boosterFrame(t), 1, boosterHudLines(t.booster, t));
+  } else {
+    cam = renderBody(ctx, 0, 0, w, h, t, undefined, hudLines(t));
+  }
+  if (window.__scene) window.__scene.cam = cam;
+
+  // Мини-глобус всегда следит за кораблём — маршрут возврата бустера
+  // за десятки-сотни километров от него всё равно не поместился бы
+  // на той же проекции без отдельной перерисовки под второй трек,
+  // а корабль здесь главное тело.
+  collectTrack(t);
+  drawGlobe(t);
+}
+
+/* Один аппарат в своей прямоугольной области холста: та же камера/грани/
+   HUD, что были в renderScene() до разделения на два тела, только со
+   сдвигом и обрезкой под свой прямоугольник (x, y, w, h), а не на весь
+   холст. ctx.translate после clip — все внутренние функции отрисовки
+   по-прежнему считают, что им принадлежит область от (0,0) до (w,h). */
+function renderBody(ctx, x, y, w, h, active, onlyStage, lines) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.translate(x, y);
+
+  // Небо перерисовывается на каждое тело своей высотой: корабль на орбите
+  // и бустер над самой водой в один и тот же момент — обычное дело после
+  // отделения, и общее на двоих небо красило бы половину бустера чернотой
+  // космоса, до которого ему как до площадки.
+  drawSky(ctx, w, h, active.altitude || 0);
+
+  fitCamera(active);
+  const cam = buildCamera(active, w, h);
 
   const faces = [];
-  if (S3.showGrid) planetFaces(faces, t);
-  vehicleFaces(faces, t);
+  if (S3.showGrid) planetFaces(faces, active);
+  vehicleFaces(faces, active, onlyStage);
   drawFaces(ctx, faces, cam);
 
-  if (S3.showGrid) drawGroundGrid(ctx, cam, t);
-  if (S3.showFlow) drawArrows(ctx, cam, t);
+  if (S3.showGrid) drawGroundGrid(ctx, cam, active);
+  if (S3.showFlow) drawArrows(ctx, cam, active);
 
-  drawGlobe(t);
-  hudText(ctx, w, h, hudLines(t));
+  hudText(ctx, w, h, lines);
+  ctx.restore();
+  return cam;
+}
+
+/* Камера режима «Оба»: не следит за одним корпусом, а держит в кадре сразу
+   оба — цель между их условными центрами, дальность подобрана под больший
+   из двух корпусов и разнос между ними. Азимут, тангаж и приближение —
+   те же ручки оператора (S3.cam, S3.zoom), что и у обычной камеры;
+   привязка к грунту и «по потоку» здесь ни при чём — тела стоят не на
+   своей истинной высоте, а в общей точке сравнения, грунту в этом кадре
+   искать нечего. */
+function buildComboCamera(shipT, boosterT, sep, w, h) {
+  const yaw = S3.cam.yaw, pitch = S3.cam.pitch;
+  const shipLen = vehicleLength(shipT);
+  const boosterLen = boosterT ? vehicleLength(boosterT) : shipLen;
+  const dist = (sep + Math.max(shipLen, boosterLen) * 0.6) * 1.5 * S3.zoom;
+  S3.cam.dist = dist;
+
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const target = v3(0, sep / 2, 0);
+  const pos = vAdd(target, v3(
+    dist * cp * Math.sin(yaw),
+    dist * cp * Math.cos(yaw),
+    dist * sp));
+
+  const fwd = vUnit(vSub(target, pos));
+  let right = vCross(fwd, v3(0, 0, 1));
+  if (vLen(right) < 1e-6) right = v3(1, 0, 0);
+  right = vUnit(right);
+  const up = vCross(right, fwd);
+  return { pos, target, fwd, right, up, cx: w / 2, cy: h / 2, f: h * 1.15 };
+}
+
+/* Оба тела в одном кадре — не в истинном взаимном положении (после
+   отделения счёт идёт на километры, а то и сотни километров, в кадре
+   с различимыми деталями это всё равно не поместилось бы), а нарочно
+   разнесены на фиксированное расстояние вдоль мировой оси Y, каждое вокруг
+   своего начала координат со своей ориентацией — см. offset у bodyToWorld.
+   Ради этого режим и заведён: увидеть, куда развёрнут бустер относительно
+   корабля в тот же момент, а не гоняться взглядом за одним из них по
+   очереди (что и так умеют режимы «Корабль»/«Бустер»). Сетка земли и
+   стрелки потока здесь не рисуются: оба тела стоят не на своей истинной
+   высоте, и то, и другое было бы просто неверным. */
+function renderBoth(ctx, x, y, w, h, t) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.translate(x, y);
+
+  drawSky(ctx, w, h, t.altitude || 0);
+
+  const bt = boosterFrame(t);
+  const sep = Math.max(vehicleLength(t), bt ? vehicleLength(bt) : 0) * 1.8;
+  const cam = buildComboCamera(t, bt, sep, w, h);
+
+  const faces = [];
+  vehicleFaces(faces, t, undefined);
+  if (bt) vehicleFaces(faces, bt, 1, v3(0, sep, 0));
+  drawFaces(ctx, faces, cam);
+
+  hudText(ctx, w, h, hudLines(t), 'left', w / 2);
+  if (bt) hudText(ctx, w, h, boosterHudLines(t.booster, t), 'right', w / 2);
+
+  ctx.restore();
+  return cam;
+}
+
+/* Кадр бустера в форме, которую понимают функции отрисовки тела: та же
+   форма, что и у ship-телеметрии сцены (Scene, altitude, lat/lon), но
+   геометрия и оснастка — только первой ступени. */
+function boosterFrame(t) {
+  const b = t.booster;
+  if (!b) return null;
+  return {
+    time: t.time,
+    phase: b.phase,
+    stage: 1,
+    isBooster: true,
+    altitude: b.altitude,
+    lat: b.lat,
+    lon: b.lon,
+    scene: b.scene,
+    gridFins: b.gridFins,
+    engines: b.engines || [],
+    flaps: [],
+    heatShield: null,
+  };
+}
+
+/* Подписи для бустера — свой набор строк вместо ship-специфичных (мах,
+   скоростной напор, тепловой поток на входе, теплозащита у бустера
+   не считаются). t — полный кадр сцены, для общего модельного времени. */
+function boosterHudLines(b, t) {
+  if (!b) return ['бустер сейчас не летит'];
+  const fin = (b.gridFins || []).map(f => `${num(f.deflection, 0)}°`).join(' ');
+  const lines = [
+    `Бустер: ${b.phase} · T+${num(t.time, 0)} с`,
+    `высота ${num((b.altitude || 0) / 1000, 1)} км`,
+  ];
+  if (fin) lines.push(`рули ${fin}`);
+  if (b.destroyed) lines.push('РАЗРУШЕН: приводнился и завалился набок');
+  return lines;
 }
 
 /* Дальность камеры под то, что сейчас летит.
@@ -411,17 +639,27 @@ function renderScene() {
 function fitCamera(t) {
   const layout = S.layout;
   if (!layout?.stages?.length) return;
-  if (S3.fitStage === t.stage) return;
 
-  S3.base = vehicleLength(t) * 2.4;
-  S3.fitStage = t.stage;
+  const slot = t.isBooster ? S3.fit.booster : S3.fit.ship;
+  // Внутри одного тела ключ подгонки — это то, что меняет его длину:
+  // у корабля смена ступени (сброс второй, сама она короче связки),
+  // у бустера — ничего, ступень всегда первая.
+  const key = t.isBooster ? 'booster' : t.stage;
+  if (slot.key === key) return;
+
+  slot.base = vehicleLength(t) * 2.4;
+  slot.key = key;
 }
 
-/* Длина того, что сейчас летит: до разделения вся сборка, после — корабль. */
+/* Длина того, что сейчас летит: до разделения вся сборка, после — корабль
+   (или, при слежении за бустером, только первая ступень). */
 function vehicleLength(t) {
   const layout = S.layout;
   if (!layout?.stages?.length) return 120;
 
+  if (t.isBooster) {
+    return layout.stages.find(s => s.index === 1)?.length || layout.totalLength;
+  }
   return t.stage >= 2
     ? (layout.stages.find(s => s.index === 2)?.length || layout.totalLength)
     : layout.totalLength;
@@ -454,7 +692,8 @@ function buildCamera(t, w, h) {
     if (vLen(flow) > 0.5) yaw = Math.atan2(flow.x, flow.y) + Math.PI / 2;
   }
 
-  const dist = (S3.base || S3.cam.dist) * S3.zoom;
+  const base = (t.isBooster ? S3.fit.booster.base : S3.fit.ship.base) || S3.cam.dist;
+  const dist = base * S3.zoom;
   S3.cam.dist = dist;
 
   const cp = Math.cos(S3.cam.pitch), sp = Math.sin(S3.cam.pitch);
@@ -525,17 +764,25 @@ function project(p, cam) {
    из тех же данных, что и развёртка, — из /api/vehicle/layout.
    -------------------------------------------------------------------------- */
 
-function bodyToWorld(t) {
+// offset сдвигает построенное тело в мировых осях — по умолчанию нулевой
+// (тело строится в начале координат, как и раньше). Нужен только режиму
+// «Оба» (renderBoth): корабль и бустер там показаны не в истинном взаимном
+// положении (после отделения это километры, в кадре с деталями всё равно
+// не поместились бы), а нарочно разнесены на фиксированное расстояние,
+// каждый вокруг своего начала координат, — иначе, оба в буквальном центре,
+// их корпуса просто взаимно проступали бы друг сквозь друга на экране.
+function bodyToWorld(t, offset) {
   const f = vUnit(fromScene(t.scene?.forward) || v3(0, 0, 1));
   const r = vUnit(fromScene(t.scene?.right));
   const d = vUnit(fromScene(t.scene?.down));
+  const off = offset || v3();
 
   // Оси приходят готовой тройкой, и собирать матрицу из углов не нужно:
   // любое расхождение в порядке поворотов дало бы корабль, летящий боком.
   return p => v3(
-    f.x * p.x + r.x * p.y + d.x * p.z,
-    f.y * p.x + r.y * p.y + d.y * p.z,
-    f.z * p.x + r.z * p.y + d.z * p.z);
+    off.x + f.x * p.x + r.x * p.y + d.x * p.z,
+    off.y + f.y * p.x + r.y * p.y + d.y * p.z,
+    off.z + f.z * p.x + r.z * p.y + d.z * p.z);
 }
 
 /* Кольцо радиуса r на продольной координате x. */
@@ -550,17 +797,22 @@ function ring(x, r, segments) {
   return out;
 }
 
-function vehicleFaces(faces, t) {
+function vehicleFaces(faces, t, onlyStage, offset) {
   const layout = S.layout;
   if (!layout || !layout.stages?.length) return;
 
-  const toWorld = bodyToWorld(t);
+  const toWorld = bodyToWorld(t, offset);
   const seg = 20;
 
-  // После разделения рисуется только корабль.
-  const stages = t.stage >= 2
-    ? layout.stages.filter(s => s.index === 2)
-    : layout.stages;
+  // onlyStage — явный запрос нарисовать одну конкретную ступень (сейчас
+  // им пользуется только бустер: у него всегда первая, независимо от того,
+  // какая ступень активна у корабля в этом же кадре). Без явного запроса —
+  // прежнее правило: после разделения рисуется только корабль.
+  const stages = onlyStage != null
+    ? layout.stages.filter(s => s.index === onlyStage)
+    : t.stage >= 2
+      ? layout.stages.filter(s => s.index === 2)
+      : layout.stages;
 
   const total = stages.reduce((s, x) => s + x.length, 0);
 
@@ -591,7 +843,12 @@ function vehicleFaces(faces, t) {
       // плавников (сейчас это одно и то же семейство носителей), поэтому
       // им же гасится и рисовка плиток на чужой ракете.
       const tiled = stage.index === 2 && !!layout.flaps;
-      const top = stage === stages[0] && section === stage.sections[0];
+      // Купол/оживал — только у корабля. У бустера нос — плоская крышка
+      // бака (перед решёткой межступенного стыка), не купол: без этой
+      // оговорки booster-рендер (onlyStage === 1) наследовал носовую секцию
+      // корабля просто потому, что она первая по порядку в его собственном
+      // списке ступеней.
+      const top = onlyStage == null && stage === stages[0] && section === stage.sections[0];
 
       if (section.kind === 'nose' || top) {
         const coneLen = Math.min(section.length, r * 2.6);
@@ -615,16 +872,99 @@ function vehicleFaces(faces, t) {
     engineFaces(faces, toWorld, x, stage, t);
   }
 
-  // Плавники корабля.
-  //
-  // До разделения телеметрия про них молчит: ими никто не управляет, они
-  // прижаты к борту. Но стоят они на корабле с самого старта, и не рисовать
-  // их на выведении — значит показывать не ту машину.
-  const flaps = t.flaps?.length ? t.flaps : stowedFlaps(layout);
-  if (flaps.length) flapFaces(faces, toWorld, { ...t, flaps }, layout, total);
+  if (onlyStage === 1) {
+    // Решётчатые рули бустера — свои крепления, не по развёртке ship-flaps
+    // (для них нет привязок в /api/vehicle/layout, только у ship-flapMounts).
+    if (t.gridFins?.length) gridFinFaces(faces, toWorld, t.gridFins, total, layout.diameter / 2);
+  } else {
+    // Плавники корабля.
+    //
+    // До разделения телеметрия про них молчит: ими никто не управляет, они
+    // прижаты к борту. Но стоят они на корабле с самого старта, и не рисовать
+    // их на выведении — значит показывать не ту машину.
+    const flaps = t.flaps?.length ? t.flaps : stowedFlaps(layout);
+    if (flaps.length) flapFaces(faces, toWorld, { ...t, flaps }, layout, total);
 
-  // Свечение при входе.
-  plasmaFaces(faces, toWorld, t, layout.diameter / 2, total);
+    // Свечение при входе.
+    plasmaFaces(faces, toWorld, t, layout.diameter / 2, total);
+  }
+}
+
+/* Решётчатые рули бустера Super Heavy V3: три плоских щитка (не четыре),
+   практически у самого верха ступени, перед кольцом горячего разделения.
+
+   Раскладка — НЕ равномерное кольцо через сто двадцать градусов (так было
+   нарисовано раньше, и ровно то же по ошибке когда-то стояло и в physics
+   — simulator/vehicle/surfaces.go). По доступным фотографиям показа рулей
+   V3 (август 2025) раскладка T-образная: два рули друг напротив друга
+   ("порт"/"старборд", 180° друг от друга), третий — перпендикулярно им,
+   на стороне без башни. Азимуты (0°, 90°, 180°) захардкожены здесь ЖЁСТКО
+   СИНХРОННО с physics-стороной (vehicle.gridFinAzimuths) — единственный
+   источник правды по факту физики, а не по рисовке, но развёртки-привязки
+   как таковой между ними нет: азимуты и станция продублированы руками,
+   и при следующей правке geometry на физической стороне их придётся
+   поправить и здесь тоже.
+
+   Станция — 0.97 длины от среза сопел, то есть 0.03 длины от носа: та же
+   точка, что и в physics (GridFins→PositionFromNose = length·0.03,
+   simulator/vehicle/surfaces.go). Размах 7.5 м, ширина 3.75 м — те же
+   числа, что и там же (gridFinSpan/gridFinChord).
+   Форма, число щитков и раскладка по азимуту с бэкенда не читаются —
+   в отличие от ship-flapMounts, эта геометрия здесь не с телеметрии,
+   а зафиксирована руками: угол раскрытия и температура берутся из
+   телеметрии (то же FlapTelemetry, что и у плавников корабля), геометрия —
+   нет.
+
+   Бустер спускается двигателями вниз, носом вперёд по потоку: набегающий
+   воздух идёт вдоль продольной оси корпуса. Чтобы решётка вообще работала
+   (гасила и создавала момент обтеканием), её плоскость должна стоять
+   поперёк этого потока — размах радиально от борта наружу и поперёк
+   по окружности, — а не вдоль потока. Первая версия строила щиток
+   в плоскости (ось корпуса × радиус) — это разворачивало решётку на
+   девяносто градусов относительно набегающего потока, ребром по потоку
+   вместо лицом к нему. Здесь та же решётка стоит в плоскости
+   (радиус × поперёк потока), а рыскание (deflection) поворачивает эту
+   плоскость вокруг радиальной оси щитка — так руление видно как
+   разворот решётки, а не как её изгиб. */
+function gridFinFaces(faces, toWorld, fins, total, r) {
+  const station = total * 0.97;
+  const rad = Math.PI / 180;
+  const span = 7.5;   // вылет от борта наружу (по радиусу), м
+  const width = 3.75; // ширина решётки поперёк потока (по окружности), м
+
+  // Те же азимуты, что и vehicle.gridFinAzimuths (simulator/vehicle/surfaces.go):
+  // fin_1/fin_3 друг напротив друга (0°/180°), fin_2 перпендикулярно (90°).
+  const gridFinAzimuths = [0, Math.PI / 2, Math.PI];
+
+  fins.forEach((f, i) => {
+    const az = gridFinAzimuths[i] ?? (2 * Math.PI / fins.length) * i;
+    const s = Math.sin(az), c = Math.cos(az);
+    // Орт «поперёк потока» в плоскости (y, z) на этом азимуте — касательная
+    // к окружности корпуса, перпендикулярная радиальному орту (s, c).
+    const tc = c, ts = -s;
+
+    // Рыскание при рулении: поворот плоскости щитка вокруг его радиальной
+    // оси — часть поперечного размаха уходит в осевое смещение, и решётка
+    // видна развёрнутой, а не изогнутой.
+    const openA = (f.deflection || 0) * rad;
+    const cs = Math.cos(openA), sn = Math.sin(openA);
+    const halfW = width / 2;
+
+    // rr — радиус от оси корпуса, t — координата вдоль ширины щитка
+    // в его собственной (повёрнутой рысканьем) плоскости.
+    const p = (rr, t) => ({
+      x: station + t * sn,
+      y: rr * s + t * cs * tc,
+      z: rr * c + t * cs * ts,
+    });
+
+    const a0 = p(r, -halfW), a1 = p(r, halfW);
+    const b0 = p(r + span, -halfW), b1 = p(r + span, halfW);
+
+    const colour = f.manual ? [90, 120, 170] : [96, 100, 108];
+    faces.push({ p: [a0, a1, b1, b0].map(toWorld), c: colour });
+    faces.push({ p: [b0, b1, a1, a0].map(toWorld), c: colour }); // видна с обеих сторон
+  });
 }
 
 /* Цвет стороны по её температуре: холодная сталь серая, раскалённая
@@ -1324,17 +1664,50 @@ function hudLines(t) {
   return lines;
 }
 
-function hudText(ctx, w, h, lines) {
-  ctx.font = '12px ui-monospace, monospace';
+// align: 'left' (по умолчанию) — коробка у левого края, 'right' — у
+// правого. maxWidth — сколько места ей вообще отведено (по умолчанию весь
+// холст); в режиме «Оба» (renderBoth) там же два тела и два независимых
+// HUD, левый и правый, и без явного предела в половину холста они наползли
+// бы друг на друга посередине.
+function hudText(ctx, w, h, lines, align = 'left', maxWidth) {
+  const pad = 8;
+  let size = 12;
+  ctx.font = `${size}px ui-monospace, monospace`;
   ctx.textBaseline = 'top';
 
-  const pad = 8;
-  const width = Math.max(...lines.map(l => ctx.measureText(l).width)) + pad * 2;
+  // Строки HUD подобраны под ширину всего холста, а не под половину —
+  // самые длинные, например у корабля с плавниками и теплозащитой,
+  // в отведённый предел не помещаются. Раз строка не влезает — шрифт
+  // мельче, а не текст короче: цифры важнее миллиметровой точности букв.
+  const avail = Math.max(80, (maxWidth || w) - pad * 2 - 16);
+  let width = Math.max(...lines.map(l => ctx.measureText(l).width));
+  if (width > avail) {
+    size = Math.max(7, Math.floor(size * avail / width));
+    ctx.font = `${size}px ui-monospace, monospace`;
+    width = Math.max(...lines.map(l => ctx.measureText(l).width));
+  }
+
+  // Даже семи пикселей может не хватить — дальше мельчить нечитаемо. Тут
+  // уже не шрифт, а сами строки: обрезаем по символам с многоточием, лишь
+  // бы не резало посреди слова случайным клипом canvas.
+  if (width > avail) {
+    lines = lines.map(l => {
+      if (ctx.measureText(l).width <= avail) return l;
+      let cut = l;
+      while (cut.length > 1 && ctx.measureText(cut + '…').width > avail) cut = cut.slice(0, -1);
+      return cut + '…';
+    });
+    width = avail;
+  }
+
+  const lineHeight = size + 4;
+  const boxW = width + pad * 2;
+  const x0 = align === 'right' ? w - boxW - 8 : 8;
   ctx.fillStyle = 'rgba(8,12,18,0.55)';
-  ctx.fillRect(8, 8, width, lines.length * 16 + pad * 2 - 4);
+  ctx.fillRect(x0, 8, boxW, lines.length * lineHeight + pad * 2 - 4);
 
   ctx.fillStyle = '#c8d6e4';
-  lines.forEach((l, i) => ctx.fillText(l, 8 + pad, 8 + pad + i * 16));
+  lines.forEach((l, i) => ctx.fillText(l, x0 + pad, 8 + pad + i * lineHeight));
 }
 
 /* Наружу выходит только то, чем пользуются другие: отрисовка кадра и её

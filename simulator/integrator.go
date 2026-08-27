@@ -98,6 +98,31 @@ type ForceModel struct {
 	// Ноль трактуется как единица, чтобы нулевое значение структуры
 	// оставалось осмысленным.
 	DensityFactor float64
+
+	// FinForce — суммарная аэродинамическая сила управляющих поверхностей
+	// (решётчатых рулей, плавников) в мировых (ECI) осях, Н.
+	//
+	// Раньше эта сила участвовала только в r×F — вращении (см.
+	// SurfaceSet.UpdateTorque) — а в totalForce, идущую в RK4Step, не
+	// попадала вовсе: рули создавали момент, как будто сила, которая его
+	// вызывает, на поступательное движение корпуса никак не действует. Это
+	// нефизично — одна и та же сила не может толкать тело только на
+	// вращение, не толкая его центр масс, — и означало, что решётчатые
+	// рули бустера НИКОГДА не тормозили спуск, как бы ни были раскрыты.
+	//
+	// Здесь используется ТА ЖЕ сила, что уже посчитана для момента
+	// (SurfaceSet.Force, повёрнутая из связанных осей в мировые) — не
+	// отдельный, заново придуманный коэффициент сопротивления рулей.
+	// Зафиксирована на шаге тем же зероордерным удержателем, что и
+	// ThrustDir/Thrust: пересчитывать её на каждый RK4-подшаг означало бы
+	// пересчитывать саму геометрию/отклонение поверхности внутри шага,
+	// которого управляющий контур ориентации не видит (тот работает на
+	// своём, более мелком шаге — см. VehicleAttitude.Update).
+	//
+	// Нулевое значение (поле не заполнено — так для всех тел, кроме
+	// бустера) не меняет поведение: складывается с totalForce как нулевой
+	// вектор.
+	FinForce physics.Vec3
 }
 
 // densityFactor возвращает множитель плотности, приводя ноль к единице.
@@ -125,6 +150,11 @@ type Accelerations struct {
 	Mach      float64
 	Density   float64
 	DynamicQ  float64 // скоростной напор, Па
+
+	// FinForce — ускорение от силы управляющих поверхностей (ForceModel.FinForce
+	// / масса), мировые оси, м/с². Отдельно от Drag: это не сопротивление
+	// корпуса, а сила решётчатых рулей/плавников — см. ForceModel.FinForce.
+	FinForce physics.Vec3
 }
 
 // Evaluate вычисляет ускорения для заданного состояния.
@@ -172,9 +202,13 @@ func (fm ForceModel) Evaluate(s VehicleState) Accelerations {
 		acc.Drag = vRel.Unit().Scale(-dragForce / mass)
 	}
 
+	if fm.FinForce != (physics.Vec3{}) {
+		acc.FinForce = fm.FinForce.Scale(1 / mass)
+	}
+
 	acc.AngleOfAttack = fm.AngleOfAttack
 	acc.Area = fm.effectiveArea(fm.AngleOfAttack)
-	acc.Total = acc.Gravity.Add(acc.Thrust).Add(acc.Drag)
+	acc.Total = acc.Gravity.Add(acc.Thrust).Add(acc.Drag).Add(acc.FinForce)
 	return acc
 }
 
@@ -245,12 +279,20 @@ func SpecificEnergy(s VehicleState) float64 {
 // dragArea возвращает произведение коэффициента сопротивления на площадь, м².
 //
 // Продольная и поперечная составляющие считаются раздельно: у цилиндра,
-// поставленного поперёк потока, коэффициент около полутора против трёх
-// десятых у него же носом вперёд.
+// поставленного поперёк потока, коэффициент около полутора против осевого
+// у него же вдоль потока. Осевой коэффициент, в свою очередь, зависит от
+// того, какой конец корпуса встречает поток — см. physics.AxialDragCoefficient:
+// обтекаемый нос и тупой торец с двигателями дают разное сопротивление при
+// одном и том же |cos α|, и раньше это различие терялось (angleOfAttack
+// попадал сюда только через math.Abs(cos(...)) — знак, а с ним и
+// ориентация, стирался до выбора коэффициента). Здесь ориентация
+// определяется ДО взятия модуля, по полному (беззнаковому, 0…180°) углу
+// атаки — см. physics.OrientationFromAngleOfAttack.
 func (fm ForceModel) dragArea(mach, angleOfAttack float64) float64 {
 	const crossflowCd = 1.4
 
-	axial := physics.DragCoefficient(mach)
+	orientation := physics.OrientationFromAngleOfAttack(angleOfAttack)
+	axial := physics.AxialDragCoefficient(mach, orientation)
 	if fm.SideArea <= 0 {
 		return axial * fm.Area
 	}

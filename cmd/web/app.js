@@ -43,6 +43,12 @@ const S = {
 
   // Двигатель, которому адресуются команды. Пусто — вся ступень.
   target: '',
+
+  // Аппарат, которому адресуются команды и за которым следит панель:
+  // 'ship' (по умолчанию, прежнее поведение) или 'booster' — возвращающийся
+  // бустер, когда он есть (Config.BoosterReturn). На Falcon 9 и до отделения
+  // бустера вкладка «Бустер» просто нечего не показывает.
+  vehicle: 'ship',
 };
 
 const SUBSYSTEMS = [
@@ -401,6 +407,8 @@ function onSnapshot(s) {
   // Оператор при этом видел живые цифры вверху и мёртвые везде остальные.
   // Ошибка в одном узле не должна останавливать пульт.
   collectSeries(s);
+  guarded('вкладки аппарата', renderVehicleTabs);
+  guarded('бустер', () => renderBoosterPanel(s.telemetry?.booster));
   guarded('блок двигателей', renderEngineStrip);
   guarded('турбонасосы', renderPumps);
   guarded('указатель ориентации', drawAttitude);
@@ -556,9 +564,19 @@ function collectSeries(s) {
 /* Снимок величин собирается из тех же полей, что показывает сервер. */
 function sampleFromSnapshot(s) {
   const out = {};
-  for (const v of s.values || []) {
+  for (const v of activeValues()) {
     if (v.actual !== null && v.actual !== undefined) out[readsOf(v.id)] = v.actual;
   }
+
+  // У бустера нет отдельной структуры телеметрии двигательной установки
+  // (s.telemetry.propulsion — только у корабля): те же величины уже собраны
+  // сервером в плоскую карту boosterSample (control_snapshot.go), тем же
+  // способом, каким s.board.Effects()/controlSample() строит её для корабля.
+  if (S.vehicle === 'booster') {
+    Object.assign(out, s.boosterSample || {});
+    return out;
+  }
+
   const p = s.telemetry && s.telemetry.propulsion;
   if (!p) return out;
   const e = p.engine || {};
@@ -698,12 +716,16 @@ function buildThrottlePanel() {
   ignite.title = 'Запускает все камеры ступени в обход наведения — например, ' +
     'на орбите, где сама автоматика газ не даёт. Тягу после зажигания задайте ' +
     'ползунком или пресетом';
-  ignite.onclick = igniteAll;
+  ignite.onclick = () => {
+    if (!vehicleActionAllowed()) return;
+    igniteAll();
+  };
   buttons.append(ignite);
 
   const off = el('button', 'btn btn-sm btn-crit', 'Погасить все двигатели');
   off.title = 'Снимает команду со всех камер ступени и обнуляет уставку тяги';
   off.onclick = () => {
+    if (!vehicleActionAllowed()) return;
     action('emergency-shutdown');
     setBoth(0);
     THR.manual = true;
@@ -898,6 +920,7 @@ function renderPumpButtons() {
       b.title = a.hint || '';
       b.onclick = () => {
         if (a.restore) {
+          if (!vehicleActionAllowed()) return;
           action('restore-nominal');
           THR.manual = false;
           toast('ok', 'Штатный режим', 'Все воздействия сняты');
@@ -929,7 +952,7 @@ function renderPumpButtons() {
    отказ одного агрегата обязан быть виден на фоне остальных восьми. */
 function renderEngineStrip() {
   const box = $('#engine-strip');
-  const engines = S.snapshot?.engines || [];
+  const engines = activeEngines();
   if (!engines.length) {
     box.replaceChildren(el('div', 'muted', 'Нет данных'));
     return;
@@ -965,7 +988,10 @@ function renderEngineStrip() {
     // висит один делегированный слушатель на #engine-strip — сам контейнер
     // не пересоздаётся никогда, и клик долетает независимо от того,
     // сколько раз плитки внутри перерисовались между нажатием и отпусканием.
-    if (!e.running) {
+    // Точечное зажигание — команда наведению корабля (/api/sim/ignite/{id}),
+    // у бустера ей адресовать нечего: его камеры зажигаются и гаснут сами,
+    // по фазе возврата (см. vehicleActionAllowed).
+    if (!e.running && S.vehicle !== 'booster') {
       const ignite = el('button', 'eng-ignite', 'Зажечь');
       ignite.dataset.igniteEngine = e.id;
       ignite.title = `Запустить только ${e.id}, минуя наведение`;
@@ -1007,8 +1033,8 @@ function setTarget(id) {
 
 function renderPumps() {
   const grid = $('#pump-grid');
-  const all = S.snapshot?.pumps || [];
-  const shown = S.target || S.snapshot?.selected || '';
+  const all = activePumps();
+  const shown = S.target || activeSelected();
   const pumps = all.filter(p => p.engine === shown);
 
   if (!pumps.length) { grid.replaceChildren(el('div', 'muted', 'Нет данных')); return; }
@@ -1121,7 +1147,7 @@ function project(v, cx, cy, k) {
 
 function drawAttitude() {
   const canvas = $('#attitude-canvas');
-  const t = S.snapshot?.telemetry;
+  const t = S.vehicle === 'booster' ? S.snapshot?.telemetry?.booster : S.snapshot?.telemetry;
   if (!canvas || !t) return;
 
   const dpr = window.devicePixelRatio || 1;
@@ -1224,7 +1250,7 @@ function drawAttitude() {
 function renderKeyValues() {
   const box = $('#key-values');
   const sample = S.snapshot ? sampleFromSnapshot(S.snapshot) : {};
-  const manual = new Set((S.snapshot?.effects || []).map(e => readsOf(e.parameter)));
+  const manual = new Set(activeEffects().map(e => readsOf(e.parameter)));
   const alarmed = new Map((S.snapshot?.alarms || []).map(a => [a.key, a.severity]));
 
   box.replaceChildren();
@@ -1350,7 +1376,7 @@ function renderCausal() {
 
 function renderEffects() {
   const box = $('#effects');
-  const list = S.snapshot?.effects || [];
+  const list = activeEffects();
   if (!list.length) {
     box.replaceChildren(el('div', 'muted', 'Все параметры под управлением модели'));
     return;
@@ -1392,6 +1418,168 @@ function renderSubsystemTabs() {
     const b = el('button', `tab${S.subsystem === s.id ? ' active' : ''}`, s.title);
     b.onclick = () => { S.subsystem = s.id; renderSubsystemTabs(); renderParams(); };
     nav.append(b);
+  }
+}
+
+/* ===========================================================================
+   Адресат команд: корабль или бустер.
+
+   Переключение не совмещённая панель, а замена того, чем распоряжается
+   левая колонка и за чем следит сцена справа — то же решение, что и
+   у камеры (scene3d.js:boosterFrame): один пульт на аппарат за раз,
+   без полноценного сплит-скрина.
+   =========================================================================== */
+
+const VEHICLE_TABS = [
+  { id: 'ship',    title: 'Корабль' },
+  { id: 'booster', title: 'Бустер' },
+];
+
+/* Панели двигателей/насосов/параметров/воздействий читают одни и те же поля
+   снимка что у корабля, что у бустера — сервер отдаёт их под именами
+   engines/pumps/values/effects/selected и boosterEngines/boosterPumps/
+   boosterValues/boosterEffects/boosterSelected (ControlSnapshot,
+   control_snapshot.go). Эти чтения — единственное место, где выбирается,
+   какую половину снимка показывать; сами render-функции ничего не знают
+   про S.vehicle. */
+function activeEngines()  { return (S.vehicle === 'booster' ? S.snapshot?.boosterEngines  : S.snapshot?.engines)  || []; }
+function activePumps()    { return (S.vehicle === 'booster' ? S.snapshot?.boosterPumps    : S.snapshot?.pumps)    || []; }
+function activeValues()   { return (S.vehicle === 'booster' ? S.snapshot?.boosterValues   : S.snapshot?.values)   || []; }
+function activeEffects()  { return (S.vehicle === 'booster' ? S.snapshot?.boosterEffects  : S.snapshot?.effects)  || []; }
+function activeSelected() { return (S.vehicle === 'booster' ? S.snapshot?.boosterSelected : S.snapshot?.selected) || ''; }
+
+/* Зажигание/аварийное отключение/«штатный режим» идут через отдельные
+   REST-действия (/api/sim/ignite и т.п.), а не через пульт (control.Board),
+   и адресата не различают — они всегда относятся к кораблю: камеры бустера
+   зажигаются и гаснут только сами, по фазе возврата (setEngineGroup,
+   booster.go), ручного зажигания у него нет и в физической модели.
+   На вкладке «Бустер» эти кнопки предупреждают об этом вместо того, чтобы
+   молча подействовать на корабль, пока оператор думает, что командует
+   бустером. */
+function vehicleActionAllowed() {
+  if (S.vehicle !== 'booster') return true;
+  toast('warn', 'Недоступно для бустера',
+    'Камеры бустера зажигаются и гаснут автоматически по фазе возврата — ' +
+    'ручного зажигания и аварийного отключения у него нет.');
+  return false;
+}
+
+// switchVehicle меняет адресата команд и перерисовывает то, что от него
+// зависит. Вызывается из делегированного pointerdown на #vehicle-tabs
+// (bindControls), а не из onclick на самой кнопке — та же причина, что
+// и у #engine-strip: этот блок перерисовывается заново на каждый снимок
+// (renderVehicleTabs идёт из onSnapshot), и re-render иногда успевает
+// подменить нажатую кнопку между mousedown и mouseup, так что click
+// на ней не рождается вовсе — снаружи это выглядело как «вкладка
+// переключается через раз, помогает только частый клик».
+function switchVehicle(id) {
+  if (!id || S.vehicle === id) return;
+  S.vehicle = id;
+  // 3D-камера (S3.cameraTarget) сюда не привязана нарочно: за какой
+  // командой распоряжается левая панель и за чем следит камера — разные
+  // вопросы, у камеры теперь свой отдельный выбор («Корабль»/«Бустер»/
+  // «Оба», #scene-target в index.html) — можно управлять кораблём,
+  // разглядывая при этом бустер, и наоборот.
+  $('#booster-card')?.classList.toggle('hidden', id !== 'booster');
+
+  // Ship-cards ниже (блок двигателей, тяга, насосы, ориентация, ключевые
+  // показатели, воздействия) — не про конкретный аппарат, а про то, что
+  // сейчас выбрано в activeEngines()/activeValues()/... выше: на вкладке
+  // «Бустер» они показывают его двигательную установку, а не корабль.
+  // Прячется только карточка бустера — на корабле ей нечего показывать.
+
+  // Адресат по двигателю — от прежнего аппарата, и после переключения
+  // может не существовать у нового (S1-14 нет у корабля, и наоборот).
+  setTarget('');
+
+  renderVehicleTabs();
+  guarded('бустер', () => renderBoosterPanel(S.snapshot?.telemetry?.booster));
+  guarded('блок двигателей', renderEngineStrip);
+  guarded('турбонасосы', renderPumps);
+  guarded('ключевые показатели', renderKeyValues);
+  guarded('воздействия', renderEffects);
+  guarded('параметры', renderParamValues);
+}
+
+function renderVehicleTabs() {
+  const nav = $('#vehicle-tabs');
+  if (!nav) return;
+  const haveBooster = !!S.snapshot?.telemetry?.booster;
+
+  nav.replaceChildren();
+  for (const v of VEHICLE_TABS) {
+    const disabled = v.id === 'booster' && !haveBooster;
+    const b = el('button', `tab${S.vehicle === v.id ? ' active' : ''}`, v.title);
+    if (disabled) {
+      b.disabled = true;
+      b.title = 'Бустер сейчас не летит: носитель без активного возврата ' +
+        'либо ступени ещё не разделились';
+    }
+    b.dataset.vehicle = v.id;
+    nav.append(b);
+  }
+}
+
+/* Компактная карточка бустера: фаза возврата и цифры, которых нет у корабля
+   (решётчатые рули вместо плавников, приводнение вместо посадки на опоры).
+   Двигатели/насосы/параметры/воздействия бустер показывает в тех же
+   карточках, что и корабль (#ship-cards), просто на своих данных —
+   activeEngines()/activeValues()/... выше переключают источник по S.vehicle;
+   эта карточка — только то, что специфично для возврата и посадки. */
+function renderBoosterPanel(b) {
+  const box = $('#booster-body');
+  if (!box) return;
+  box.replaceChildren();
+
+  if (!b) {
+    box.append(el('div', 'muted',
+      'Бустер сейчас не летит. Появится после отделения первой ступени ' +
+      '(только у носителей с активным возвратом).'));
+    return;
+  }
+
+  const grid = el('div', 'kv-grid');
+  const row = (title, v, digits, unit, status) => {
+    const c = el('div', `kv s-${status || 'normal'}`);
+    c.append(el('span', null, title));
+    const bb = el('b', null, num(v, digits));
+    if (unit) bb.append(el('i', null, unit));
+    c.append(bb);
+    grid.append(c);
+  };
+  const textRow = (title, text) => {
+    const c = el('div', 'kv s-normal');
+    c.append(el('span', null, title));
+    c.append(el('b', null, text || '—'));
+    grid.append(c);
+  };
+
+  textRow('Фаза', b.phase);
+  row('Высота', b.altitude / 1000, 1, 'км');
+  row('Скорость', b.totalVelocity, 0, 'м/с');
+  row('Верт. скорость', b.verticalVelocity, 0, 'м/с',
+    b.verticalVelocity < -5 ? 'warning' : 'normal');
+  row('Тяга', (b.throttle || 0) * 100, 0, '%');
+  row('Двигателей', b.enginesRunning, 0);
+  row('Топливо', b.fuelMass / 1000, 1, 'т');
+  row('Газ наддува', b.ventGasMass, 0, 'кг');
+  box.append(grid);
+
+  if (b.gridFins?.length) {
+    const fins = el('div', 'muted');
+    fins.textContent = 'Решётчатые рули: ' +
+      b.gridFins.map(f => `${num(f.deflection, 0)}°`).join('  ');
+    box.append(fins);
+  }
+
+  if (b.splashdown) {
+    const outcome = el('div', `kv s-${b.destroyed ? 'critical' : 'warning'}`);
+    outcome.append(el('span', null,
+      b.destroyed ? 'ПРИВОДНИЛСЯ И РАЗРУШЕН' : 'ПРИВОДНИЛСЯ'));
+    const bb = el('b', null,
+      `${num(b.splashSpeed, 1)} м/с, крен ${num(b.tilt, 0)}°`);
+    outcome.append(bb);
+    box.append(outcome);
   }
 }
 
@@ -1652,7 +1840,7 @@ function paramCard(p) {
 
 /* Обновление значений в карточках параметров без перерисовки разметки. */
 function renderParamValues() {
-  const values = new Map((S.snapshot?.values || []).map(v => [v.id, v]));
+  const values = new Map(activeValues().map(v => [v.id, v]));
   for (const card of $$('#param-list .param')) {
     const v = values.get(card.dataset.id);
     if (!v) continue;
@@ -1693,6 +1881,10 @@ function submit(cmd) {
   // и адресовать его конкретному агрегату бессмысленно.
   const p0 = S.params.get(cmd.parameter);
   if (S.target && p0 && p0.subsystem !== 'tanks') cmd.engine = S.target;
+  // Аппарат — у корабля и бустера разные пульты (Simulation.Board /
+  // BoosterBoard); ship — значение по умолчанию на сервере, но здесь
+  // выставляется явно, чтобы не зависеть от угадывания по id двигателя.
+  cmd.vehicle = S.vehicle;
   cmd.operator = 'operator';
   cmd.source = 'ui';
   cmd.issuedAtModelTime = S.snapshot?.modelTime ?? 0;
@@ -3354,6 +3546,7 @@ async function boot() {
   S.chartKeys = PUMP_CHART_KEYS.slice();
 
   renderSubsystemTabs();
+  renderVehicleTabs();
   renderParams();
   renderPumpButtons();
   buildThrottlePanel();
@@ -3431,6 +3624,13 @@ function bindControls() {
     }
     const tile = ev.target.closest('[data-select-engine]');
     if (tile) setTarget(tile.dataset.selectEngine);
+  });
+
+  // Та же гонка перерисовки и та же лечба (pointerdown вместо click) —
+  // у вкладок «Корабль»/«Бустер», см. switchVehicle.
+  $('#vehicle-tabs')?.addEventListener('pointerdown', ev => {
+    const tab = ev.target.closest('[data-vehicle]');
+    if (tab && !tab.disabled) switchVehicle(tab.dataset.vehicle);
   });
 
   $('#btn-start').onclick = () => {

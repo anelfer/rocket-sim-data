@@ -146,8 +146,14 @@ type Telemetry struct {
 	EnginesRunning int               `json:"enginesRunning"`
 	Engines        []EngineTelemetry `json:"engines"`
 
-	// SpentStage — состояние отработавшей первой ступени, если она отделилась.
+	// SpentStage — состояние отработавшей первой ступени, если она отделилась
+	// и носитель не возвращает бустер активно (см. Booster).
 	SpentStage *env.SpentStageTelemetry `json:"spentStage,omitempty"`
+
+	// Booster — состояние возвращающегося бустера (RTLS, решётчатые рули,
+	// посадочный импульс), если носитель это поддерживает и разделение
+	// уже произошло.
+	Booster *BoosterTelemetry `json:"booster,omitempty"`
 
 	// Propulsion — состояние двигательной установки: баки, турбонасосы,
 	// камеры сгорания, сопла и охлаждение.
@@ -344,9 +350,10 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 	// повторяет состояние носителя: ступень летит, просто в его составе.
 	if s.spentStage != nil {
 		t.SpentStage = s.spentStage.Telemetry(s.elapsed)
-	} else {
+	} else if s.booster == nil {
 		t.SpentStage = s.attachedStageTelemetry(altitude, atm, vRel, mach, acc, geo)
 	}
+	t.Booster = boosterTelemetry(s.booster, s.elapsed)
 
 	t.Propulsion = s.buildPropulsionTelemetry()
 
@@ -546,6 +553,94 @@ func (t Telemetry) Publish() {
 				SemiMajorAxis:   d.SemiMajorAxis,
 				SemiMinorAxis:   d.SemiMinorAxis,
 				SurvivingMass:   d.SurvivingMassFraction,
+			})
+		}
+	} else if t.Booster != nil {
+		// У носителей с активным возвратом (BoosterReturn) отделившаяся
+		// ступень не пассивная баллистика (env.SpentStage), а сама летит
+		// бустером — см. performStageSeparation. t.SpentStage поэтому nil,
+		// и без этой ветки старые панели «Отработавшая первая ступень» в
+		// Grafana просто замирали бы на последнем значении перед разделением
+		// (Prometheus держит gauge как есть, пока его не обновят) — выглядит
+		// так, будто ступень зависла в пространстве. NaN вместо этого рисует
+		// разрыв графика, честно показывая «эта величина здесь больше не
+		// определена» (тот же приём, что и с stageBlackout выше и с NaN
+		// в апоцентре/перицентре на суборбитальном участке) — актуальные
+		// параметры ступени публикуются отдельно, панелью «Бустер».
+		metrics.SetSpentStage(metrics.SpentStageSample{
+			Altitude:      math.NaN(),
+			Latitude:      math.NaN(),
+			Longitude:     math.NaN(),
+			Speed:         math.NaN(),
+			Mach:          math.NaN(),
+			SkinTemp:      math.NaN(),
+			HeatFlux:      math.NaN(),
+			DynamicQ:      math.NaN(),
+			Outcome:       int(env.StageFlying),
+			SpinRate:      math.NaN(),
+			AngleOfAttack: math.NaN(),
+			ShockTemp:     math.NaN(),
+			Ionization:    math.NaN(),
+			PlasmaFreq:    math.NaN(),
+			// Attached: true здесь не значит "ступень в составе носителя" —
+			// это тот же флаг, что и раньше давал разрыв графика радиосвязи
+			// вместо ложного "связь есть" (см. SetSpentStage), переиспользован
+			// как признак "величина не определена" для единственного поля,
+			// которое иначе не NaN-able (bool, не float64).
+			Attached: true,
+		})
+	}
+
+	if b := t.Booster; b != nil {
+		phase := 0.0
+		switch b.Phase {
+		case BoosterCoast.String():
+			phase = 1
+		case BoosterLandingBurn.String():
+			phase = 2
+		case BoosterSplashdown.String():
+			phase = 3
+		case BoosterDestroyed.String():
+			phase = 4
+		}
+
+		sample := metrics.BoosterSample{
+			Phase:            phase,
+			Altitude:         b.Altitude,
+			Latitude:         b.Latitude,
+			Longitude:        b.Longitude,
+			VerticalVelocity: b.VerticalVelocity,
+			TotalVelocity:    b.TotalVelocity,
+			Pitch:            b.Pitch,
+			Yaw:              b.Yaw,
+			Roll:             b.Roll,
+			FuelMass:         b.FuelMass,
+			Throttle:         b.Throttle,
+			EnginesRunning:   float64(b.EnginesRunning),
+			VentGasMass:      b.VentGasMass,
+			Splashdown:       b.Splashdown,
+			Destroyed:        b.Destroyed,
+			SplashSpeed:      b.SplashSpeed,
+			Tilt:             b.Tilt,
+		}
+		for _, f := range b.GridFins {
+			sample.GridFins = append(sample.GridFins,
+				metrics.GridFinSample{Name: f.Name, Deflection: f.Deflection})
+		}
+		metrics.SetBooster(sample)
+
+		// Камеры бустера (S1-…) публикуются через тот же rocket_engine_*,
+		// что и у корабля — идентификаторы не пересекаются (см. комментарий
+		// у boosterAltitude в metrics.go).
+		for _, e := range b.Engines {
+			metrics.SetEngine(metrics.EngineSample{
+				ID:          e.ID,
+				Thrust:      e.Thrust,
+				ISP:         e.ISP,
+				ChamberTemp: e.ChamberTemp,
+				NozzleTemp:  e.NozzleTemp,
+				WallTemp:    e.WallTemp,
+				TurbineTemp: e.TurbineTemp,
 			})
 		}
 	}

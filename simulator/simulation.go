@@ -144,7 +144,15 @@ type Simulation struct {
 
 	// spentStage — отработавшая первая ступень. Продолжает интегрироваться
 	// отдельным телом до входа в атмосферу или удара о поверхность.
+	// Используется, только если носитель не возвращает бустер (см. booster).
 	spentStage *env.SpentStage
+
+	// booster — первая ступень после отделения на носителях с активным
+	// возвратом (Config.BoosterReturn): свой автопилот, свои двигатели,
+	// решётчатые рули, посадочный импульс. Шагает тем же тактом, что
+	// и основная симуляция (см. step()) — второй одновременно живой
+	// аппарат без второй горутины и без гонок.
+	booster *Booster
 
 	// wind — профиль ветра, разыгранный один раз на весь полёт.
 	wind env.WindModel
@@ -202,6 +210,11 @@ type Simulation struct {
 	// board — пульт ручных воздействий. Единственный путь, которым внешнее
 	// управление попадает в физическую модель.
 	board *control.Board
+
+	// boosterBoard — тот же пульт, но для бустера (см. booster). Существует
+	// только пока бустер жив: команда, адресованная ему после приводнения
+	// или на носителе без активного возврата, применяться уже не к чему.
+	boosterBoard *control.Board
 
 	// runState — состояние хода симуляции.
 	runState RunState
@@ -482,10 +495,16 @@ func (s *Simulation) initState() {
 	s.orbitCorrectionBurn = false
 	s.throttleCmd = 1.0
 	s.spentStage = nil
+	s.booster = nil
+	s.boosterBoard = nil
 
 	// Ориентация на столе — вертикальная, с азимутом пуска. Дальше корпус
 	// поворачивается только моментами.
-	s.attitude = VehicleAttitude{Config: DefaultAttitudeControl()}
+	attitudeCfg := DefaultAttitudeControl()
+	if cfg.MaxGimbalDegrees > 0 {
+		attitudeCfg.MaxGimbal = cfg.MaxGimbalDegrees * physics.DegToRad
+	}
+	s.attitude = VehicleAttitude{Config: attitudeCfg}
 	azimuth, _ := physics.LaunchAzimuthForInclination(
 		cfg.LaunchLatitude, cfg.TargetInclination, true)
 	s.attitude.Init(physics.Attitude{
@@ -909,13 +928,24 @@ func (s *Simulation) step(dt float64) {
 	// 9. Случайные отказы и события при малом остатке топлива.
 	s.applyRandomEvents(dt)
 
-	// 10. Отработавшая ступень летит своей траекторией.
+	// 10. Отработавшая ступень летит своей траекторией — либо пассивно
+	// (env.SpentStage), либо активно возвращается сама (booster), смотря
+	// что применимо для этого носителя. Тот же такт, что и у основной
+	// симуляции: второй аппарат живёт "одновременно" с первым именно
+	// потому, что шагает тем же dt на том же таймере, без второй горутины.
 	if s.spentStage != nil {
 		wasAlive := s.spentStage.Alive()
 		s.spentStage.Step(dt, s.elapsed)
 		if wasAlive && !s.spentStage.Alive() {
 			s.logSpentStageOutcome()
 		}
+	}
+	if s.booster != nil {
+		var boosterOverrides control.Overrides
+		if s.boosterBoard != nil {
+			boosterOverrides = s.boosterBoard.Advance(s.elapsed)
+		}
+		s.booster.Step(dt, s.elapsed, s.wind, s.dispersion.DensityFactor, boosterOverrides)
 	}
 
 	// 11. Проверка столкновения с поверхностью.

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"rocketTelemetrySim/control"
+	"rocketTelemetrySim/simulator/physics"
 	"rocketTelemetrySim/simulator/propulsion"
 )
 
@@ -191,6 +192,29 @@ type ControlSnapshot struct {
 
 	// Selected — двигатель, предлагаемый интерфейсом по умолчанию.
 	Selected string `json:"selected"`
+
+	// BoosterAvailable сообщает, есть ли сейчас второй аппарат под своим
+	// пультом (BoosterBoard): носитель с активным возвратом и ступени уже
+	// разделились. Остальные Booster*-поля ниже пусты, пока это не так.
+	BoosterAvailable bool `json:"boosterAvailable"`
+
+	// Booster* — то же самое, что Effects/Values/Engines/Pumps/Valves/Selected
+	// выше, но для бустера: у него своя двигательная установка (того же
+	// типа PropulsionSystem) и свой пульт, и путать воздействия одного
+	// с другим нельзя.
+	BoosterEffects  []control.View `json:"boosterEffects"`
+	BoosterValues   []ParamValue   `json:"boosterValues"`
+	BoosterEngines  []EngineView   `json:"boosterEngines"`
+	BoosterPumps    []PumpView     `json:"boosterPumps"`
+	BoosterValves   []ValveView    `json:"boosterValves"`
+	BoosterSelected string         `json:"boosterSelected"`
+
+	// BoosterSample — те же величины, что и BoosterValues, но в виде
+	// плоской карты "ключ → значение" (те же ключи, что видит сервер
+	// в control.Sample): интерфейсу так удобнее собирать сводку показателей
+	// (renderKeyValues в app.js), чем каждый раз искать нужный параметр
+	// по списку ParamValue.
+	BoosterSample control.Sample `json:"boosterSample,omitempty"`
 }
 
 // ControlSnapshot собирает состояние для интерфейса управления.
@@ -227,6 +251,24 @@ func (s *Simulation) ControlSnapshot() ControlSnapshot {
 	}
 	engine := s.propulsion.PrimaryEngine()
 	all := append([]*propulsion.Engine(nil), s.propulsion.Engines...)
+
+	// Бустер — под тем же мьютексом, что и всё остальное состояние: он
+	// живёт в том же такте (Simulation.step), что и корабль, и его список
+	// двигателей может смениться (setEngineGroup) между этим RLock и тем
+	// моментом, когда снимок дойдёт до интерфейса.
+	booster := s.booster
+	boosterBoard := s.boosterBoard
+	var boosterEngine *propulsion.Engine
+	var boosterAll []*propulsion.Engine
+	if booster != nil {
+		boosterEngine = booster.propulsion.PrimaryEngine()
+		boosterAll = append([]*propulsion.Engine(nil), booster.propulsion.Engines...)
+	}
+	boosterDt := s.Time.TickInterval.Seconds() * math.Max(s.Time.Scale, 0.01)
+	var boosterAxialAccel float64
+	if booster != nil {
+		boosterAxialAccel = booster.prevAxialAccel
+	}
 	s.mu.RUnlock()
 
 	snap.SentAt = time.Now().UnixMilli()
@@ -234,7 +276,7 @@ func (s *Simulation) ControlSnapshot() ControlSnapshot {
 	snap.Effects = s.board.Effects()
 
 	sample := tel.controlSample()
-	snap.Values = s.paramValues(sample)
+	snap.Values = paramValues(s.board, sample)
 	snap.Alarms = alarmsFor(sample)
 
 	// Адресные воздействия — по двигателям, чтобы интерфейс мог отметить,
@@ -268,6 +310,57 @@ func (s *Simulation) ControlSnapshot() ControlSnapshot {
 	if engine != nil {
 		snap.Selected = engine.ID
 	}
+
+	// Бустер отдаёт ровно те же срезы, что и корабль выше, только собранные
+	// по своей двигательной установке и своему пульту. Нет смысла заводить
+	// для него отдельные типы: PropulsionSystem и Board у обоих аппаратов
+	// один и тот же код, различается только то, чья это установка.
+	snap.BoosterAvailable = booster != nil && boosterBoard != nil
+	if snap.BoosterAvailable {
+		snap.BoosterEffects = boosterBoard.Effects()
+
+		boosterManual := make(map[string]bool)
+		for _, e := range snap.BoosterEffects {
+			if e.Engine != "" {
+				boosterManual[e.Engine] = true
+			}
+		}
+
+		boosterSample := propulsionControlSample(propulsionTelemetry(booster.propulsion, boosterDt, boosterAxialAccel))
+		boosterSample["vehicle.altitude"] = booster.state.Altitude() / 1000
+		boosterSample["vehicle.velocity"] = booster.state.Velocity.Norm()
+		boosterMass := booster.dryMass() + booster.state.FuelMass
+		boosterSample["vehicle.mass"] = boosterMass / 1000
+		if boosterMass > 0 {
+			boosterSample["vehicle.acceleration"] = booster.propulsion.TotalThrust / (boosterMass * physics.G0)
+		}
+		boosterSample = finalizeSample(boosterSample)
+		snap.BoosterSample = boosterSample
+
+		snap.BoosterValues = paramValues(boosterBoard, boosterSample)
+
+		boosterByID := make(map[string]propulsion.EngineTelemetry, len(boosterAll))
+		for _, e := range boosterAll {
+			boosterByID[e.ID] = e.Telemetry(boosterDt, e.Detailed)
+		}
+
+		snap.BoosterEngines = make([]EngineView, 0, len(boosterAll))
+		for _, e := range boosterAll {
+			snap.BoosterEngines = append(snap.BoosterEngines,
+				engineView(e, boosterByID[e.ID], boosterManual[e.ID]))
+		}
+
+		snap.BoosterPumps = make([]PumpView, 0, 2*len(boosterAll))
+		snap.BoosterValves = make([]ValveView, 0, 4*len(boosterAll))
+		for _, e := range boosterAll {
+			snap.BoosterPumps = append(snap.BoosterPumps, pumpViews(e, boosterByID[e.ID], snap.BoosterValues)...)
+			snap.BoosterValves = append(snap.BoosterValves, valveViews(e, boosterByID[e.ID])...)
+		}
+		if boosterEngine != nil {
+			snap.BoosterSelected = boosterEngine.ID
+		}
+	}
+
 	return snap
 }
 
@@ -303,10 +396,13 @@ func engineView(e *propulsion.Engine, t propulsion.EngineTelemetry, manual bool)
 	}
 }
 
-// paramValues строит состояние каждого управляемого параметра.
-func (s *Simulation) paramValues(sample control.Sample) []ParamValue {
-	effects := make(map[string]control.View, len(s.board.Effects()))
-	for _, e := range s.board.Effects() {
+// paramValues строит состояние каждого управляемого параметра для данного
+// пульта — общая функция для корабля (s.board) и бустера (s.boosterBoard):
+// оба пульта одного типа (control.Board), различается только то, каким
+// аппаратом он распоряжается.
+func paramValues(board *control.Board, sample control.Sample) []ParamValue {
+	effects := make(map[string]control.View, len(board.Effects()))
+	for _, e := range board.Effects() {
 		effects[e.Parameter] = e
 	}
 

@@ -21,6 +21,10 @@ import (
 // Board возвращает пульт воздействий этой симуляции.
 func (s *Simulation) Board() *control.Board { return s.board }
 
+// BoosterBoard возвращает пульт воздействий бустера — nil, пока бустер
+// не создан (носитель без активного возврата или до отделения).
+func (s *Simulation) BoosterBoard() *control.Board { return s.boosterBoard }
+
 // ControlSample возвращает снимок наблюдаемых величин на текущий момент.
 //
 // Нужен при приёме команды: относительные воздействия отсчитываются
@@ -50,8 +54,13 @@ func shieldValue(h *HeatShieldTelemetry, pick func(*HeatShieldTelemetry) float64
 	return pick(h)
 }
 
-func (t Telemetry) controlSample() control.Sample {
-	p := t.Propulsion
+// propulsionControlSample собирает величины, общие для любой двигательной
+// установки (турбонасос, клапаны, камера, сопло, баки) — общий код для
+// корабля (controlSample) и бустера (BoosterControlSample): установка
+// физически устроена одинаково что у активной ступени, что у RTLS-бустера
+// (тот же тип PropulsionSystem), и пульту незачем дважды описывать одни
+// и те же единицы измерения.
+func propulsionControlSample(p PropulsionTelemetry) control.Sample {
 	e := p.Engine
 
 	sample := control.Sample{
@@ -120,28 +129,45 @@ func (t Telemetry) controlSample() control.Sample {
 		"oxTank.pressurantFlow":   p.OxTank.PressurantFlow,
 		"fuelTank.depletionTime":  p.FuelTank.DepletionTime.Value(),
 		"oxTank.depletionTime":    p.OxTank.DepletionTime.Value(),
-
-		// Теплозащита появляется только у корабля и только после разделения.
-		// Пока её нет, величины не определены: ноль запаса означал бы, что
-		// корпус на пределе, а нулевое повреждение — что теплозащита цела.
-		"shield.tileMargin":  shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Tiles.Margin }),
-		"shield.steelMargin": shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Steel.Margin }),
-		"shield.damage": shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 {
-			return math.Max(h.Tiles.Damage, h.Steel.Damage)
-		}),
-		"shield.exposure": shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Exposure }),
-
-		"vehicle.angleOfAttack": t.TotalAoA,
-		"vehicle.pitchRate":     t.PitchRate,
-		"control.gimbalPitch":   t.GimbalPitch,
-		"control.gimbalDemand":  t.GimbalDemand,
-		"control.authority":     t.ControlAuthority,
-		"control.staticMargin":  t.StaticMargin,
-
-		"vehicle.altitude": t.Altitude / 1000,
-		"vehicle.velocity": t.TotalVelocity,
-		"vehicle.mass":     t.TotalMass / 1000,
 	}
+	return sample
+}
+
+// finalizeSample убирает неопределённые величины из снимка: пульт отличает
+// отсутствие данных от нуля, а NaN/Inf в JSON не сериализуются молча.
+func finalizeSample(sample control.Sample) control.Sample {
+	for k, v := range sample {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			delete(sample, k)
+		}
+	}
+	return sample
+}
+
+func (t Telemetry) controlSample() control.Sample {
+	p := t.Propulsion
+	sample := propulsionControlSample(p)
+
+	// Теплозащита появляется только у корабля и только после разделения.
+	// Пока её нет, величины не определены: ноль запаса означал бы, что
+	// корпус на пределе, а нулевое повреждение — что теплозащита цела.
+	sample["shield.tileMargin"] = shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Tiles.Margin })
+	sample["shield.steelMargin"] = shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Steel.Margin })
+	sample["shield.damage"] = shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 {
+		return math.Max(h.Tiles.Damage, h.Steel.Damage)
+	})
+	sample["shield.exposure"] = shieldValue(t.HeatShield, func(h *HeatShieldTelemetry) float64 { return h.Exposure })
+
+	sample["vehicle.angleOfAttack"] = t.TotalAoA
+	sample["vehicle.pitchRate"] = t.PitchRate
+	sample["control.gimbalPitch"] = t.GimbalPitch
+	sample["control.gimbalDemand"] = t.GimbalDemand
+	sample["control.authority"] = t.ControlAuthority
+	sample["control.staticMargin"] = t.StaticMargin
+
+	sample["vehicle.altitude"] = t.Altitude / 1000
+	sample["vehicle.velocity"] = t.TotalVelocity
+	sample["vehicle.mass"] = t.TotalMass / 1000
 
 	// Продольная перегрузка — то, что чувствует конструкция: тяга минус
 	// сопротивление, отнесённые к массе.
@@ -150,14 +176,7 @@ func (t Telemetry) controlSample() control.Sample {
 			(t.TotalMass * physics.G0)
 	}
 
-	// Величины, которые ещё не определены, в снимок не попадают: пульт
-	// отличает отсутствие данных от нуля.
-	for k, v := range sample {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			delete(sample, k)
-		}
-	}
-	return sample
+	return finalizeSample(sample)
 }
 
 // calibrateBoard сообщает пульту штатные значения активной ступени.
@@ -188,6 +207,66 @@ func (s *Simulation) calibrateBoard() {
 		"tank.ox.mass":          s.propulsion.OxTank.Mass,
 	}
 	s.board.Calibrate(nominals)
+}
+
+// calibrateBoosterBoard заводит пульт бустера и сообщает ему штатные
+// значения его двигательной установки — тот же приём, что и calibrateBoard,
+// но по своей, куда более простой пропульсии (три центральные камеры,
+// без разделения на вакуумные и атмосферные). Вызывается один раз сразу
+// после появления бустера (см. performStageSeparation), под удержанным mu.
+func (s *Simulation) calibrateBoosterBoard() {
+	if s.booster == nil || s.booster.propulsion == nil {
+		return
+	}
+	e := s.booster.propulsion.PrimaryEngine()
+	if e == nil {
+		return
+	}
+	cfg := e.Config
+	p := s.booster.propulsion
+
+	s.boosterBoard = control.NewBoard()
+	s.boosterBoard.Calibrate(map[string]float64{
+		"tp.shaft.speed":        cfg.Turbopump.DesignSpeed * 60 / (2 * math.Pi),
+		"tp.shaft.speed_direct": cfg.Turbopump.DesignSpeed * 60 / (2 * math.Pi),
+		"chamber.pressure":      cfg.Chamber.NominalPressure / 1e6,
+		"nozzle.throat_area":    cfg.Nozzle.InitialThroatArea * 1e4,
+		"tank.fuel.pressure":    p.FuelTank.Config.TargetPressure / 1e3,
+		"tank.ox.pressure":      p.OxTank.Config.TargetPressure / 1e3,
+		"tank.fuel.temperature": p.FuelTank.Temperature,
+		"tank.ox.temperature":   p.OxTank.Temperature,
+		"tank.fuel.mass":        p.FuelTank.Mass,
+		"tank.ox.mass":          p.OxTank.Mass,
+	})
+}
+
+// BoosterControlSample возвращает снимок наблюдаемых величин бустера —
+// то же, что ControlSample у корабля (те же ключи: turbopump.*, chamber.*,
+// nozzle.*, valves.*, fuelTank.*/oxTank.*, engine.*, vehicle.*), но по
+// собственной двигательной установке бустера. Пульт бустера (BoosterBoard)
+// оперирует теми же идентификаторами параметров, что и пульт корабля —
+// именно поэтому и снимок должен называть величины теми же ключами, иначе
+// "Actual"/"Measured" в панели управления бустером всегда были бы пустыми.
+// Nil-снимок, если бустера сейчас нет: относительные команды к нему в этот
+// момент адресовать уже некому.
+func (s *Simulation) BoosterControlSample() control.Sample {
+	if s.booster == nil {
+		return nil
+	}
+	b := s.booster
+
+	dt := s.Time.TickInterval.Seconds() * math.Max(s.Time.Scale, 0.01)
+	sample := propulsionControlSample(propulsionTelemetry(b.propulsion, dt, b.prevAxialAccel))
+
+	sample["vehicle.altitude"] = b.state.Altitude() / 1000
+	sample["vehicle.velocity"] = b.state.Velocity.Norm()
+	mass := b.dryMass() + b.state.FuelMass
+	sample["vehicle.mass"] = mass / 1000
+	if mass > 0 {
+		sample["vehicle.acceleration"] = b.propulsion.TotalThrust / (mass * physics.G0)
+	}
+
+	return finalizeSample(sample)
 }
 
 // -----------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gorilla/mux"
 
@@ -426,11 +427,42 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, res)
 }
 
+// boosterEnginePrefix — префикс идентификатора двигателя бустера, тот же,
+// что задаёт NewBooster через StagePrefix у своей PropulsionSystem.
+const boosterEnginePrefix = "S1-"
+
+// commandVehicle решает, какому аппарату адресована команда: явное поле
+// Vehicle важнее угадывания по идентификатору двигателя, а идентификатор
+// двигателя — единственный ориентир для старых клиентов, которые поля
+// Vehicle ещё не знают.
+func commandVehicle(cmd control.Command) string {
+	if cmd.Vehicle != "" {
+		return cmd.Vehicle
+	}
+	if strings.HasPrefix(cmd.Engine, boosterEnginePrefix) {
+		return "booster"
+	}
+	return "ship"
+}
+
 // applyCommand — единая точка применения команды.
 //
 // Ею пользуются и REST, и поток по WebSocket: иначе проверки пришлось бы
-// повторять дважды, и они неизбежно разошлись бы.
+// повторять дважды, и они неизбежно разошлись бы. Адресат — корабль или
+// бустер — решается по commandVehicle: у каждого свой пульт и свой снимок
+// наблюдаемых величин, команда одного не задевает другого.
 func applyCommand(sim *simulator.Simulation, cmd control.Command) control.Result {
+	if commandVehicle(cmd) == "booster" {
+		board := sim.BoosterBoard()
+		if board == nil {
+			return control.Result{
+				ID:     cmd.ID,
+				Status: control.StatusRejected,
+				Reason: "бустер сейчас не летит: адресовать команду некому",
+			}
+		}
+		return board.Apply(cmd, sim.ModelTime(), sim.BoosterControlSample())
+	}
 	return sim.Board().Apply(cmd, sim.ModelTime(), sim.ControlSample())
 }
 
@@ -443,12 +475,16 @@ func releaseHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Parameter string `json:"parameter"`
 		ID        string `json:"id"`
+		Engine    string `json:"engine,omitempty"`
+		Vehicle   string `json:"vehicle,omitempty"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 
 	res := applyCommand(sim, control.Command{
 		ID:        payload.ID,
 		Parameter: payload.Parameter,
+		Engine:    payload.Engine,
+		Vehicle:   payload.Vehicle,
 		Mode:      control.ModeRelease,
 	})
 	writeJSON(w, res)

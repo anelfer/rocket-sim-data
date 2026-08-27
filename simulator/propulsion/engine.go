@@ -208,6 +208,12 @@ type Engine struct {
 	// воздействие конкретному агрегату, а не всей ступени сразу.
 	ID string
 
+	// Number — стабильный физический номер двигателя (1-based), Stage 4.10,
+	// п.1. У ступеней с введённой физической нумерацией (см.
+	// vehicle.EngineLayout.EngineNumber) совпадает с числовым суффиксом ID;
+	// 0 — не назначен (нумерация не вводилась для этой ступени).
+	Number int
+
 	Turbopump *Turbopump
 	Chamber   *Chamber
 	Nozzle    *Nozzle

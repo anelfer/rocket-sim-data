@@ -58,7 +58,17 @@ type PropulsionTelemetry struct {
 
 // buildPropulsionTelemetry собирает снимок. Вызывается под удержанным mu.
 func (s *Simulation) buildPropulsionTelemetry() PropulsionTelemetry {
-	sys := s.propulsion
+	dt := s.Time.TickInterval.Seconds() * math.Max(s.Time.Scale, 0.01)
+	return propulsionTelemetry(s.propulsion, dt, s.prevAxialAccel)
+}
+
+// propulsionTelemetry собирает снимок произвольной двигательной установки —
+// общий код для основной ступени (buildPropulsionTelemetry) и бустера
+// (BoosterControlSample, control_bridge.go): тип один и тот же
+// (PropulsionSystem), различается только то, чья это установка и какое
+// осевое ускорение у неё было на прошлом шаге (гидростатический напор
+// в баках считается по нему, см. комментарий у OutletPressure ниже).
+func propulsionTelemetry(sys *PropulsionSystem, dt, axialAccel float64) PropulsionTelemetry {
 	if sys == nil {
 		return PropulsionTelemetry{}
 	}
@@ -82,16 +92,8 @@ func (s *Simulation) buildPropulsionTelemetry() PropulsionTelemetry {
 
 	t.FuelTank = sys.FuelTank.Telemetry()
 	t.OxTank = sys.OxTank.Telemetry()
-	t.FuelTank.OutletPressure = sys.FuelTank.OutletPressure(s.prevAxialAccel)
-	t.OxTank.OutletPressure = sys.OxTank.OutletPressure(s.prevAxialAccel)
-
-	// Шаг для датчиков — модельное время между сборками телеметрии.
-	//
-	// Датчики запаздывают, дрейфуют и шумят, и всё это отсчитывается
-	// по модельному времени, а не по времени работы программы. На ускоренном
-	// прогоне за такт проходит несколько секунд модели, и брать здесь период
-	// такта значило бы замедлять приборы во столько же раз.
-	dt := s.Time.TickInterval.Seconds() * math.Max(s.Time.Scale, 0.01)
+	t.FuelTank.OutletPressure = sys.FuelTank.OutletPressure(axialAccel)
+	t.OxTank.OutletPressure = sys.OxTank.OutletPressure(axialAccel)
 
 	t.Engines = make([]propulsion.EngineTelemetry, 0, len(sys.Engines))
 	for _, e := range sys.Engines {

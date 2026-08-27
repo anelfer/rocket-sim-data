@@ -116,6 +116,13 @@ type Command struct {
 	// с указанным двигателем к нему всё равно относится целиком.
 	Engine string `json:"engine,omitempty"`
 
+	// Vehicle — аппарат, которому адресована команда: "" или "ship" —
+	// активная ступень (как раньше, единственный получатель), "booster" —
+	// возвращающийся бустер после отделения. У бустера свой пульт
+	// (Simulation.BoosterBoard) и своя двигательная установка — команда
+	// с этим полем не задевает корабль и наоборот.
+	Vehicle string `json:"vehicle,omitempty"`
+
 	Mode  Mode  `json:"mode"`
 	Basis Basis `json:"basis,omitempty"`
 	Curve Curve `json:"curve,omitempty"`

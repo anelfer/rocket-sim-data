@@ -87,6 +87,25 @@ type SceneFrame struct {
 	Flaps      []FlapTelemetry      `json:"flaps,omitempty"`
 	HeatShield *HeatShieldTelemetry `json:"heatShield,omitempty"`
 	Landing    *LandingTelemetry    `json:"landing,omitempty"`
+
+	// Booster — облегчённое состояние возвращающегося бустера, для плавной
+	// одновременной отрисовки второго тела в 3D между полными снимками.
+	Booster *BoosterSceneFrame `json:"booster,omitempty"`
+}
+
+// BoosterSceneFrame — минимум, нужный сцене для второго тела: оси корпуса,
+// положение, решётчатые рули. Тот же принцип, что и у основного SceneFrame —
+// не тащить сюда двигательную установку целиком ради плавности картинки.
+type BoosterSceneFrame struct {
+	Phase     string  `json:"phase"`
+	Altitude  float64 `json:"altitude"`
+	Latitude  float64 `json:"lat"`
+	Longitude float64 `json:"lon"`
+
+	Scene    SceneTelemetry  `json:"scene"`
+	GridFins []FlapTelemetry `json:"gridFins,omitempty"`
+
+	Destroyed bool `json:"destroyed"`
 }
 
 // SceneFrame возвращает кадр сцены по последнему опубликованному снимку.
@@ -112,6 +131,23 @@ func (s *Simulation) SceneFrame() SceneFrame {
 		Flaps:            t.Flaps,
 		HeatShield:       t.HeatShield,
 		Landing:          t.Landing,
+		Booster:          boosterSceneFrame(t.Booster),
+	}
+}
+
+// boosterSceneFrame сжимает полную телеметрию бустера до кадра сцены.
+func boosterSceneFrame(b *BoosterTelemetry) *BoosterSceneFrame {
+	if b == nil {
+		return nil
+	}
+	return &BoosterSceneFrame{
+		Phase:     b.Phase,
+		Altitude:  b.Altitude,
+		Latitude:  b.Latitude,
+		Longitude: b.Longitude,
+		Scene:     b.Scene,
+		GridFins:  b.GridFins,
+		Destroyed: b.Destroyed,
 	}
 }
 
