@@ -211,13 +211,27 @@ func TestDragArea_EngineFirstExceedsNoseFirst(t *testing.T) {
 func TestDragArea_NoseFirstAscentUnchanged(t *testing.T) {
 	fm := ForceModel{Area: 60, SideArea: 600}
 	for _, mach := range []float64{0.5, 0.9, 1.0, 1.1, 2, 3, 5} {
+		nose := physics.DragCoefficient(mach) * fm.Area
 		for _, aoa := range []float64{0, 2, 5, 10} {
 			got := fm.dragArea(mach, aoa)
-			a := aoa * physics.DegToRad
-			want := physics.DragCoefficient(mach)*fm.Area*math.Abs(math.Cos(a)) +
-				1.4*fm.SideArea*math.Abs(math.Sin(a))
-			if math.Abs(got-want) > 1e-9*math.Max(1, want) {
-				t.Errorf("mach=%.1f aoa=%.0f: dragArea=%.4f, ожидалось (старая формула)=%.4f", mach, aoa, got, want)
+			if got < 0 {
+				t.Fatalf("mach=%.1f aoa=%.0f: отрицательная площадь %.4f", mach, aoa, got)
+			}
+			// Выведение идёт носом вперёд с углом атаки в единицы градусов.
+			// На таких углах поперечное обтекание гонит напор q·sin²α —
+			// доли процента от полного, — и площадь сопротивления обязана
+			// остаться практически той же, что у чистого носа.
+			//
+			// Прежняя модель проекции площади брала поперечный член с
+			// |sin α| и на десяти градусах давала 158 м² против 15: почти
+			// вся «площадь выведения» состояла из борта, которого поток на
+			// этих углах почти не видит.
+			if ratio := got / nose; ratio > 1.3 {
+				t.Errorf("mach=%.1f aoa=%.0f: площадь %.2f м² против %.2f у чистого носа — "+
+					"поперечный член раздут в %.1f раза", mach, aoa, got, nose, ratio)
+			}
+			if aoa == 0 && math.Abs(got-nose) > 1e-9*math.Max(1, nose) {
+				t.Errorf("mach=%.1f: на нулевом угле атаки %.4f вместо %.4f", mach, got, nose)
 			}
 		}
 	}

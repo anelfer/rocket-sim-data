@@ -70,6 +70,47 @@ func CompositeInertia(ownMass, engineMass, carriedMass, radius, length, centerOf
 	}
 }
 
+// StageInertia возвращает тензор инерции ступени относительно её центра масс,
+// считая топливо ОТДЕЛЬНЫМ телом в своём собственном положении.
+//
+// Отличие от CompositeInertia в том, где находится топливо. Там оно входило в
+// массу собственной конструкции и потому размазывалось по всей длине ступени
+// вместе с ней; здесь у него своё положение (propX) и своя длина (propLength —
+// высота залитого столба), приходящие из геометрии баков и уровня их
+// заполнения. Для почти пустой ступени разница мала, для полной — велика:
+// топливо составляет три четверти её массы и сидит не там, где корпус.
+//
+// Тела и их положения (x отсчитывается от носа):
+//
+//   - конструкция без камер — тонкостенный цилиндр по длине, центр на L/2;
+//   - камеры — сосредоточенная масса у среза сопел, x = L;
+//   - топливо — сплошной цилиндр высотой propLength с центром в propX;
+//   - несомая масса (следующая ступень, нагрузка) — у носа, x = 0.
+//
+// Продольная (крен) составляющая складывается из собственных вкладов тел:
+// точечные массы на оси в неё не дают ничего, а топливо даёт — оно занимает
+// весь диаметр бака, и при вращении вокруг продольной оси его приходится
+// раскручивать.
+func StageInertia(structMass, engineMass, propMass, carriedMass,
+	propX, propLength, radius, length, centerOfMass float64) InertiaTensor {
+
+	structure := CylinderInertia(structMass, radius, length)
+	propellant := CylinderInertia(propMass, radius, propLength)
+
+	d := func(x float64) float64 {
+		v := x - centerOfMass
+		return v * v
+	}
+	shift := structMass*d(length/2) + engineMass*d(length) +
+		propMass*d(propX) + carriedMass*d(0)
+
+	return InertiaTensor{
+		Ixx: structure.Ixx + propellant.Ixx,
+		Iyy: structure.Iyy + propellant.Iyy + shift,
+		Izz: structure.Izz + propellant.Izz + shift,
+	}
+}
+
 // AngularAcceleration решает уравнения Эйлера относительно углового ускорения.
 //
 //	I·dω/dt + ω × (I·ω) = M
@@ -236,7 +277,7 @@ func (s AeroShape) AerodynamicTorque(
 	if normalMag > 1e-9 {
 		// Нормальная сила пропорциональна квадрату синуса угла атаки:
 		// так ведёт себя поперечное обтекание цилиндра.
-		cn := 1.2 * math.Sin(alpha) * math.Abs(math.Sin(alpha))
+		cn := CrossflowDragCoefficient * math.Sin(alpha) * math.Abs(math.Sin(alpha))
 		normalForce := dynamicPressure * s.SideArea() * cn
 
 		// Плечо: расстояние от центра масс до центра давления вдоль корпуса.

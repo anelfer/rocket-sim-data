@@ -91,6 +91,21 @@ type ForceModel struct {
 	// AngleOfAttack — угол между продольной осью и потоком, градусы.
 	AngleOfAttack float64
 
+	// BodyAxis — продольная ось корпуса, единичный вектор в осях ECI.
+	//
+	// По ней аэродинамическая сила получает НАПРАВЛЕНИЕ (physics.BodyAeroForce):
+	// осевая составляющая приложена вдоль корпуса, нормальная — поперёк, и
+	// под углом атаки их сумма отклонена от вектора скорости. Эта разница и
+	// есть подъёмная сила корпуса — единственное, чем возвращающаяся ступень
+	// правит траекторию, пока двигатели молчат.
+	//
+	// Нулевой вектор означает «ось не задана»: тогда вся сила прикладывается
+	// против скорости, как и прежде. Так летят тела, которым подъёмная сила
+	// не нужна или ещё не просчитана — обломки, отработавшая ступень,
+	// корабль (его вход на больших углах атаки — отдельная работа со своими
+	// замерами, см. место заполнения в booster.go).
+	BodyAxis physics.Vec3
+
 	// Wind — скорость воздуха относительно вращающейся Земли, в осях ECI.
 	Wind physics.Vec3
 
@@ -197,9 +212,15 @@ func (fm ForceModel) Evaluate(s VehicleState) Accelerations {
 		// носом: корабль влетал бы в плотные слои на первой космической
 		// и разбирался бы там от напора в мегапаскаль.
 		dragArea := fm.dragArea(acc.Mach, fm.AngleOfAttack)
-		dragForce := acc.DynamicQ * dragArea
-		acc.DragForce = dragForce
-		acc.Drag = vRel.Unit().Scale(-dragForce / mass)
+		acc.DragForce = acc.DynamicQ * dragArea
+
+		if fm.BodyAxis != (physics.Vec3{}) {
+			force := physics.BodyAeroForce(acc.DynamicQ, acc.Mach,
+				fm.Area, fm.SideArea, vRel.Unit(), fm.BodyAxis)
+			acc.Drag = force.Scale(1 / mass)
+		} else {
+			acc.Drag = vRel.Unit().Scale(-acc.DragForce / mass)
+		}
 	}
 
 	if fm.FinForce != (physics.Vec3{}) {
@@ -289,17 +310,8 @@ func SpecificEnergy(s VehicleState) float64 {
 // определяется ДО взятия модуля, по полному (беззнаковому, 0…180°) углу
 // атаки — см. physics.OrientationFromAngleOfAttack.
 func (fm ForceModel) dragArea(mach, angleOfAttack float64) float64 {
-	const crossflowCd = 1.4
-
-	orientation := physics.OrientationFromAngleOfAttack(angleOfAttack)
-	axial := physics.AxialDragCoefficient(mach, orientation)
-	if fm.SideArea <= 0 {
-		return axial * fm.Area
-	}
-
-	a := math.Abs(angleOfAttack) * physics.DegToRad
-	return axial*fm.Area*math.Abs(math.Cos(a)) +
-		crossflowCd*fm.SideArea*math.Abs(math.Sin(a))
+	// Одна формула на физику и на наведение — см. physics.BodyDragArea.
+	return physics.BodyDragArea(mach, angleOfAttack, fm.Area, fm.SideArea)
 }
 
 // effectiveArea возвращает площадь, подставленную потоку, м².

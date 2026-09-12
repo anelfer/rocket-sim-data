@@ -39,11 +39,39 @@ type SceneTelemetry struct {
 	// Нулевой вектор означает, что потока нет: в вакууме обдувать нечем.
 	Airflow SceneVector `json:"airflow"`
 
-	// Velocity — направление движения относительно инерциальной системы.
+	// Velocity — направление движения ОТНОСИТЕЛЬНО ПОВЕРХНОСТИ.
+	//
+	// Раньше здесь была инерциальная (ECI) скорость, и это ломало картинку.
+	// Инерциальная скорость включает переносную скорость вращения Земли —
+	// около 400 м/с на широте площадки. Пока аппарат идёт быстро, вклад
+	// теряется в общей величине; на возврате и посадке, где своя скорость
+	// сравнима с переносной, направления расходятся. Измерено на живом
+	// прогоне: 51.7° между инерциальным и относительно поверхности при
+	// |v_ECI|=469 м/с и |v_отн|=497 м/с.
+	//
+	// Рядом в той же сцене рисуется набегающий поток (Airflow), который
+	// считается относительно ВОЗДУХА. Две стрелки в разных системах отсчёта
+	// расходились на полсотни градусов без всякой физической причины — и
+	// это выглядело как «корпус, направление полёта и векторы не сходятся».
+	// Здесь та же система отсчёта, что у потока: расхождение между ними
+	// теперь означает ровно то, чем оно и является физически — снос ветром.
+	//
+	// Тот же переход и по той же причине уже сделан для скорости бустера в
+	// телеметрии (Stage 4.12.5, BoosterTelemetry.TotalVelocity).
 	Velocity SceneVector `json:"velocity"`
 
 	// Downrange — удаление от стартовой площадки по дуге большого круга, м.
 	Downrange float64 `json:"downrange"`
+
+	// Tower — вектор ОТ аппарата К основанию башни-ловушки в том же местном
+	// горизонте (восток, север, верх), м.
+	//
+	// Якорь, по которому сцена ставит башню относительно корпуса. Один
+	// вектор вместо широт и долгот: картинка не должна повторять
+	// преобразования координат — на десятках километров плоская земля
+	// расходится с моделью на заметную величину, и башня уезжала бы из-под
+	// садящейся ступени.
+	Tower SceneVector `json:"tower"`
 }
 
 // -----------------------------------------------------------------------------
@@ -105,6 +133,16 @@ type BoosterSceneFrame struct {
 	Scene    SceneTelemetry  `json:"scene"`
 	GridFins []FlapTelemetry `json:"gridFins,omitempty"`
 
+	// Tower, Catch — башня-ловушка глазами сцены: куда её поставить
+	// относительно корпуса и что показать о проходе зоны захвата.
+	// Полтысячи байт на кадр — цена того, чтобы промах относительно рук
+	// рисовался с той же частотой, что и сам корпус, а не рывками по
+	// полному снимку.
+	// Catch — что произошло (или ещё нет) на высоте захвата. Полтораста
+	// байт на кадр — цена того, чтобы промах относительно рук рисовался с
+	// той же частотой, что и сам корпус, а не рывками по полному снимку.
+	Catch CatchTelemetry `json:"catch"`
+
 	Destroyed bool `json:"destroyed"`
 }
 
@@ -147,6 +185,7 @@ func boosterSceneFrame(b *BoosterTelemetry) *BoosterSceneFrame {
 		Longitude: b.Longitude,
 		Scene:     b.Scene,
 		GridFins:  b.GridFins,
+		Catch:     b.Catch,
 		Destroyed: b.Destroyed,
 	}
 }
@@ -186,14 +225,16 @@ func (s *Simulation) buildSceneTelemetry(air physics.Vec3, geo physics.Geodetic)
 		Downrange: greatCircleDistance(
 			s.Config.LaunchLatitude, s.Config.LaunchLongitude,
 			geo.Latitude, geo.Longitude),
+		Tower: s.tower.Offset(s.state.Position, s.elapsed),
 	}
 
 	// Поток идёт навстречу движению относительно воздуха.
 	if speed := air.Norm(); speed > 1 {
 		out.Airflow = toScene(frame, air.Scale(-1/speed))
 	}
-	if speed := s.state.Velocity.Norm(); speed > 1 {
-		out.Velocity = toScene(frame, s.state.Velocity.Scale(1/speed))
+	ground := s.state.Velocity.Sub(physics.CorotatingVelocity(s.state.Position))
+	if speed := ground.Norm(); speed > 1 {
+		out.Velocity = toScene(frame, ground.Scale(1/speed))
 	}
 	return out
 }

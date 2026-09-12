@@ -602,6 +602,8 @@ func (t Telemetry) Publish() {
 			phase = 3
 		case BoosterDestroyed.String():
 			phase = 4
+		case BoosterCaught.String():
+			phase = 5
 		}
 
 		sample := metrics.BoosterSample{
@@ -614,6 +616,11 @@ func (t Telemetry) Publish() {
 			Pitch:            b.Pitch,
 			Yaw:              b.Yaw,
 			Roll:             b.Roll,
+			YawContinuous:    b.YawContinuous,
+			RollContinuous:   b.RollContinuous,
+			BodyRollRate:     b.BodyRollRate,
+			BodyPitchRate:    b.BodyPitchRate,
+			BodyYawRate:      b.BodyYawRate,
 			FuelMass:         b.FuelMass,
 			Throttle:         b.Throttle,
 			EnginesRunning:   float64(b.EnginesRunning),
@@ -622,6 +629,43 @@ func (t Telemetry) Publish() {
 			Destroyed:        b.Destroyed,
 			SplashSpeed:      b.SplashSpeed,
 			Tilt:             b.Tilt,
+
+			GfoldStatus:        gfoldStatusCode(b.GfoldStatus),
+			GfoldSolves:        float64(b.GfoldSolves),
+			GfoldFailures:      float64(b.GfoldFailures),
+			GfoldMiss:          b.GfoldMiss,
+			FinTorqueRequested: b.FinTorqueRequested,
+			FinTorqueDelivered: b.FinTorqueDelivered,
+			FinSaturated:       b.FinSaturated,
+
+			GfoldShadowStatus:    gfoldStatusCode(b.ShadowStatus),
+			GfoldShadowMiss:      b.ShadowMiss,
+			GfoldShadowTof:       b.ShadowTof,
+			GfoldShadowReachable: b.ShadowReachable,
+
+			PassiveMiss:        b.PassiveMiss,
+			CoastLeanDemand:    b.CoastLeanDemand,
+			CoastLeanAuthority: b.CoastLeanAuthority,
+			CoastLeanApplied:   b.CoastLeanApplied,
+			GfoldTimeOfFlight:  b.GfoldTimeOfFlight,
+			GfoldPlannedFuel:   b.GfoldPlannedFuel,
+			GfoldSlack:         b.GfoldSlack,
+			GfoldTrackPosition: b.GfoldTrackingPositionError,
+			GfoldTrackVelocity: b.GfoldTrackingVelocityError,
+
+			CatchMissAlong:      float64(b.Catch.MissX),
+			CatchMissAcross:     float64(b.Catch.MissY),
+			CatchMissVertical:   float64(b.Catch.MissZ),
+			CatchMissHorizontal: float64(b.Catch.MissHorizontal),
+			CatchMiss3D:         float64(b.Catch.Miss3D),
+			CatchDownrange:      float64(b.Catch.Downrange),
+			CatchCrossrange:     float64(b.Catch.Crossrange),
+			CatchVertical:       float64(b.Catch.VerticalVelocity),
+			CatchHorizontal:     float64(b.Catch.HorizontalVelocity),
+			CatchTilt:           float64(b.Catch.Tilt),
+			CatchAngularRate:    float64(b.Catch.AngularRate),
+			CatchCrossed:        b.Catch.Crossed,
+			CatchSuccess:        b.Catch.Success,
 		}
 		for _, f := range b.GridFins {
 			sample.GridFins = append(sample.GridFins,
@@ -766,4 +810,25 @@ func (s *Simulation) buildFlapTelemetry() []FlapTelemetry {
 		})
 	}
 	return out
+}
+
+// gfoldStatusCode переводит исход решения задачи наведения в число для
+// Prometheus.
+//
+// Пустая строка (задача ещё не решалась — до посадочного импульса) даёт
+// NaN, а не ноль: ноль здесь означает «решение найдено», и подставлять его
+// вместо «неизвестно» значило бы рисовать на графике успешное наведение
+// там, где наведения ещё не было (см. CLAUDE.md про неопределённые
+// величины).
+func gfoldStatusCode(status string) float64 {
+	switch status {
+	case "optimal":
+		return 0
+	case "infeasible":
+		return 1
+	case "failed":
+		return 2
+	default:
+		return math.NaN()
+	}
 }

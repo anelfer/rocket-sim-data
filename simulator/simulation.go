@@ -154,6 +154,11 @@ type Simulation struct {
 	// аппарат без второй горутины и без гонок.
 	booster *Booster
 
+	// tower — башня-ловушка площадки (см. catch_tower.go). Кораблю она
+	// нужна только для картинки: он стоит на том же столе, и без башни
+	// рядом стартовый комплекс на сцене выглядит пустым полем.
+	tower CatchTower
+
 	// wind — профиль ветра, разыгранный один раз на весь полёт.
 	wind env.WindModel
 
@@ -163,6 +168,10 @@ type Simulation struct {
 	// seed — зерно генератора. Один и тот же seed даёт побитово одинаковый
 	// полёт, что позволяет воспроизвести любой прогон.
 	seed int64
+
+	// liveTraj — запись траектории ИДУЩЕГО прогона (trajectory_live.go).
+	// Наблюдатель: на физику, наведение и управление не влияет.
+	liveTraj liveTrajectory
 
 	// Entry — профиль возвращения корабля.
 	Entry EntryConfig
@@ -369,6 +378,7 @@ func NewSimulationWithSeed(cfg vehicle.Config, tc TimeConfig, seed int64) *Simul
 		scenario:  "Штатный полёт",
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+		tower:     newCatchTower(cfg),
 	}
 	s.initState()
 	s.calibrateBoard()
@@ -403,6 +413,10 @@ func (s *Simulation) initState() {
 	// Генератор пересоздаётся от того же зерна, поэтому Reset даёт в точности
 	// тот же полёт: тот же ветер, те же отклонения, те же отказы.
 	s.rng = rand.New(rand.NewSource(s.seed))
+
+	// Записанная трасса относится к прошлому прогону: с возвратом к T+0 она
+	// теряет смысл и очищается вместе с остальным состоянием.
+	s.liveTraj.reset()
 
 	// sensorRng разводится от того же seed чистым арифметическим
 	// перемешиванием (splitMix64), а не броском s.rng: если бы для этого
@@ -972,6 +986,11 @@ func (s *Simulation) step(dt float64) {
 			s.crashed = true
 		}
 	}
+
+	// 12. Запись траектории для страницы «Траектория». Строго последним:
+	// записывается состояние, сложившееся ПО ИТОГАМ такта, включая только
+	// что вынесенный приговор о касании. Ничего не считает и не меняет.
+	s.observeLive()
 }
 
 // windVelocity возвращает скорость ветра в точке, в осях ECI.

@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"rocketTelemetrySim/simulator/orbit"
 	"rocketTelemetrySim/simulator/physics"
 	"rocketTelemetrySim/simulator/vehicle"
 )
@@ -36,7 +37,7 @@ func newTestBooster(t *testing.T, position, velocity physics.Vec3, elapsed float
 	cfg := testBoosterConfig(t)
 	rng := rand.New(rand.NewSource(1))
 	sensorRng := rand.New(rand.NewSource(2))
-	return NewBooster(cfg, position, velocity, elapsed, rng, sensorRng, 290, physics.Quaternion{W: 1})
+	return NewBooster(cfg, position, velocity, elapsed, rng, sensorRng, 1, 290, physics.Quaternion{W: 1})
 }
 
 // TestBoostback_LaunchTargetMatchesConfig — Stage 4.11, п.1,11; Stage 4.12,
@@ -130,14 +131,22 @@ func TestBoostback_PredictedImpactErrorDecreasesWithCorrectiveVelocity(t *testin
 
 	b := newTestBooster(t, position, awayVelocity, 0)
 
-	missBefore, _, _, _, ok := b.landingPredictedImpact(0)
+	// Наведение работает по ПОКАЗАНИЯМ навигации (см. Booster.sensedNavState),
+	// поэтому состояние, чью коррекцию проверяет тест, подаётся так же —
+	// через NavState, а не подменой истинного вектора. landingPredictedImpact
+	// читает из него только положение и скорость.
+	navAtState := func(pos, vel physics.Vec3) orbit.NavState {
+		return orbit.NavState{Position: pos, Velocity: vel}
+	}
+
+	missBefore, _, _, _, ok := b.landingPredictedImpact(navAtState(position, awayVelocity), 0)
 	if !ok {
 		t.Fatal("landingPredictedImpact не сошёлся на baseline-состоянии")
 	}
 
 	// Коррекция: та же величина скорости, что и в boostbackTarget — против
 	// направления промаха (impact-target), горизонтально.
-	impactECI, flightTime, ok := predictBallisticImpact(b.state.Position, b.state.Velocity)
+	impactECI, flightTime, ok := predictBallisticImpact(position, awayVelocity)
 	if !ok {
 		t.Fatal("predictBallisticImpact не сошёлся")
 	}
@@ -151,8 +160,8 @@ func TestBoostback_PredictedImpactErrorDecreasesWithCorrectiveVelocity(t *testin
 	}
 	correction := localAtCurrent.East.Scale(-me / n).Add(localAtCurrent.North.Scale(-mn / n))
 
-	b.state.Velocity = b.state.Velocity.Add(correction.Scale(200)) // 200 м/с коррекции
-	missAfter, _, _, _, ok := b.landingPredictedImpact(0)
+	corrected := awayVelocity.Add(correction.Scale(200)) // 200 м/с коррекции
+	missAfter, _, _, _, ok := b.landingPredictedImpact(navAtState(position, corrected), 0)
 	if !ok {
 		t.Fatal("landingPredictedImpact не сошёлся после коррекции")
 	}

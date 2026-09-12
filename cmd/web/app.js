@@ -250,7 +250,32 @@ function connect() {
   };
 
   ws.onerror = () => ws.close();
-  ws.onmessage = (ev) => handleMessage(JSON.parse(ev.data));
+  ws.onmessage = (ev) => { S.lastMessageAt = Date.now(); handleMessage(JSON.parse(ev.data)); };
+}
+
+/* Сторож живого соединения.
+
+   readyState умеет врать. Если сервер исчез (перезапуск контейнера, обрыв
+   на промежуточном узле), сокет у браузера ещё какое-то время числится
+   OPEN: TCP о разрыве не узнал, и ws.send() отрабатывает без ошибки —
+   сообщение просто уходит в никуда. Команда при этом считается отправленной
+   и молча теряется, а следующее нажатие уже попадает в переподключённый
+   сокет и срабатывает. Снаружи это и есть «кнопка работает через раз».
+
+   Сервер шлёт телеметрию десять раз в секунду и отвечает на ping каждые две.
+   Шесть секунд тишины означают, что канал мёртв, чем бы ни считал его
+   readyState, — закрываем сам, и штатное переподключение поднимает новый. */
+const LINK_SILENCE_MS = 6000;
+
+function watchLink() {
+  setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!S.lastMessageAt) { S.lastMessageAt = Date.now(); return; }
+    if (Date.now() - S.lastMessageAt > LINK_SILENCE_MS) {
+      setLink('нет');
+      ws.close();
+    }
+  }, 1000);
 }
 
 function setLink(text) {
@@ -275,7 +300,21 @@ function handleMessage(msg) {
       $('#stat-latency').textContent = `${S.latency} мс`;
       break;
     }
-    case 'idle':  setState('не запущена'); break;
+    // Симуляции на сервере нет: прогон завершён и убран, либо сервер
+    // перезапустился. Снимок прошлого прогона с этого мгновения описывает
+    // то, чего уже не существует, и держать его нельзя.
+    //
+    // Пока он держался, Start считал, что прогон идёт, и на первое нажатие
+    // открывал подтверждение «Текущий прогон будет остановлен» вместо
+    // запуска. Со стороны это выглядело как «кнопка не сработала с первого
+    // раза»: оператор нажимал ещё раз, попадал уже по «Применить», и прогон
+    // начинался со второго клика. Проверено: после перезапуска сервера Start
+    // действительно не запускал ничего.
+    case 'idle':
+      S.snapshot = null;
+      S.lastRunState = null;
+      setState('idle');
+      break;
     case 'error': toast('err', 'Ошибка сервера', msg.error); break;
   }
 }
@@ -351,11 +390,21 @@ function describe(cmd) {
   return `${labelFor(cmd.parameter)} · ${cmd.mode} ${num(cmd.value, 2)}`;
 }
 
+// Управление ходом прогона идёт по REST, а не по вебсокету.
+//
+// Причина та же, что у igniteAll ниже: вебсокет отправляет и забывает. Пока
+// канал жив, разницы нет; когда он умер, но браузер ещё считает его
+// открытым, команда исчезает бесследно, а оператор видит кнопку, которая
+// «не сработала». REST отвечает кодом: либо команда принята, либо о ней
+// честно сообщено. Пауза, Stop и Start — действия редкие, экономить на них
+// один HTTP-запрос незачем.
 function action(name, value) {
-  if (!send({ type: 'action', action: name, value: value || 0 })) {
-    fetch(`/api/sim/${name}` + (value ? `?value=${value}&steps=${value}` : ''),
-      { method: 'POST' }).catch(() => toast('err', 'Нет связи с сервером'));
-  }
+  const query = value ? `?value=${value}&steps=${value}` : '';
+  fetch(`/api/sim/${name}${query}`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) return r.text().then(t => toast('err', 'Команда отклонена', t));
+    })
+    .catch(() => toast('err', 'Нет связи с сервером'));
 }
 
 // igniteAll — зажигание в отличие от пауз и переключений скорости может
@@ -375,9 +424,91 @@ function igniteAll() {
    Приём снимка
    =========================================================================== */
 
+/* ---------------------------------------------------------------------------
+   Нажатие и перерисовка
+
+   Пульт перерисовывает панели на каждый снимок телеметрии — десять раз в
+   секунду, — и делает это подменой содержимого (replaceChildren). Мышиный
+   click рождается только тогда, когда нажатие и отпускание пришлись на ОДИН
+   И ТОТ ЖЕ, всё ещё существующий узел. Если перерисовка успевает подменить
+   нажатую кнопку между ними, click не рождается вовсе: ни на кнопке, ни на
+   контейнере. Снаружи это выглядит как «кнопка срабатывает через раз».
+
+   То же и с блокировкой: setState снимает и ставит disabled у Pause/Resume/
+   Step на каждый снимок, а disabled, выставленный между нажатием и
+   отпусканием, отменяет click так же надёжно, как подмена узла.
+
+   Раньше это лечили точечно — переводом отдельных обработчиков на
+   pointerdown (блок двигателей, вкладки аппарата). Лечение помогало ровно
+   тем кнопкам, до которых дошли руки, и не помогало всем остальным.
+
+   Здесь причина убирается целиком: пока кнопка мыши нажата, DOM не
+   перестраивается. Отложенная перерисовка выполняется сразу после
+   отпускания, по последнему пришедшему снимку, — задержка равна длительности
+   нажатия, то есть десятым долям секунды.
+
+   Данные при этом не теряются: снимок сохраняется и ряды для графиков
+   копятся как обычно, откладывается только отрисовка.
+   --------------------------------------------------------------------------- */
+
+const PRESS = { down: false, stale: false, at: 0 };
+
+/* Наибольшая длительность нажатия, после которой признак сбрасывается сам.
+   Страховка от потерянного pointerup (отпустили за пределами окна, вкладку
+   увели из-под пальца): без неё пульт застыл бы навсегда. Десять секунд —
+   заведомо больше любого нажатия и любого перетаскивания камеры. */
+const PRESS_MAX_MS = 10000;
+
+function pressRelease() {
+  if (!PRESS.down) return;
+  PRESS.down = false;
+  if (PRESS.stale) {
+    PRESS.stale = false;
+    if (S.snapshot) renderSnapshot(S.snapshot);
+  }
+}
+
+function watchPress() {
+  document.addEventListener('pointerdown', () => {
+    PRESS.down = true;
+    PRESS.at = Date.now();
+  }, true);
+  document.addEventListener('pointerup', pressRelease, true);
+  document.addEventListener('pointercancel', pressRelease, true);
+  // Кнопку отпустили за пределами окна — узнаём об этом по первому же
+  // движению с отпущенными кнопками.
+  document.addEventListener('pointermove', ev => {
+    if (PRESS.down && ev.buttons === 0) pressRelease();
+  }, true);
+  window.addEventListener('blur', pressRelease);
+}
+
 function onSnapshot(s) {
   S.snapshot = s;
 
+  // Ряды для графиков копятся всегда: это данные, а не картинка.
+  collectSeries(s);
+
+  // Ход сценария — тоже не картинка: он отправляет команды по модельному
+  // времени, и пропуск тактов на время нажатия сдвинул бы весь сценарий.
+  guarded('сценарий', () => runScenarioTick(s.modelTime));
+
+  // Трёхмерная сцена живёт своим ходом отрисовки и на кнопки не влияет —
+  // её кадры откладывать нельзя, иначе картинка замирает на всё время
+  // перетаскивания камеры.
+  if (S.dataView === 'scene') guarded('трёхмерная сцена', drawScene3D);
+
+  if (PRESS.down) {
+    if (Date.now() - PRESS.at < PRESS_MAX_MS) {
+      PRESS.stale = true;
+      return;
+    }
+    PRESS.down = false;
+  }
+  renderSnapshot(s);
+}
+
+function renderSnapshot(s) {
   setState(s.runState);
   $('#stat-model').textContent = clock(s.modelTime);
   $('#stat-real').textContent  = clock(s.realTime);
@@ -406,7 +537,6 @@ function onSnapshot(s) {
   // до тех пор, пока переключение вкладки не вызывало отрисовку напрямую.
   // Оператор при этом видел живые цифры вверху и мёртвые везде остальные.
   // Ошибка в одном узле не должна останавливать пульт.
-  collectSeries(s);
   guarded('вкладки аппарата', renderVehicleTabs);
   guarded('бустер', () => renderBoosterPanel(s.telemetry?.booster));
   guarded('блок двигателей', renderEngineStrip);
@@ -421,9 +551,6 @@ function onSnapshot(s) {
 
   if (S.dataView === 'cutaway') guarded('развёртка', drawCutaway);
   if (S.dataView === 'entry') guarded('вход в атмосферу', drawEntry);
-  if (S.dataView === 'scene') guarded('трёхмерная сцена', drawScene3D);
-
-  guarded('сценарий', () => runScenarioTick(s.modelTime));
 }
 
 /* guarded выполняет отрисовку одной панели, не давая её ошибке остановить
@@ -1570,6 +1697,57 @@ function renderBoosterPanel(b) {
     fins.textContent = 'Решётчатые рули: ' +
       b.gridFins.map(f => `${num(f.deflection, 0)}°`).join('  ');
     box.append(fins);
+  }
+
+  // Захват башней — главная посадочная величина Super Heavy.
+  //
+  // «Промах» здесь меряется относительно ЦЕНТРА ЗОНЫ между руками и снимается
+  // в момент прохода их высоты. Расстояние от упавшего корпуса до площадки —
+  // другая величина: ступень к тому времени прошла зону насквозь, и её
+  // координаты описывают уже не ошибку наведения.
+  const c = b.catch;
+  if (c && Number.isFinite(c.catchMissHorizontal)) {
+    const head = el('div', `kv s-${c.catchSuccess ? 'normal'
+      : c.catchCrossed ? 'critical' : 'warning'}`);
+    head.append(el('span', null, c.catchSuccess ? 'ЗАХВАТ БАШНЕЙ'
+      : c.catchCrossed ? 'ПРОМАХ ЗАХВАТА' : 'подход к зоне захвата'));
+    head.append(el('b', null, `${num(c.catchMissHorizontal, 1)} м`));
+    box.append(head);
+
+    const cg = el('div', 'kv-grid');
+    const crow = (title, v, digits, unit, status) => {
+      if (!Number.isFinite(v)) return;
+      const cell = el('div', `kv s-${status || 'normal'}`);
+      cell.append(el('span', null, title));
+      const bb = el('b', null, num(v, digits));
+      if (unit) bb.append(el('i', null, unit));
+      cell.append(bb);
+      cg.append(cell);
+    };
+    crow('Вдоль рук', c.catchMissX, 1, 'м');
+    crow('Поперёк рук', c.catchMissY, 1, 'м');
+    crow('По высоте', c.catchMissZ, 1, 'м');
+    crow('Полный промах', c.catchMiss3D, 1, 'м');
+    crow('Продольный', c.catchMissDownrange, 1, 'м');
+    crow('Боковой', c.catchMissCrossrange, 1, 'м');
+    crow('Верт. скорость', c.catchVerticalVelocity, 1, 'м/с');
+    crow('Бок. скорость', c.catchHorizontalVelocity, 1, 'м/с');
+    crow('Наклон', c.catchTilt, 1, '°');
+    crow('Вращение', c.catchAngularRate, 1, '°/с');
+    box.append(cg);
+
+    if (!c.catchCrossed) {
+      box.append(el('div', 'muted',
+        'Плоскость рук ещё не пройдена: числа описывают ближайший подход, ' +
+        'а не проход зоны захвата.'));
+    }
+  }
+
+  if (b.phase === 'Caught') {
+    const caught = el('div', 'kv s-normal');
+    caught.append(el('span', null, 'ПОЙМАН БАШНЕЙ'));
+    caught.append(el('b', null, 'висит в руках над стартовым столом'));
+    box.append(caught);
   }
 
   if (b.splashdown) {
@@ -3510,6 +3688,11 @@ function switchDataView(view) {
    =========================================================================== */
 
 async function boot() {
+  // Слежение за нажатием — раньше всего остального: без него первая же
+  // перерисовка может съесть первый же клик оператора (см. PRESS).
+  watchPress();
+  watchLink();
+
   // Реестр параметров приходит с сервера: интерфейс не знает заранее ни одного
   // параметра, ни его пределов, ни последствий выхода за них.
   // Каталог носителей. Профиль применяется при следующем запуске: массы,

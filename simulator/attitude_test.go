@@ -82,13 +82,13 @@ func TestAttitudeErrorHasNoSingularity(t *testing.T) {
 
 	// Курс на вертикали не определён: тот же корпус можно описать любым курсом.
 	// Рассогласование при этом обязано остаться нулевым.
-	p, y, r := a.attitudeError(physics.Attitude{Pitch: 90, Yaw: 45, Roll: 0}, frame)
+	p, y, r := a.attitudeError(physics.Attitude{Pitch: 90, Yaw: 45, Roll: 0}, physics.Quaternion{}, frame)
 	if math.Abs(p) > 1e-9 || math.Abs(y) > 1e-9 || math.Abs(r) > 1e-9 {
 		t.Errorf("ненулевая ошибка при совпадающей ориентации: %.3e/%.3e/%.3e", p, y, r)
 	}
 
 	// Наклон на градус от вертикали должен дать ровно градус рассогласования.
-	p, y, r = a.attitudeError(physics.Attitude{Pitch: 89, Yaw: 45, Roll: 0}, frame)
+	p, y, r = a.attitudeError(physics.Attitude{Pitch: 89, Yaw: 45, Roll: 0}, physics.Quaternion{}, frame)
 	total := math.Sqrt(p*p+y*y+r*r) * physics.RadToDeg
 	if math.Abs(total-1) > 0.01 {
 		t.Errorf("рассогласование %.4f°, ожидался ровно градус", total)
@@ -494,4 +494,38 @@ func TestReducedGimbalRaisesAuthority(t *testing.T) {
 		"запас %.2f, на упоре %v",
 		after.GimbalLimit, after.GimbalDemand, after.ControlAuthority,
 		after.ControlSaturated)
+}
+
+// Признак хвостового обтекания берётся из потока и ориентации, а не из
+// фазы полёта: от него зависит, подавляет ли автопилот собственную
+// устойчивость корпуса, и ошибка здесь стоит всей власти приводов.
+func TestTailFirstInFlow(t *testing.T) {
+	flow := physics.Vec3{X: 100} // поток вдоль +X
+	axisAt := func(aoaDeg float64) physics.Quaternion {
+		// Кватернион, поворачивающий +X на заданный угол атаки.
+		return physics.QuaternionFromAxisAngle(physics.Vec3{Z: 1}, aoaDeg*physics.DegToRad)
+	}
+
+	for _, c := range []struct {
+		aoa  float64
+		want bool
+	}{
+		{0, false},  // носом вперёд — неустойчив
+		{45, false}, // поток всё ещё на носовой половине
+		{89, false}, // почти бортом, но ещё нос
+		{91, true},  // поток перешёл на хвостовую половину
+		{135, true}, // завалившийся корпус — как раз тот случай, ради
+		{170, true}, // которого признак и нужен
+		{180, true}, // чистый tail-first
+	} {
+		if got := tailFirstInFlow(axisAt(c.aoa), flow); got != c.want {
+			t.Errorf("угол атаки %.0f°: хвостовое обтекание %v, ожидалось %v", c.aoa, got, c.want)
+		}
+	}
+
+	// Без потока устойчивости не бывает: делить не на что и компенсировать
+	// нечего.
+	if tailFirstInFlow(axisAt(180), physics.Vec3{}) {
+		t.Error("в вакууме объявлено хвостовое обтекание")
+	}
 }

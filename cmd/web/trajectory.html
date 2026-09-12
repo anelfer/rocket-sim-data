@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Траектория полёта</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="trajectory.css">
+</head>
+<body class="traj-page">
+
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">◜</span>
+    <span class="brand-text">Траектория</span>
+  </div>
+
+  <div class="run-controls">
+    <label class="speed">
+      Носитель
+      <select id="tj-profile"></select>
+    </label>
+    <label class="speed">
+      Задание
+      <select id="tj-mission"></select>
+    </label>
+    <label class="speed" title="Текущий прогон — тот, что идёт на пульте прямо сейчас, со всеми вашими вмешательствами. По зерну — отдельный воспроизводимый прогон без вмешательств.">
+      Источник
+      <select id="tj-source">
+        <option value="live">Текущий прогон</option>
+        <option value="seed">По зерну (seed)</option>
+      </select>
+    </label>
+    <label class="speed" id="tj-seed-box" title="Зерно генератора случайных чисел. Одно и то же зерно всегда даёт один и тот же прогон.">
+      Прогон (seed)
+      <input id="tj-seed" type="number" value="1" min="0" step="1">
+    </label>
+    <label class="speed" title="Обновлять траекторию текущего прогона по ходу полёта">
+      <input id="tj-follow" type="checkbox" checked> следить
+    </label>
+    <label class="speed" title="Предел модельного времени записи. Полёт корабля по трансатмосферной траектории длится дольше возврата бустера.">
+      Длительность, с
+      <input id="tj-duration" type="number" value="1500" min="60" max="6000" step="60">
+    </label>
+    <button id="tj-load" class="btn btn-go">Показать</button>
+    <span class="sep"></span>
+    <a class="btn" href="/">К пульту</a>
+  </div>
+
+  <div class="status-strip">
+    <div class="stat"><span class="stat-label">Состояние</span><span class="stat-value" id="tj-state">—</span></div>
+    <div class="stat"><span class="stat-label">Длительность</span><span class="stat-value" id="tj-dur">—</span></div>
+    <div class="stat"><span class="stat-label">Точек</span><span class="stat-value" id="tj-points">—</span></div>
+    <div class="stat"><span class="stat-label">Промах бустера</span><span class="stat-value" id="tj-miss">—</span></div>
+    <div class="stat"><span class="stat-label">Зерно</span><span class="stat-value" id="tj-seedval">—</span></div>
+  </div>
+</header>
+
+<main class="traj-main">
+
+  <section class="traj-panel">
+    <div class="traj-panel-head">
+      <h2>Трёхмерная картина полёта</h2>
+      <div class="traj-hint">
+        Левая кнопка — поворот · колесо — приближение · двойной щелчок — вернуть вид
+      </div>
+    </div>
+
+    <div class="traj-canvas-wrap">
+      <canvas id="tj-3d"></canvas>
+      <div id="tj-tooltip" class="traj-tooltip hidden"></div>
+      <div class="traj-legend">
+        <div class="lg"><i class="sw sw-ship"></i>Корабль</div>
+        <div class="lg"><i class="sw sw-booster"></i>Бустер</div>
+        <div class="lg"><i class="sw sw-boostback"></i>Разворотный импульс</div>
+        <div class="lg"><i class="sw sw-pad"></i>Старт / цель посадки</div>
+      </div>
+      <div id="tj-empty" class="traj-empty">Нажмите «Показать»: по умолчанию будет показан прогон, идущий на пульте</div>
+    </div>
+  </section>
+
+  <section class="traj-panel">
+    <div class="traj-panel-head">
+      <h2>Высота по дальности</h2>
+      <div class="traj-hint">
+        X — расстояние по поверхности до точки посадки · Y — высота ·
+        потяните мышью, чтобы приблизить зону · колесо — масштаб ·
+        двойной щелчок — весь полёт
+      </div>
+    </div>
+    <div class="traj-canvas-wrap traj-canvas-2d">
+      <canvas id="tj-2d"></canvas>
+      <div id="tj-tooltip2" class="traj-tooltip hidden"></div>
+    </div>
+  </section>
+
+  <section class="traj-panel">
+    <div class="traj-panel-head"><h2>События полёта</h2></div>
+    <div id="tj-events" class="traj-events scroll"></div>
+  </section>
+
+</main>
+
+<script src="trajectory.js"></script>
+</body>
+</html>

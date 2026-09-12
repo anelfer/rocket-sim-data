@@ -139,14 +139,52 @@ var (
 	// её камеры (S1-1 … S1-N) публикуются через тот же rocket_engine_*
 	// с engine_id, что и у корабля — идентификаторы не пересекаются, а вести
 	// две параллельные пары метрик под одни и те же величины незачем.
-	boosterAltitude   = gauge("rocket_booster_altitude_meters", "Высота возвращающегося бустера")
-	boosterLatitude   = gauge("rocket_booster_latitude", "Широта возвращающегося бустера")
-	boosterLongitude  = gauge("rocket_booster_longitude", "Долгота возвращающегося бустера")
-	boosterVVel       = gauge("rocket_booster_vertical_velocity_mps", "Вертикальная скорость бустера")
-	boosterTVel       = gauge("rocket_booster_total_velocity_mps", "Полная скорость бустера")
-	boosterPitch      = gauge("rocket_booster_pitch_deg", "Тангаж бустера, градусы")
-	boosterYaw        = gauge("rocket_booster_yaw_deg", "Рыскание бустера, градусы")
-	boosterRoll       = gauge("rocket_booster_roll_deg", "Крен бустера, градусы")
+	boosterAltitude  = gauge("rocket_booster_altitude_meters", "Высота возвращающегося бустера")
+	boosterLatitude  = gauge("rocket_booster_latitude", "Широта возвращающегося бустера")
+	boosterLongitude = gauge("rocket_booster_longitude", "Долгота возвращающегося бустера")
+	boosterVVel      = gauge("rocket_booster_vertical_velocity_mps", "Вертикальная скорость бустера")
+	boosterTVel      = gauge("rocket_booster_total_velocity_mps", "Полная скорость бустера")
+	// Сырые углы Эйлера: диагностические. Азимут выдаётся в 0…360, крен —
+	// в −180…180, и оба рвутся на границах там, где корпус поворачивается
+	// плавно. Для чтения ориентации служат непрерывные двойники ниже.
+	boosterPitch = gauge("rocket_booster_pitch_deg", "Тангаж бустера, градусы (угол места, −90…90, не цикличен)")
+	boosterYaw   = gauge("rocket_booster_yaw_deg", "Рыскание бустера, градусы (сырой азимут 0…360, рвётся на границе)")
+	boosterRoll  = gauge("rocket_booster_roll_deg", "Крен бустера, градусы (сырой, −180…180, рвётся на границе)")
+
+	// Развёрнутые (непрерывные) углы: те же величины с накоплением, без
+	// разрывов на 360°/0° и ±180°. Выходят за пределы оборота — так и
+	// задумано, обороты должны быть видны как обороты.
+	// Захват башней. Промах меряется относительно ЦЕНТРА ЗОНЫ ЗАХВАТА между
+	// руками, а не относительно основания башни, и снимается в момент
+	// прохождения плоскости рук, а не после падения корпуса: положение
+	// упавшей и завалившейся ступени — это уже другая величина, и выдавать
+	// её за ошибку наведения нельзя.
+	boosterCatchAlong      = gauge("rocket_booster_catch_miss_along_m", "Промах захвата вдоль рук башни, м (NaN до прохода зоны)")
+	boosterCatchAcross     = gauge("rocket_booster_catch_miss_across_m", "Промах захвата поперёк просвета между руками, м (NaN до прохода зоны)")
+	boosterCatchVertical   = gauge("rocket_booster_catch_miss_vertical_m", "Промах захвата по высоте относительно плоскости рук, м (NaN до прохода зоны)")
+	boosterCatchHorizontal = gauge("rocket_booster_catch_miss_horizontal_m", "Горизонтальный промах захвата, м (NaN до прохода зоны)")
+	boosterCatch3D         = gauge("rocket_booster_catch_miss_3d_m", "Полный трёхмерный промах захвата, м (NaN до прохода зоны)")
+	boosterCatchDownrange  = gauge("rocket_booster_catch_miss_downrange_m", "Продольный промах вдоль курса отлёта в момент прохода зоны, м")
+	boosterCatchCrossrange = gauge("rocket_booster_catch_miss_crossrange_m", "Боковой промах поперёк курса отлёта в момент прохода зоны, м")
+	boosterCatchVVel       = gauge("rocket_booster_catch_vertical_velocity_mps", "Скорость снижения в момент прохода зоны захвата, м/с")
+	boosterCatchHVel       = gauge("rocket_booster_catch_horizontal_velocity_mps", "Боковая скорость в момент прохода зоны захвата, м/с")
+	boosterCatchTilt       = gauge("rocket_booster_catch_tilt_deg", "Наклон корпуса от вертикали в момент прохода зоны захвата, градусы")
+	boosterCatchRate       = gauge("rocket_booster_catch_angular_rate_dps", "Модуль угловой скорости в момент прохода зоны захвата, град/с")
+	boosterCatchCrossed    = gauge("rocket_booster_catch_crossed", "Плоскость захвата пройдена сверху вниз: 1 — да, 0 — нет")
+	boosterCatchSuccess    = gauge("rocket_booster_catch_success", "Захват состоялся: 1 — да, 0 — нет")
+
+	boosterYawCont  = gauge("rocket_booster_yaw_continuous_deg", "Рыскание бустера, непрерывное: 359° → 361° вместо 359° → 1°")
+	boosterRollCont = gauge("rocket_booster_roll_continuous_deg", "Крен бустера, непрерывный: 179° → 181° вместо 179° → −179°")
+
+	// Собственные угловые скорости в СВЯЗАННЫХ осях. Особых точек у них нет
+	// вовсе: это не координаты ориентации, а сама угловая скорость корпуса.
+	// Углы Эйлера у вертикально стоящего бустера вырождены — азимут метётся
+	// сколь угодно быстро при сколь угодно медленном физическом вращении, —
+	// и никакое разворачивание этого не лечит, потому что лечить тут нечего:
+	// такова сама координата. Судить о вращении следует по этим трём.
+	boosterRateRoll   = gauge("rocket_booster_body_roll_rate_dps", "Угловая скорость бустера вокруг продольной оси, град/с")
+	boosterRatePitch  = gauge("rocket_booster_body_pitch_rate_dps", "Угловая скорость бустера по тангажу (связанная ось), град/с")
+	boosterRateYaw    = gauge("rocket_booster_body_yaw_rate_dps", "Угловая скорость бустера по рысканию (связанная ось), град/с")
 	boosterFuelMass   = gauge("rocket_booster_fuel_mass_kg", "Остаток топлива бустера")
 	boosterThrottle   = gauge("rocket_booster_throttle_percent", "Уставка тяги бустера")
 	boosterEngines    = gauge("rocket_booster_engines_running", "Число работающих камер бустера")
@@ -158,6 +196,61 @@ var (
 	boosterDestroyed  = gauge("rocket_booster_destroyed", "1 — разрушен")
 
 	boosterFinDeflection = gaugeVec("rocket_booster_grid_fin_deflection_deg", "Угол раскрытия решётчатого руля")
+
+	// Наведение посадочного импульса по G-FOLD (simulator/orbit/gfold).
+	// Пять величин, которыми объясняется любое поведение контура: сошлась
+	// ли задача, каким вышло решение, насколько ступень от него отстала и
+	// осталась ли релаксация точной.
+	boosterFinTorqueReq = gauge("rocket_booster_grid_fin_torque_requested_nm",
+		"Момент, запрошенный у решётчатых рулей контуром ориентации")
+	boosterFinTorqueDone = gauge("rocket_booster_grid_fin_torque_delivered_nm",
+		"Момент, который рули дают на назначенных углах")
+	boosterFinSaturated = gauge("rocket_booster_grid_fin_saturated",
+		"1 — рули на упоре: запрошенный момент не выдаётся")
+
+	// Теневая проба терминальной задачи на пассивном участке: наведение по
+	// ней не идёт, она только отвечает, достижима ли ещё площадка из
+	// предсказанной точки розжига. Именно её и не хватало, чтобы видеть
+	// потерю цели задолго до включения настоящего G-FOLD.
+	boosterGfoldShadowStatus = gauge("rocket_booster_gfold_shadow_status",
+		"Исход теневой пробы терминальной задачи: 0 — решение найдено, 1 — цель недостижима, 2 — решатель не сошёлся, NaN — проба ещё не делалась")
+	boosterGfoldShadowMiss = gauge("rocket_booster_gfold_shadow_miss_meters",
+		"Промах теневого решения: на сколько терминальный узел пробной траектории расходится с зоной захвата")
+	boosterGfoldShadowTof = gauge("rocket_booster_gfold_shadow_time_of_flight_seconds",
+		"Время полёта теневой траектории")
+	boosterGfoldShadowReach = gauge("rocket_booster_gfold_shadow_reachable",
+		"1 — мягкая посадка в зоне захвата из предсказанной точки розжига ещё разрешима")
+
+	// Боковое наведение пассивного участка. Промах разомкнутый (что будет,
+	// если больше не править), поэтому по нему и видно, где ошибка
+	// появляется, а запрос/власть отвечают, упёрлись ли рули.
+	boosterPassiveMiss = gauge("rocket_booster_passive_miss_meters",
+		"Разомкнутый прогнозируемый промах пассивного участка: куда придёт ступень, если боковой коррекции больше не делать")
+	boosterCoastLeanDemand = gauge("rocket_booster_coast_lean_demand_deg",
+		"Отклонение от tail-first, которое запросило боковое наведение по промаху")
+	boosterCoastLeanAuthority = gauge("rocket_booster_coast_lean_authority_deg",
+		"Отклонение от tail-first, которое удержат решётчатые рули и газоотвод при текущем напоре")
+	boosterCoastLeanApplied = gauge("rocket_booster_coast_lean_applied_deg",
+		"Отклонение от tail-first, фактически поданное в цель ориентации")
+
+	boosterGfoldStatus = gauge("rocket_booster_gfold_status",
+		"Исход последнего решения задачи наведения: 0 — решение найдено, 1 — цель недостижима, 2 — решатель не сошёлся, NaN — задача ещё не решалась")
+	boosterGfoldSolves = gauge("rocket_booster_gfold_solves_total",
+		"Сколько раз запрошено решение задачи наведения посадочного импульса")
+	boosterGfoldFailures = gauge("rocket_booster_gfold_failures_total",
+		"Сколько решений не удалось получить (ступень летит по предыдущему плану)")
+	boosterGfoldMiss = gauge("rocket_booster_gfold_plan_miss_meters",
+		"Промах ПЛАНА: расхождение терминального узла найденной траектории с точкой посадки")
+	boosterGfoldTof = gauge("rocket_booster_gfold_time_of_flight_seconds",
+		"Время полёта найденной траектории")
+	boosterGfoldFuel = gauge("rocket_booster_gfold_planned_fuel_kg",
+		"Запланированный расход топлива на найденной траектории")
+	boosterGfoldSlack = gauge("rocket_booster_gfold_slack",
+		"Невязка условия ‖u‖=σ в решении: мера того, осталась ли релаксация точной (теорема о lossless convexification)")
+	boosterGfoldTrackPos = gauge("rocket_booster_gfold_tracking_position_error_meters",
+		"Отставание от опорной траектории по положению")
+	boosterGfoldTrackVel = gauge("rocket_booster_gfold_tracking_velocity_error_mps",
+		"Отставание от опорной траектории по скорости")
 )
 
 func gauge(name, help string) prometheus.Gauge {
@@ -220,9 +313,24 @@ func collectors() []prometheus.Collector {
 		engineNozzleGauge, engineWallGauge, engineTurbineGauge,
 		boosterAltitude, boosterLatitude, boosterLongitude,
 		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
+		boosterYawCont, boosterRollCont,
+		boosterRateRoll, boosterRatePitch, boosterRateYaw,
 		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
 		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
 		boosterFinDeflection,
+		boosterGfoldStatus, boosterGfoldSolves, boosterGfoldFailures,
+		boosterFinTorqueReq, boosterFinTorqueDone, boosterFinSaturated,
+		boosterGfoldShadowStatus, boosterGfoldShadowMiss, boosterGfoldShadowTof,
+		boosterGfoldShadowReach,
+		boosterPassiveMiss, boosterCoastLeanDemand, boosterCoastLeanAuthority,
+		boosterCoastLeanApplied,
+		boosterGfoldMiss, boosterGfoldTof, boosterGfoldFuel, boosterGfoldSlack,
+		boosterGfoldTrackPos, boosterGfoldTrackVel,
+		boosterCatchAlong, boosterCatchAcross, boosterCatchVertical,
+		boosterCatchHorizontal, boosterCatch3D,
+		boosterCatchDownrange, boosterCatchCrossrange,
+		boosterCatchVVel, boosterCatchHVel, boosterCatchTilt, boosterCatchRate,
+		boosterCatchCrossed, boosterCatchSuccess,
 	}
 	return append(base, propulsionCollectors()...)
 }
@@ -255,6 +363,8 @@ func undefinedOnStart() []prometheus.Gauge {
 		// ступени выше.
 		boosterAltitude, boosterLatitude, boosterLongitude,
 		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
+		boosterYawCont, boosterRollCont,
+		boosterRateRoll, boosterRatePitch, boosterRateYaw,
 		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
 		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
 	}
@@ -461,6 +571,14 @@ type BoosterSample struct {
 
 	Pitch, Yaw, Roll float64
 
+	// YawContinuous, RollContinuous — развёрнутые углы (см. метрики
+	// rocket_booster_*_continuous_deg).
+	YawContinuous, RollContinuous float64
+
+	// BodyRollRate, BodyPitchRate, BodyYawRate — угловая скорость в
+	// связанных осях, град/с.
+	BodyRollRate, BodyPitchRate, BodyYawRate float64
+
 	FuelMass       float64
 	Throttle       float64
 	EnginesRunning float64
@@ -476,6 +594,51 @@ type BoosterSample struct {
 	Tilt        float64
 
 	GridFins []GridFinSample
+
+	// Наведение посадочного импульса по G-FOLD. GfoldStatus — исход
+	// последнего решения (см. gfoldStatusCode); NaN означает, что задача
+	// ещё ни разу не решалась, и это осмысленно отличается от нуля («решение
+	// найдено»), см. CLAUDE.md про неопределённые величины.
+	GfoldStatus        float64
+	GfoldSolves        float64
+	GfoldFailures      float64
+	GfoldMiss          float64
+	GfoldTimeOfFlight  float64
+	GfoldPlannedFuel   float64
+	GfoldSlack         float64
+	GfoldTrackPosition float64
+	GfoldTrackVelocity float64
+
+	// Захват башней (см. simulator/catch_tower.go). Все величины сняты в
+	// момент прохождения плоскости рук, а не после падения корпуса, и до
+	// этого момента равны NaN: ноль здесь означал бы «промах нулевой».
+	FinTorqueRequested float64
+	FinTorqueDelivered float64
+	FinSaturated       bool
+
+	GfoldShadowStatus    float64
+	GfoldShadowMiss      float64
+	GfoldShadowTof       float64
+	GfoldShadowReachable bool
+
+	PassiveMiss        float64
+	CoastLeanDemand    float64
+	CoastLeanAuthority float64
+	CoastLeanApplied   float64
+
+	CatchMissAlong      float64
+	CatchMissAcross     float64
+	CatchMissVertical   float64
+	CatchMissHorizontal float64
+	CatchMiss3D         float64
+	CatchDownrange      float64
+	CatchCrossrange     float64
+	CatchVertical       float64
+	CatchHorizontal     float64
+	CatchTilt           float64
+	CatchAngularRate    float64
+	CatchCrossed        bool
+	CatchSuccess        bool
 }
 
 // SetBooster публикует параметры возвращающегося бустера.
@@ -490,6 +653,11 @@ func SetBooster(s BoosterSample) {
 	boosterPitch.Set(s.Pitch)
 	boosterYaw.Set(s.Yaw)
 	boosterRoll.Set(s.Roll)
+	boosterYawCont.Set(s.YawContinuous)
+	boosterRollCont.Set(s.RollContinuous)
+	boosterRateRoll.Set(s.BodyRollRate)
+	boosterRatePitch.Set(s.BodyPitchRate)
+	boosterRateYaw.Set(s.BodyYawRate)
 	boosterFuelMass.Set(s.FuelMass)
 	boosterThrottle.Set(s.Throttle)
 	boosterEngines.Set(s.EnginesRunning)
@@ -504,6 +672,41 @@ func SetBooster(s BoosterSample) {
 	} else {
 		boosterSplashV.Set(math.NaN())
 	}
+	boosterGfoldStatus.Set(s.GfoldStatus)
+	boosterGfoldSolves.Set(s.GfoldSolves)
+	boosterGfoldFailures.Set(s.GfoldFailures)
+	boosterGfoldMiss.Set(s.GfoldMiss)
+	boosterFinTorqueReq.Set(s.FinTorqueRequested)
+	boosterFinTorqueDone.Set(s.FinTorqueDelivered)
+	boosterFinSaturated.Set(boolToFloat(s.FinSaturated))
+	boosterGfoldShadowStatus.Set(s.GfoldShadowStatus)
+	boosterGfoldShadowMiss.Set(s.GfoldShadowMiss)
+	boosterGfoldShadowTof.Set(s.GfoldShadowTof)
+	boosterGfoldShadowReach.Set(boolToFloat(s.GfoldShadowReachable))
+	boosterPassiveMiss.Set(s.PassiveMiss)
+	boosterCoastLeanDemand.Set(s.CoastLeanDemand)
+	boosterCoastLeanAuthority.Set(s.CoastLeanAuthority)
+	boosterCoastLeanApplied.Set(s.CoastLeanApplied)
+	boosterGfoldTof.Set(s.GfoldTimeOfFlight)
+	boosterGfoldFuel.Set(s.GfoldPlannedFuel)
+	boosterGfoldSlack.Set(s.GfoldSlack)
+	boosterGfoldTrackPos.Set(s.GfoldTrackPosition)
+	boosterGfoldTrackVel.Set(s.GfoldTrackVelocity)
+
+	boosterCatchAlong.Set(s.CatchMissAlong)
+	boosterCatchAcross.Set(s.CatchMissAcross)
+	boosterCatchVertical.Set(s.CatchMissVertical)
+	boosterCatchHorizontal.Set(s.CatchMissHorizontal)
+	boosterCatch3D.Set(s.CatchMiss3D)
+	boosterCatchDownrange.Set(s.CatchDownrange)
+	boosterCatchCrossrange.Set(s.CatchCrossrange)
+	boosterCatchVVel.Set(s.CatchVertical)
+	boosterCatchHVel.Set(s.CatchHorizontal)
+	boosterCatchTilt.Set(s.CatchTilt)
+	boosterCatchRate.Set(s.CatchAngularRate)
+	boosterCatchCrossed.Set(boolToFloat(s.CatchCrossed))
+	boosterCatchSuccess.Set(boolToFloat(s.CatchSuccess))
+
 	for _, f := range s.GridFins {
 		boosterFinDeflection.WithLabelValues(f.Name).Set(f.Deflection)
 	}

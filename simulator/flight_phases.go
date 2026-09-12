@@ -211,7 +211,7 @@ func (s *Simulation) performStageSeparation() {
 	// в этой модели) ведут себя как прежде.
 	if cfg.BoosterReturn {
 		s.booster = NewBooster(cfg, s.state.Position, s.state.Velocity,
-			s.elapsed, s.rng, s.sensorRng, stageStartTemperature(cfg), s.attitude.Orientation)
+			s.elapsed, s.rng, s.sensorRng, s.seed, stageStartTemperature(cfg), s.attitude.Orientation)
 		s.calibrateBoosterBoard()
 	} else {
 		s.spentStage = env.NewSpentStage(

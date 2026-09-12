@@ -53,6 +53,10 @@ func registerControlRoutes(r *mux.Router) {
 	r.HandleFunc("/api/vehicle/load", loadHandler).
 		Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
 
+	// Геометрия башни-ловушки: статична, читается сценой один раз.
+	r.HandleFunc("/api/catch/tower", towerHandler).
+		Methods(http.MethodGet, http.MethodOptions)
+
 	// Зажигание одной конкретной камеры (в отличие от /api/sim/ignite,
 	// который запускает всю ступень).
 	r.HandleFunc("/api/engines/{id}/ignite", igniteEngineHandler).
@@ -296,6 +300,21 @@ func layoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, vehicle.NewLayout(currentConfig()))
+}
+
+// towerHandler отдаёт геометрию башни-ловушки.
+//
+// Отдельной ручкой, а не полем в кадре сцены: геометрия неизменна за весь
+// прогон, и возить её двадцать раз в секунду вместе с положением корпуса
+// значило бы платить трафиком за постоянную величину.
+func towerHandler(w http.ResponseWriter, r *http.Request) {
+	if sim := simulator.GetCurrentSimulation(); sim != nil &&
+		sim.Started() && !sim.Finished() {
+
+		writeJSON(w, simulator.CatchTowerFor(sim.Config))
+		return
+	}
+	writeJSON(w, simulator.CatchTowerFor(currentConfig()))
 }
 
 // loadHandler читает и меняет заправку носителя перед пуском.

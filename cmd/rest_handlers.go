@@ -30,6 +30,9 @@ func startRESTServer() {
 	// и поток телеметрии.
 	registerControlRoutes(router)
 
+	// Страница «Траектория» — отдельная от пульта, со своими данными.
+	registerTrajectoryRoutes(router)
+
 	// Веб-интерфейс центра управления.
 	registerUIRoutes(router)
 

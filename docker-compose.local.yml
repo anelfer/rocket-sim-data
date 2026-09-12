@@ -1,0 +1,82 @@
+# Локальный запуск стека на свободных портах.
+#
+# Зачем отдельный файл, а не правка docker-compose.yml. Порты 3000 (Grafana)
+# и 9090 (Prometheus) на этой машине заняты посторонним, давно работающим
+# проектом. Останавливать его нельзя, а основной docker-compose.yml — рабочий
+# файл проекта, и менять в нём адреса под особенность одной машины неверно.
+#
+# Надстройкой (docker compose -f base -f override) это не решается: Compose
+# 2.6 объединяет списки ports сложением, а не заменой, — переопределить
+# адрес там нечем (директива !override появилась заметно позже).
+#
+# Внутренняя связность от адресов на хосте не зависит: Prometheus ходит в
+# симулятор по имени контейнера (rocket-simulator:8086), Grafana в Prometheus
+# — по prometheus:9090, обе пары живут в общей сети monitoring. Наружу стек
+# при этом виден по адресам ниже.
+#
+#   docker compose -f docker-compose.local.yml up -d --build
+services:
+  rocket-simulator:
+    build: .
+    container_name: rocket-telemetry-simulator
+    ports:
+      - "8086:8086"  # метрики Prometheus
+      - "8087:8087"  # REST API, WebSocket, пульт и страница «Траектория»
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - rocket-simulator
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # Grafana строит по этому адресу ссылки и перенаправления: оставить
+      # здесь 3000 значило бы уводить оператора на чужой сервис.
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+      - GF_INSTALL_PLUGINS=
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

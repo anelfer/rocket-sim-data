@@ -56,6 +56,11 @@ const S3 = {
   // разглядывая при этом бустер).
   cameraTarget: 'ship',
 
+  // Башня-ловушка: геометрия с /api/catch/tower и признак того, что камера
+  // уже развёрнута вдоль рук (см. buildCatchCamera).
+  tower: null,
+  catchCam: false,
+
   // Буфер последних состояний и номер хода отрисовки.
   buf: [],
   loop: 0,
@@ -98,6 +103,7 @@ const fromScene = s => v3(s?.e || 0, s?.n || 0, s?.u || 0);
    -------------------------------------------------------------------------- */
 
 function initScene3D() {
+  loadTower();
   if (S3.ready) return;
 
   const canvas = document.getElementById('scene-canvas');
@@ -392,6 +398,13 @@ function blendFrames() {
 
   const toScene = u => ({ e: u.x, n: u.y, u: u.z });
 
+  // Вектор на башню — смещение в метрах, а не направление: складывается
+  // покомпонентно и НЕ нормируется, иначе башня уехала бы на единичное
+  // расстояние от корпуса.
+  const offset = (x, y) => x && y
+    ? { e: mix(x.e, y.e), n: mix(x.n, y.n), u: mix(x.u, y.u) }
+    : (y || x);
+
   const sa = a.scene, sb = b.scene;
   if (sa && sb) {
     out.scene = {
@@ -401,6 +414,7 @@ function blendFrames() {
       airflow: toScene(vec(sa.airflow, sb.airflow)),
       velocity: toScene(vec(sa.velocity, sb.velocity)),
       downrange: mix(sa.downrange, sb.downrange),
+      tower: offset(sa.tower, sb.tower),
     };
   }
 
@@ -430,6 +444,7 @@ function blendFrames() {
         airflow: toScene(vec(bsa.airflow, bsb.airflow)),
         velocity: toScene(vec(bsa.velocity, bsb.velocity)),
         downrange: mix(bsa.downrange, bsb.downrange),
+        tower: offset(bsa.tower, bsb.tower),
       };
     }
 
@@ -514,14 +529,18 @@ function renderBody(ctx, x, y, w, h, active, onlyStage, lines) {
   drawSky(ctx, w, h, active.altitude || 0);
 
   fitCamera(active);
-  const cam = buildCamera(active, w, h);
+  // На подходе к площадке камера сама встаёт так, чтобы в кадре были и
+  // башня с обеими руками, и подходящий бустер (см. buildCatchCamera).
+  const cam = buildCatchCamera(active, w, h) || buildCamera(active, w, h);
 
   const faces = [];
   if (S3.showGrid) planetFaces(faces, active);
+  towerFaces(faces, active);
   vehicleFaces(faces, active, onlyStage);
   drawFaces(ctx, faces, cam);
 
   if (S3.showGrid) drawGroundGrid(ctx, cam, active);
+  drawCatch(ctx, cam, active);
   if (S3.showFlow) drawArrows(ctx, cam, active);
 
   hudText(ctx, w, h, lines);
@@ -609,6 +628,7 @@ function boosterFrame(t) {
     lon: b.lon,
     scene: b.scene,
     gridFins: b.gridFins,
+    catch: b.catch,
     engines: b.engines || [],
     flaps: [],
     heatShield: null,
@@ -626,6 +646,8 @@ function boosterHudLines(b, t) {
     `высота ${num((b.altitude || 0) / 1000, 1)} км`,
   ];
   if (fin) lines.push(`рули ${fin}`);
+  if (b.phase === 'Caught') lines.push('ПОЙМАН БАШНЕЙ');
+  lines.push(...catchLines(b.catch));
   if (b.destroyed) lines.push('РАЗРУШЕН: приводнился и завалился набок');
   return lines;
 }
@@ -1374,7 +1396,13 @@ function drawGroundGrid(ctx, cam, t) {
   const alt = t.altitude || 0;
   if (alt > 20000) return;
 
-  const z = -Math.max(alt, 0.5);
+  // Грунт у площадки лежит НИЖЕ нулевой отметки телеметрии на высоту
+  // стартового стола: ноль — это верх стола, на нём изделие и стоит
+  // (см. towerFaces). Поправка вводится только там, где башня в кадре, —
+  // вдали от площадки разница в два десятка метров невидима, а сетка
+  // должна сходиться с горизонтом, а не с фермой.
+  const drop = towerBase(t) ? (S3.tower.tableHeight || 0) : 0;
+  const z = -Math.max(alt, 0.5) - drop;
   const step = alt < 400 ? 20 : alt < 4000 ? 200 : 2000;
   const half = 10;
   const fade = 1 - Math.min(1, alt / 20000);
@@ -1397,13 +1425,327 @@ function drawGroundGrid(ctx, cam, t) {
   }
 
   // Точка под кораблём: видно, куда он идёт.
-  const p = project(v3(0, 0, z), cam);
+  const p = project(v3(0, 0, -Math.max(alt, 0.5)), cam);
   if (p) {
     ctx.strokeStyle = `rgba(255,190,120,${0.3 + 0.5 * fade})`;
     ctx.beginPath();
     ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
     ctx.stroke();
   }
+}
+
+/* --------------------------------------------------------------------------
+   Башня-ловушка
+
+   Цель возврата бустера — не точка на земле, а ПРОСВЕТ МЕЖДУ РУКАМИ башни на
+   высоте нескольких десятков метров над стартовым столом. Поэтому здесь
+   рисуется не условная отметка площадки, а сама конструкция: ферма, стол, обе
+   руки и коридор захвата между ними. По такой картинке видно то, чего не видно
+   ни по одному числу, — проходит ли корпус между руками или бьётся о них.
+
+   Геометрия приходит один раз с /api/catch/tower, положение — вектором от
+   корпуса к основанию фермы в кадре сцены (booster.tower): считать его из
+   широт и долгот на стороне картинки значило бы повторять преобразования
+   координат и расходиться с моделью на десятки метров.
+   -------------------------------------------------------------------------- */
+
+/* Дальность, с которой башня начинает рисоваться, м. Дальше она занимает
+   меньше пикселя, а граней стоит полторы сотни. */
+const TOWER_DRAW_RANGE = 6000;
+
+function loadTower() {
+  fetch('/api/catch/tower')
+    .then(r => (r.ok ? r.json() : null))
+    .then(g => { if (g && g.towerHeight) S3.tower = g; })
+    .catch(() => {});
+}
+
+/* Вектор от корпуса к основанию фермы в осях сцены. null — башни в кадре нет:
+   либо геометрия ещё не загружена, либо это не бустер, либо до площадки
+   слишком далеко. */
+function towerBase(t) {
+  if (!S3.tower || !t || !t.scene || !t.scene.tower) return null;
+  const base = fromScene(t.scene.tower);
+  return vLen(base) > TOWER_DRAW_RANGE ? null : base;
+}
+
+/* Орты системы башни в осях сцены: вдоль рук (от фермы к просвету), поперёк
+   рук и вверх. Сходимость меридианов на километре площадки — доли угловой
+   секунды, поэтому азимут берётся как есть. */
+function towerAxes(g) {
+  const a = (g.armAzimuth || 0) * Math.PI / 180;
+  const along = v3(Math.sin(a), Math.cos(a), 0);
+  const up = v3(0, 0, 1);
+  return { along, across: vCross(up, along), up };
+}
+
+/* Построитель точки в осях башни: вдоль, поперёк, вверх — в метрах. */
+function towerMapper(g, base) {
+  const { along, across, up } = towerAxes(g);
+  return (x, y, z) => vAdd(base,
+    vAdd(vAdd(vMul(along, x), vMul(across, y)), vMul(up, z)));
+}
+
+/* Параллелепипед по центру и трём полуосям. twoSided — чтобы не зависеть от
+   обхода вершин: тела выпуклые, сортировка по глубине рисует дальние грани
+   раньше ближних сама. */
+function boxFaces(faces, P, c, half, colour, extra) {
+  const [cx, cy, cz] = c;
+  const [hx, hy, hz] = half;
+  const p = (sx, sy, sz) => P(cx + hx * sx, cy + hy * sy, cz + hz * sz);
+  const quads = [
+    [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]],
+    [[-1, -1, -1], [-1, -1, 1], [-1, 1, 1], [-1, 1, -1]],
+    [[-1, 1, -1], [-1, 1, 1], [1, 1, 1], [1, 1, -1]],
+    [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1]],
+    [[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]],
+    [[-1, -1, -1], [-1, 1, -1], [1, 1, -1], [1, -1, -1]],
+  ];
+  for (const q of quads) {
+    faces.push(Object.assign({
+      p: q.map(s => p(s[0], s[1], s[2])), c: colour, twoSided: true,
+    }, extra || {}));
+  }
+}
+
+/* Плоский стержень фермы: отрезок от a до b, поднятый на ширину w. Один
+   четырёхугольник на связь вместо шести — решётка из сотни коробок стоила бы
+   дороже самого корпуса ракеты. */
+function strutFace(faces, P, a, b, w, colour) {
+  const p0 = P(a[0], a[1], a[2]);
+  const p1 = P(b[0], b[1], b[2]);
+  const p2 = P(b[0], b[1], b[2] + w);
+  const p3 = P(a[0], a[1], a[2] + w);
+  faces.push({ p: [p0, p1, p2, p3], c: colour, twoSided: true, flat: true });
+}
+
+const TOWER_STEEL = [118, 126, 138];
+const TOWER_DARK = [86, 92, 102];
+const TABLE_STEEL = [104, 100, 94];
+const ARM_STEEL = [150, 156, 166];
+
+function towerFaces(faces, t) {
+  const g = S3.tower;
+  const base = towerBase(t);
+  if (!base) return;
+
+  const P = towerMapper(g, base);
+  const w = g.towerWidth / 2;
+
+  // Нулевая отметка сцены — УРОВЕНЬ СТАРТА, то есть верх стартового стола.
+  //
+  // Высота в телеметрии отсчитывается от точки, в которой изделие стоит на
+  // старте, и в трёхмерной сцене корпус строится от той же нулевой отметки.
+  // Значит, стол обязан быть ПОД ней, а не над: пока тумба рисовалась вверх
+  // от нуля, ракета на старте оказывалась внутри неё по самые решётчатые
+  // рули. Грунт вокруг лежит на высоту стола ниже — там же стоит и ферма.
+  const ground = -g.tableHeight;
+
+  // Стартовый стол — восьмигранная тумба под центром зоны захвата.
+  const tableSeg = 8, tr = g.tableRadius;
+  const ringPt = i => {
+    const a = (i / tableSeg) * Math.PI * 2;
+    return [g.armReach + tr * Math.cos(a), tr * Math.sin(a)];
+  };
+  for (let i = 0; i < tableSeg; i++) {
+    const a = ringPt(i), b = ringPt((i + 1) % tableSeg);
+    faces.push({
+      p: [P(a[0], a[1], ground), P(b[0], b[1], ground),
+        P(b[0], b[1], 0), P(a[0], a[1], 0)],
+      c: TABLE_STEEL, twoSided: true,
+    });
+  }
+  const top = [];
+  for (let i = 0; i < tableSeg; i++) {
+    const a = ringPt(i);
+    top.push(P(a[0], a[1], 0));
+  }
+  faces.push({ p: top, c: [126, 122, 116], twoSided: true });
+
+  // Ферма: четыре пояса и решётка по секциям.
+  const legs = [[w, w], [w, -w], [-w, -w], [-w, w]];
+  for (const [x, y] of legs) {
+    boxFaces(faces, P, [x, y, ground + g.towerHeight / 2],
+      [0.7, 0.7, g.towerHeight / 2], TOWER_STEEL);
+  }
+  const bays = Math.max(1, g.towerBays | 0);
+  const bay = g.towerHeight / bays;
+  for (let i = 0; i < bays; i++) {
+    const z0 = ground + i * bay, z1 = ground + (i + 1) * bay;
+    for (let k = 0; k < 4; k++) {
+      const a = legs[k], b = legs[(k + 1) % 4];
+      strutFace(faces, P, [a[0], a[1], z1], [b[0], b[1], z1], 0.6, TOWER_DARK);
+      strutFace(faces, P, [a[0], a[1], z0], [b[0], b[1], z1], 0.5, TOWER_DARK);
+      strutFace(faces, P, [b[0], b[1], z0], [a[0], a[1], z1], 0.5, TOWER_DARK);
+    }
+  }
+
+  // Руки: две балки на высоте захвата, просвет между ними — то самое, во что
+  // обязан войти корпус.
+  const armMid = w + g.armLength / 2;
+  const side = g.armGap / 2 + g.armWidth / 2;
+  for (const s of [1, -1]) {
+    boxFaces(faces, P, [armMid, s * side, g.armHeight],
+      [g.armLength / 2, g.armWidth / 2, g.armThickness / 2], ARM_STEEL);
+    // Обойма на конце руки — по ней видно, где руки смыкаются.
+    boxFaces(faces, P, [g.armReach, s * (g.armGap / 2 + 0.6), g.armHeight],
+      [3.0, 0.6, g.armThickness / 2 + 0.4], [190, 160, 90]);
+  }
+
+  // Коридор захвата: прозрачный объём от высоты опорной точки до рук —
+  // канал, по которому корпус обязан пройти.
+  const chTop = g.armHeight + 6;
+  boxFaces(faces, P, [g.armReach, 0, (g.catchHeight + chTop) / 2],
+    [g.corridorAlong, g.corridorAcross, (chTop - g.catchHeight) / 2],
+    [70, 190, 255], { glow: 0.10 });
+
+  // Само окно захвата — допуск на опорную точку корпуса.
+  boxFaces(faces, P, [g.armReach, 0, g.catchHeight],
+    [g.corridorAlong, g.corridorAcross, g.catchWindow],
+    [90, 255, 170], { glow: 0.22 });
+}
+
+/* Разметка промаха поверх сцены: центр зоны, фактическая точка прохода
+   плоскости рук, отрезок между ними и подпись.
+
+   Точка прохода — именно та, что модель записала при пересечении высоты
+   захвата (booster.catch), а не текущее положение корпуса: после того как
+   ступень прошла зону насквозь и упала, её координаты описывают уже другое
+   событие. */
+function drawCatch(ctx, cam, t) {
+  const g = S3.tower;
+  const base = t && t.isBooster ? towerBase(t) : null;
+  if (!base) return;
+
+  const P = towerMapper(g, base);
+  const c = t.catch || {};
+  const centre = P(g.armReach, 0, g.catchHeight);
+
+  const mark = (p, colour, r) => {
+    const s = project(p, cam);
+    if (!s) return null;
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(s.x - r, s.y); ctx.lineTo(s.x + r, s.y);
+    ctx.moveTo(s.x, s.y - r); ctx.lineTo(s.x, s.y + r);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r * 0.62, 0, Math.PI * 2);
+    ctx.stroke();
+    return s;
+  };
+
+  const sc = mark(centre, 'rgba(110,255,180,0.95)', 9);
+  if (sc) {
+    ctx.fillStyle = 'rgba(110,255,180,0.95)';
+    ctx.font = '11px ui-monospace, monospace';
+    ctx.fillText('центр захвата', sc.x + 12, sc.y - 6);
+  }
+
+  if (!Number.isFinite(c.catchActualX)) return;
+
+  const actual = P(c.catchActualX, c.catchActualY, c.catchActualZ);
+  const hit = c.catchSuccess;
+  const colour = hit ? 'rgba(120,255,140,0.95)'
+    : c.catchCrossed ? 'rgba(255,140,120,0.95)' : 'rgba(255,205,110,0.95)';
+
+  const sa = mark(actual, colour, 8);
+  if (sa && sc) {
+    ctx.strokeStyle = colour;
+    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(sc.x, sc.y);
+    ctx.lineTo(sa.x, sa.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const miss = c.catchMissHorizontal;
+    if (Number.isFinite(miss)) {
+      ctx.fillStyle = colour;
+      ctx.font = 'bold 12px ui-monospace, monospace';
+      ctx.fillText(`${hit ? 'ЗАХВАТ' : 'ПРОМАХ'}: ${num(miss, 0)} м`,
+        (sc.x + sa.x) / 2 + 8, (sc.y + sa.y) / 2 - 6);
+    }
+  }
+}
+
+/* Камера финального участка: башня, обе руки, стол и подходящий бустер
+   одновременно в кадре.
+
+   Взгляд ставится ВДОЛЬ рук — только с этого направления видно, проходит ли
+   корпус между ними: вдоль просвета руки расходятся влево и вправо, и зазор
+   читается напрямую. Дальше оператор волен вертеть камеру как обычно —
+   направление задаётся один раз, при входе в зону. */
+function buildCatchCamera(t, w, h) {
+  const g = S3.tower;
+  const base = t && t.isBooster ? towerBase(t) : null;
+  if (!base) { leaveCatchCamera(); return null; }
+
+  const P = towerMapper(g, base);
+  const centre = P(g.armReach, 0, g.catchHeight);
+  if (vLen(centre) > 1500) { leaveCatchCamera(); return null; }
+
+  if (!S3.catchCam) {
+    S3.catchCam = true;
+    S3.bodyCamSaved = S3.bodyCam;
+    S3.cam.yaw = (g.armAzimuth || 0) * Math.PI / 180;
+    S3.cam.pitch = 0.10;
+    S3.bodyCam = false;
+  }
+
+  const target = vMul(centre, 0.5);
+  const span = vLen(centre) + vehicleLength(t) * 0.7 + g.armLength;
+  const dist = Math.max(span * 0.9, 120) * S3.zoom;
+  S3.cam.dist = dist;
+
+  const cp = Math.cos(S3.cam.pitch), sp = Math.sin(S3.cam.pitch);
+  let pos = vAdd(target, v3(
+    dist * cp * Math.sin(S3.cam.yaw),
+    dist * cp * Math.cos(S3.cam.yaw),
+    dist * sp));
+
+  const groundZ = -(t.altitude || 0) + 12;
+  if (pos.z < groundZ) pos = v3(pos.x, pos.y, groundZ);
+
+  const fwd = vUnit(vSub(target, pos));
+  let right = vCross(fwd, v3(0, 0, 1));
+  if (vLen(right) < 1e-6) right = v3(1, 0, 0);
+  right = vUnit(right);
+  return { pos, target, fwd, right, up: vCross(right, fwd), cx: w / 2, cy: h / 2, f: h * 1.15 };
+}
+
+/* Выход из режима захвата возвращает оператору его же настройку привязки
+   камеры к корпусу: режим её временно снимает, чтобы башня не вращалась
+   вместе с ракетой, но забирать чужую галочку насовсем он не вправе. */
+function leaveCatchCamera() {
+  if (!S3.catchCam) return;
+  S3.catchCam = false;
+  if (S3.bodyCamSaved !== undefined) S3.bodyCam = S3.bodyCamSaved;
+}
+
+/* Строки о захвате для подписи под бустером. */
+function catchLines(c) {
+  if (!c || !Number.isFinite(c.catchMissHorizontal)) return [];
+  const out = [];
+  if (c.catchSuccess) {
+    out.push(`ЗАХВАТ: промах ${num(c.catchMissHorizontal, 1)} м`);
+  } else if (c.catchCrossed) {
+    out.push(`ПРОМАХ ЗАХВАТА: ${num(c.catchMissHorizontal, 0)} м`);
+  } else {
+    out.push(`подход к зоне: ${num(c.catchMissHorizontal, 0)} м`);
+  }
+  out.push(`вдоль ${num(c.catchMissX, 0)} · поперёк ${num(c.catchMissY, 0)} · верт ${num(c.catchMissZ, 0)} м`);
+  if (Number.isFinite(c.catchMiss3D)) out.push(`полный промах ${num(c.catchMiss3D, 0)} м`);
+  if (Number.isFinite(c.catchMissDownrange)) {
+    out.push(`продольный ${num(c.catchMissDownrange, 0)} · боковой ${num(c.catchMissCrossrange, 0)} м`);
+  }
+  if (Number.isFinite(c.catchVerticalVelocity)) {
+    out.push(`в зоне: Vверт ${num(c.catchVerticalVelocity, 1)} · Vгор ${num(c.catchHorizontalVelocity, 1)} м/с`);
+    out.push(`наклон ${num(c.catchTilt, 1)}° · вращение ${num(c.catchAngularRate, 1)}°/с`);
+  }
+  return out;
 }
 
 /* --------------------------------------------------------------------------
@@ -1517,8 +1859,10 @@ function drawArrows(ctx, cam, t) {
    -------------------------------------------------------------------------- */
 
 function collectTrack(t) {
-  // Новый прогон — новый след.
-  if (t.time < S3.lastTime) S3.track = [];
+  // Новый прогон — новый след, камера снова не развёрнута вдоль рук, и
+  // геометрия башни перечитывается: между прогонами оператор мог сменить
+  // носитель, а высота захвата считается от длины ступени.
+  if (t.time < S3.lastTime) { S3.track = []; leaveCatchCamera(); loadTower(); }
   S3.lastTime = t.time;
 
   const last = S3.track[S3.track.length - 1];

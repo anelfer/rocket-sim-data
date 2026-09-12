@@ -203,6 +203,15 @@ type VehicleAttitude struct {
 	// внешнего наблюдения — ни на что не влияет.
 	AttitudeError physics.Vec3
 
+	// CenterOfMassUsed — центр масс (доля длины от носа), с которым контур
+	// считал момент на последнем такте. Только для наблюдения.
+	CenterOfMassUsed float64
+
+	// Target — потребная ориентация, поданная автопилоту на последнем такте.
+	// Только для наблюдения (телеметрия, разбор полёта): сам контур
+	// пользуется ей через аргумент, а не через это поле.
+	Target physics.Attitude
+
 	// RequestedTorque — потребный момент (mcmd), переданный в
 	// SurfaceSet.Allocate, Н·м, связанные оси. Диагностическое поле: не
 	// участвует в самом расчёте, только сохраняет то, что уже вычислено.
@@ -251,7 +260,27 @@ type VehicleAttitude struct {
 // AttitudeInput — внешние условия для расчёта углового движения.
 type AttitudeInput struct {
 	// Target — потребная ориентация, назначенная наведением.
+	//
+	// Когда задано TargetDirection, эти углы служат ТОЛЬКО телеметрии:
+	// управление идёт по направлению, а не по ним.
 	Target physics.Attitude
+
+	// TargetOrientation — потребная ориентация целиком, кватернионом.
+	// Ненулевой кватернион означает, что цель задана им, а не углами.
+	//
+	// Разница не в удобстве записи. Пара «тангаж + азимут» у вертикально
+	// стоящего корпуса вырождена: азимут продольной оси не определён, и
+	// опора крена, которую Attitude.BodyFrame строит ИЗ АЗИМУТА,
+	// переворачивается на сто восемьдесят градусов от возмущения в доли
+	// сантиметра в секунду. Автопилот получает при этом команду резко
+	// накренить корпус — на ровном месте, из одного лишь способа записи
+	// цели. Бустер живёт в этой особой точке весь возврат: тангаж на
+	// пассивном участке 85-90°.
+	//
+	// Нулевой вектор оставляет прежний путь через Target — им пользуется
+	// корабль, у которого крен назначается ролл-программой и обязан
+	// отслеживаться абсолютно.
+	TargetOrientation physics.Quaternion
 
 	// Frame — местный горизонтальный базис.
 	Frame physics.LocalFrame
@@ -288,6 +317,19 @@ type AttitudeInput struct {
 	// CenterOfMass — положение центра масс от носа, доля длины.
 	CenterOfMass float64
 
+	// PropellantMass, PropellantX, PropellantLength — топливо как отдельное
+	// тело: масса (кг), положение его центра тяжести (доля длины от носа) и
+	// высота залитого столба (доля длины). Приходят из геометрии баков и
+	// уровня их заполнения — см. vehicle.TankSpans/PropellantCenter.
+	//
+	// Нулевая PropellantLength означает «раскладка не задана»: тогда инерция
+	// считается прежним способом (physics.CompositeInertia, топливо внутри
+	// массы конструкции). Это нужно прямым тестам VehicleAttitude, которые
+	// собирают вход руками и о баках ничего не знают.
+	PropellantMass   float64
+	PropellantX      float64
+	PropellantLength float64
+
 	// GimbalArm — расстояние от центра масс до плоскости качания камер, м.
 	GimbalArm float64
 
@@ -302,6 +344,17 @@ type AttitudeInput struct {
 
 	// Overrides — ручные воздействия на рулевой тракт.
 	Overrides control.ControlOverrides
+
+	// AeroStable сообщает, что в ТЕКУЩЕМ обтекании корпус статически
+	// устойчив — собственный аэродинамический момент возвращает его к
+	// потоку, а не уводит.
+	//
+	// Ставит вызывающая сторона, и пока только бустер: у него голый корпус,
+	// и признак считается прямо по потоку (tailFirstInFlow). Корабль сюда
+	// не входит намеренно — его момент на входе в атмосферу создают закрылки
+	// и балансируют ими же, это другой аппарат в другом режиме, и
+	// замерами он здесь не подкреплён.
+	AeroStable bool
 
 	// Controllable сообщает, что рулевой тракт работоспособен.
 	//
@@ -338,6 +391,33 @@ func (a *VehicleAttitude) Init(target physics.Attitude, frame physics.LocalFrame
 // Шаг интегрирования вращения берётся мельче шага поступательного движения:
 // постоянная времени неустойчивого корпуса при высоком напоре составляет доли
 // секунды, и на шаге в одну десятую решение разошлось бы.
+// tailFirstInFlow сообщает, что корпус подставлен потоку хвостом — тем
+// концом, где двигатели. Условие берётся из ФАКТИЧЕСКОЙ ориентации и
+// ФАКТИЧЕСКОГО потока, а не из фазы полёта: устойчивость создаётся
+// взаимным положением центра давления и центра масс в этом обтекании, а
+// не названием участка траектории.
+//
+// Граница — ровно девяносто градусов, полёт бортом. Она не выбрана, а
+// следует из геометрии: центр давления лежит позади середины корпуса (нос
+// сужается, двигательный отсек тупой), центр масс — впереди неё, и знак
+// момента меняется тогда же, когда поток переходит с носовой половины на
+// хвостовую. Ровно на этой границе величина момента и так близка к нулю:
+// нормальная сила приложена у середины, плечо до центра масс мало, — так
+// что вопрос «что делать точно на 90°» ни на что не влияет.
+//
+// Порог строже (скажем, 135°) пробовался и оказался хуже: он выключается
+// как раз тогда, когда корпус уже завалило, то есть возвращает полную
+// компенсацию ровно в том состоянии, из которого её и надо вытаскивать.
+// Замерено: наклон 66°, угловая скорость 117 °/с против 32° и 14 °/с.
+func tailFirstInFlow(orientation physics.Quaternion, airRelative physics.Vec3) bool {
+	speed := airRelative.Norm()
+	if speed < 1 {
+		return false
+	}
+	axis := orientation.Rotate(physics.Vec3{X: 1})
+	return axis.Dot(airRelative) < 0
+}
+
 func (a *VehicleAttitude) Update(dt float64, in AttitudeInput) {
 	if !a.initialised {
 		a.Init(in.Target, in.Frame)
@@ -377,9 +457,8 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	a.StaticMargin = (cop - in.CenterOfMass) *
 		in.Length / (2 * in.Radius)
 
-	a.Inertia = physics.CompositeInertia(
-		in.Mass-in.CarriedMass-in.EngineMass, in.EngineMass, in.CarriedMass,
-		in.Radius, in.Length, in.CenterOfMass)
+	a.Inertia = stageInertia(in)
+	a.CenterOfMassUsed = in.CenterOfMass
 
 	// --- 1. Аэродинамический момент ------------------------------------------
 	//
@@ -393,8 +472,9 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	// Ошибка ориентации вычисляется как поворот от текущего положения
 	// к потребному. Малые углы этого поворота и есть рассогласование
 	// по тангажу, рысканию и крену.
-	errPitch, errYaw, errRoll := a.attitudeError(in.Target, in.Frame)
+	errPitch, errYaw, errRoll := a.attitudeError(in.Target, in.TargetOrientation, in.Frame)
 	a.AttitudeError = physics.Vec3{X: errRoll, Y: errPitch, Z: errYaw}
+	a.Target = in.Target
 
 	// Ручные воздействия на рулевой тракт.
 	ov := in.Overrides
@@ -423,9 +503,36 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	// Потребный момент и потребное отклонение камер. Аэродинамический момент
 	// компенсируется явно: автопилот знает, что поток уводит корпус, и
 	// закладывает противодействие, а не ждёт появления ошибки.
-	wantPitch := a.Inertia.Iyy*accPitch - a.AeroTorque.Y
-	wantYaw := a.Inertia.Izz*accYaw - a.AeroTorque.Z
-	wantRoll := a.Inertia.Ixx*accRoll - a.AeroTorque.X
+	// Компенсируется только ОПРОКИДЫВАЮЩАЯ часть аэродинамического момента.
+	//
+	// Полная компенсация — точная линеаризация: приводы выдают всё, что
+	// нужно, чтобы суммарный момент равнялся заказанному ПД. Она верна для
+	// неустойчивого аппарата, и именно такой тут корпус, когда летит носом
+	// вперёд. Но возвращается ступень ДВИГАТЕЛЯМИ ВПЕРЁД, и в этом
+	// направлении та же геометрия статически УСТОЙЧИВА: проверено свободным
+	// возмущением с выключенным управлением — с десяти градусов угол атаки
+	// сам сходит к нулю за две секунды.
+	//
+	// Вычитать восстанавливающий момент значит тратить приводы на
+	// подавление собственной устойчивости аппарата. Замерено на розжиге:
+	// при НУЛЕВОЙ ошибке ориентации контур запрашивал +112.7 МН·м против
+	// аэродинамических −113.9, исполняли решётчатые рули (109.4 МН·м — на
+	// этом напоре самый сильный орган), корпус уводило от потока через
+	// девяносто градусов в область, где он уже неустойчив, и дальше он
+	// разворачивался сам.
+	//
+	// Признак «помогает» — момент того же знака, что и потребное угловое
+	// ускорение: он двигает корпус туда же, куда просит ПД. Такой момент
+	// оставляем работать, компенсируем только противоположный.
+	helping := func(aero, acc float64) float64 {
+		if in.AeroStable && aero*acc > 0 {
+			return 0
+		}
+		return aero
+	}
+	wantPitch := a.Inertia.Iyy*accPitch - helping(a.AeroTorque.Y, accPitch)
+	wantYaw := a.Inertia.Izz*accYaw - helping(a.AeroTorque.Z, accYaw)
+	wantRoll := a.Inertia.Ixx*accRoll - helping(a.AeroTorque.X, accRoll)
 
 	side := in.Thrust * in.GimbalArm
 	rollSide := in.Thrust * in.EngineRingRadius
@@ -458,7 +565,120 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 	a.Authority = required / math.Max(cfg.MaxGimbal, 1e-9)
 	a.Saturated = required > cfg.MaxGimbal
 
-	// --- 4. Аэродинамические поверхности --------------------------------------
+	// --- 4. Управляющий момент качанием камер ---------------------------------
+	//
+	// Считается ПЕРВЫМ среди всех органов, и это порядок подчинения, а не
+	// порядок строк. Пока двигатели работают, качание камер — главный орган:
+	// его момент не зависит от скоростного напора, отзывается он за доли
+	// секунды и не тратит отдельного рабочего тела. Аэродинамическим
+	// поверхностям (секция 5) остаётся ТОЛЬКО НЕДОБОР, а двигателям
+	// ориентации (секция 6) — то, чего не добрали оба.
+	//
+	// Раньше камеры и поверхности получали ОДНУ И ТУ ЖЕ полную команду
+	// wantRoll/wantPitch/wantYaw независимо друг от друга. Там, где власть
+	// есть у обоих, суммарный момент выходил вдвое больше потребного:
+	// контур получал ровно то удвоение петлевого усиления, от которого
+	// замкнутая система идёт вразнос. Снаружи это выглядело как решётчатые
+	// рули, намертво прижатые к упору (измерено: 72-89 % тактов полёта), при
+	// том что подвес камер держался около 9° из располагаемых 15° и не
+	// насыщался почти никогда.
+	//
+	// До Stage 4.5 отклонённая камера считалась одним агрегатным углом на
+	// весь блок сразу: боковая составляющая тяги T·sin δ на эффективном
+	// плече GimbalArm — а крен и вовсе получал отдельный, ничем не связанный
+	// с этим отклонением "магический" момент T·sin(GimbalRoll)·EngineRingRadius
+	// (см. историю ниже, case per-engine). При заданной карте камер
+	// (in.Engines) момент считается ИЗ РЕАЛЬНЫХ индивидуальных сил
+	// (engine_tvc.go) — единственный источник и поступательной силы, и
+	// вращающего момента, без отдельного "управляющего момента камеры".
+	a.UsingEngineTVC = len(in.Engines) > 0
+	switch {
+	case ov.Dead:
+		// Обесточенный рулевой тракт: моменту взяться неоткуда.
+		a.ControlTorque = physics.Vec3{}
+		a.EngineForce = physics.Vec3{}
+		a.UsingRCS = false
+
+	case in.Controllable && in.Thrust > 0 && len(in.Engines) > 0:
+		// Per-engine TVC (Stage 4.5, engine_tvc.go). Желаемая боковая сила —
+		// прямое малоугловое следствие ошибки ориентации (то же T·sin(err),
+		// которым раньше агрегатная модель считала бы угол качания, теперь
+		// это FEED-FORWARD цель для allocator'а, а не отдельно назначаемый
+		// угол): позволяет камерам начать компенсировать снос НЕ дожидаясь,
+		// пока довернётся весь корпус (п.27 Stage 4.5). Желаемый момент —
+		// тот же wantPitch/Yaw/Roll, что и раньше.
+		forceScale := 0.0
+		for _, e := range in.Engines {
+			forceScale += e.Thrust
+		}
+		torqueScale := forceScale * in.GimbalArm * math.Sin(cfg.MaxGimbal)
+
+		// Упреждение боковой силы пропорционально ошибке ориентации, и это
+		// ЗАМЕРЕННАЯ СЛАБОСТЬ, а не проверенное решение.
+		//
+		// При работающей тринадцатке оно перекрывает сам ПД-контур: при
+		// потребном моменте 20 МН·м раскладка выдавала 84 — вчетверо
+		// больше, причём знак и величину задавала уже не обратная связь по
+		// ориентации, а размер ошибки.
+		//
+		// Ограничение упреждения величиной sin(MaxGimbal) (просить боковую
+		// силу больше той, что даёт полное отклонение камер, бессмысленно)
+		// опробовано: угловая скорость на посадочном импульсе падает с
+		// 15…165 °/с до 7…33, то есть раскрутка действительно оттуда. Но
+		// сама по себе правка сдвигает профиль и ухудшает вертикаль в зоне
+		// захвата (в среднем по шести зёрнам 128 → 203 м/с), потому что
+		// заваливание корпуса идёт от другой причины: момент качания камер
+		// на этом режиме в разы меньше опрокидывающего. Ставить её имеет
+		// смысл вместе с решением той причины, а не вперёд него.
+		desiredForce := physics.Vec3{
+			X: forceScale,
+			Y: -forceScale * errYaw,
+			Z: forceScale * errPitch,
+		}
+
+		desiredTorque := physics.Vec3{X: wantRoll, Y: wantPitch, Z: wantYaw}
+
+		if len(a.EngineGimbal) != len(in.Engines) {
+			a.EngineGimbal = make([]EngineGimbalState, len(in.Engines))
+		}
+		if !ov.Frozen {
+			commanded := allocateEngineGimbal(in.Engines, in.GimbalArm,
+				desiredForce, desiredTorque, forceScale, torqueScale, cfg.MaxGimbal)
+			step := cfg.GimbalRate * dt
+			for i := range a.EngineGimbal {
+				a.EngineGimbal[i].Pitch = approachClamped(a.EngineGimbal[i].Pitch, commanded[i].Pitch, step, cfg.MaxGimbal)
+				a.EngineGimbal[i].Yaw = approachClamped(a.EngineGimbal[i].Yaw, commanded[i].Yaw, step, cfg.MaxGimbal)
+			}
+		}
+
+		// Финальная оценка — РЕАЛЬНАЯ, нелинейная модель (п.17 Stage 4.5),
+		// не линеаризация solver'а: то же самое, что попадёт в интегратор.
+		achievedForce, achievedTorque := engineForceTorque(in.Engines, a.EngineGimbal, in.GimbalArm)
+		a.EngineForce = achievedForce
+		a.ControlTorque = achievedTorque
+		a.UsingRCS = false
+
+	case in.Controllable && in.Thrust > 0:
+		// Агрегатная модель — ступени без индивидуальной карты камер
+		// (корабль; для бустера in.Engines всегда непуст при работающих
+		// двигателях, см. booster.go/updateAttitude).
+		a.ControlTorque = physics.Vec3{
+			X: in.Thrust * math.Sin(a.GimbalRoll) * in.EngineRingRadius,
+			Y: side * math.Sin(a.GimbalPitch+bias),
+			Z: side * math.Sin(a.GimbalYaw),
+		}
+		a.UsingRCS = false
+
+	default:
+		a.ControlTorque = physics.Vec3{}
+		a.UsingRCS = false
+	}
+
+	// enginesActive — момент действительно создаётся качанием камер на этом
+	// такте. От него зависит, кому достанется остаток (см. секции 5 и 6).
+	enginesActive := !ov.Dead && in.Controllable && in.Thrust > 0
+
+	// --- 5. Аэродинамические поверхности --------------------------------------
 	//
 	// Плавники и решётчатые рули отрабатывают тот же потребный момент, что
 	// и камеры, но их власть определяется скоростным напором. Автопилот здесь
@@ -481,7 +701,28 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 		comFromNose := in.CenterOfMass * in.Length
 		a.SurfaceAuthority = a.Surfaces.PitchAuthority(airBody, in.DynamicPressure, in.Mach, comFromNose)
 
-		mcmd := physics.Vec3{X: wantRoll, Y: wantPitch, Z: wantYaw}
+		// Поверхностям достаётся НЕДОБОР: то, что качание камер уже создало,
+		// повторять незачем — этот момент уже приложен к корпусу. При
+		// выключенных двигателях ControlTorque нулевой, и недобор равен всей
+		// потребности, как и было.
+		//
+		// Вычитается только момент ПЕРСОНАЛЬНОЙ модели камер (per-engine,
+		// UsingEngineTVC). Она возвращает реально достигнутый момент —
+		// сумму настоящих сил отклонённых камер (engineForceTorque), — и
+		// вычитать его правильно: он действительно приложен к корпусу.
+		//
+		// Агрегатная модель (ступени без карты камер) устроена иначе: её
+		// ControlTorque получается обратной подстановкой того же самого
+		// wantPitch/Yaw через gimbalFor, то есть это не измерение, а
+		// повторение запроса. Вычитать его значило бы вычесть из команды
+		// саму команду: поверхности остались бы вовсе без задания, и корпус
+		// на входе в атмосферу перестал бы удерживаться (проверено:
+		// увод угла атаки на 109° против допустимых пяти).
+		residual := physics.Vec3{X: wantRoll, Y: wantPitch, Z: wantYaw}
+		if a.UsingEngineTVC {
+			residual = residual.Sub(a.ControlTorque)
+		}
+		mcmd := residual
 
 		// Решётчатые рули бустера идут через честную МНК-раскладку
 		// (allocateOptimal, см. surfaces.go) — она сама находит комбинацию
@@ -531,77 +772,12 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 		a.SurfaceTorque = a.Surfaces.UpdateTorque(airBody, in.DynamicPressure, in.Mach, comFromNose)
 	}
 
-	// --- 5. Управляющий момент ------------------------------------------------
+	// --- 6. Двигатели ориентации ---------------------------------------------
 	//
-	// До Stage 4.5 отклонённая камера считалась одним агрегатным углом на
-	// весь блок сразу: боковая составляющая тяги T·sin δ на эффективном
-	// плече GimbalArm — а крен и вовсе получал отдельный, ничем не связанный
-	// с этим отклонением "магический" момент T·sin(GimbalRoll)·EngineRingRadius
-	// (см. историю ниже, case per-engine). При заданной карте камер
-	// (in.Engines) момент считается ИЗ РЕАЛЬНЫХ индивидуальных сил
-	// (engine_tvc.go) — единственный источник и поступательной силы, и
-	// вращающего момента, без отдельного "управляющего момента камеры".
-	a.UsingEngineTVC = len(in.Engines) > 0
-	switch {
-	case ov.Dead:
-		// Обесточенный рулевой тракт: моменту взяться неоткуда.
-		a.ControlTorque = physics.Vec3{}
-		a.EngineForce = physics.Vec3{}
-		a.UsingRCS = false
-
-	case in.Controllable && in.Thrust > 0 && len(in.Engines) > 0:
-		// Per-engine TVC (Stage 4.5, engine_tvc.go). Желаемая боковая сила —
-		// прямое малоугловое следствие ошибки ориентации (то же T·sin(err),
-		// которым раньше агрегатная модель считала бы угол качания, теперь
-		// это FEED-FORWARD цель для allocator'а, а не отдельно назначаемый
-		// угол): позволяет камерам начать компенсировать снос НЕ дожидаясь,
-		// пока довернётся весь корпус (п.27 Stage 4.5). Желаемый момент —
-		// тот же wantPitch/Yaw/Roll, что и раньше.
-		forceScale := 0.0
-		for _, e := range in.Engines {
-			forceScale += e.Thrust
-		}
-		torqueScale := forceScale * in.GimbalArm * math.Sin(cfg.MaxGimbal)
-
-		desiredForce := physics.Vec3{
-			X: forceScale,
-			Y: -forceScale * errYaw,
-			Z: forceScale * errPitch,
-		}
-		desiredTorque := physics.Vec3{X: wantRoll, Y: wantPitch, Z: wantYaw}
-
-		if len(a.EngineGimbal) != len(in.Engines) {
-			a.EngineGimbal = make([]EngineGimbalState, len(in.Engines))
-		}
-		if !ov.Frozen {
-			commanded := allocateEngineGimbal(in.Engines, in.GimbalArm,
-				desiredForce, desiredTorque, forceScale, torqueScale, cfg.MaxGimbal)
-			step := cfg.GimbalRate * dt
-			for i := range a.EngineGimbal {
-				a.EngineGimbal[i].Pitch = approachClamped(a.EngineGimbal[i].Pitch, commanded[i].Pitch, step, cfg.MaxGimbal)
-				a.EngineGimbal[i].Yaw = approachClamped(a.EngineGimbal[i].Yaw, commanded[i].Yaw, step, cfg.MaxGimbal)
-			}
-		}
-
-		// Финальная оценка — РЕАЛЬНАЯ, нелинейная модель (п.17 Stage 4.5),
-		// не линеаризация solver'а: то же самое, что попадёт в интегратор.
-		achievedForce, achievedTorque := engineForceTorque(in.Engines, a.EngineGimbal, in.GimbalArm)
-		a.EngineForce = achievedForce
-		a.ControlTorque = achievedTorque
-		a.UsingRCS = false
-
-	case in.Controllable && in.Thrust > 0:
-		// Агрегатная модель — ступени без индивидуальной карты камер
-		// (корабль; для бустера in.Engines всегда непуст при работающих
-		// двигателях, см. booster.go/updateAttitude).
-		a.ControlTorque = physics.Vec3{
-			X: in.Thrust * math.Sin(a.GimbalRoll) * in.EngineRingRadius,
-			Y: side * math.Sin(a.GimbalPitch+bias),
-			Z: side * math.Sin(a.GimbalYaw),
-		}
-		a.UsingRCS = false
-
-	case cfg.RCSMoment > 0 && !ov.Dead:
+	// Последние в очереди и работают, только когда камер нет: при работающих
+	// двигателях их момент на порядки меньше качания камер, и тратить на него
+	// рабочее тело незачем.
+	if !enginesActive && cfg.RCSMoment > 0 && !ov.Dead {
 		// Пассивный участок: работают двигатели ориентации. Момент постоянный
 		// и на порядки меньше, поэтому разворот идёт медленно.
 		//
@@ -652,12 +828,9 @@ func (a *VehicleAttitude) integrate(dt float64, in AttitudeInput) {
 		a.UsingRCS = a.ControlTorque.Norm() > 0
 		a.GimbalPitch, a.GimbalYaw, a.GimbalRoll = 0, 0, 0
 
-	default:
-		a.ControlTorque = physics.Vec3{}
-		a.UsingRCS = false
 	}
 
-	// --- 6. Уравнения вращения ------------------------------------------------
+	// --- 7. Уравнения вращения ------------------------------------------------
 	a.SloshTorque = physics.Vec3{Y: in.Thrust * in.SloshLateralOffset}
 	torque := a.AeroTorque.Add(a.ControlTorque).Add(a.SurfaceTorque).Add(a.SloshTorque)
 	alpha := a.Inertia.AngularAcceleration(a.Omega, torque)
@@ -701,10 +874,7 @@ func (a *VehicleAttitude) PointingError(target physics.Attitude,
 // Вектор этого поворота, взятый в связанных осях, и есть рассогласование
 // по крену, тангажу и рысканию. Особых точек у такого представления нет.
 func (a *VehicleAttitude) attitudeError(target physics.Attitude,
-	frame physics.LocalFrame) (pitch, yaw, roll float64) {
-
-	body := target.BodyFrame(frame)
-	want := physics.QuaternionFromBasis(body.Forward, body.Right, body.Down)
+	orientation physics.Quaternion, frame physics.LocalFrame) (pitch, yaw, roll float64) {
 
 	// Ошибку считаем от показания датчика, а не от истинной ориентации:
 	// автопилот, как и настоящий борт, знает только то, что говорит
@@ -720,6 +890,16 @@ func (a *VehicleAttitude) attitudeError(target physics.Attitude,
 	current := a.Orientation
 	if a.SensedOrientation.Norm() > 1e-9 {
 		current = a.SensedOrientation
+	}
+
+	// Цель кватернионом берётся как есть; цель углами собирается в базис
+	// из тангажа, азимута и крена (см. AttitudeInput.TargetOrientation о
+	// том, почему первое предпочтительнее там, где корпус стоит
+	// вертикально).
+	want := orientation
+	if want.Norm() < 1e-9 {
+		body := target.BodyFrame(frame)
+		want = physics.QuaternionFromBasis(body.Forward, body.Right, body.Down)
 	}
 
 	err := current.Conjugate().Multiply(want).Normalized()
@@ -884,12 +1064,33 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 	// центр масс к двигателям сам по себе: тянут именно они, и ровно
 	// настолько, насколько весят.
 	engineMass := stageCfg.EngineMass * stageCfg.EngineCount
-	bodyMass := math.Max(0, ownDryMass+propellant+s.rcsPropellant-engineMass)
 
 	// Центр масс — взвешенное среднее трёх тел: своя конструкция с топливом
 	// на геометрической середине (length/2), двигатели у хвоста (x=length),
 	// несомая масса у носа (x=0). В долях длины от носа коэффициент при
 	// bodyMass — 0.5, при engineMass — 1, при carried — 0.
+	// Топливо у КОРАБЛЯ по-прежнему учитывается вместе с конструкцией, а не
+	// по геометрии баков, — и это осознанное ограничение, а не недоделка.
+	//
+	// Раскладка по главным бакам (vehicle.TankSpans) описывает ступень на
+	// ВЫВЕДЕНИИ. Возвращается корабль иначе: посадочный остаток держат
+	// НОСОВЫЕ расходные баки — именно поэтому ветка ниже принудительно
+	// уводит центр масс вперёд. Положения этих баков в конфигурации нет
+	// вовсе, и подставлять вместо них главные значит помещать массу топлива
+	// к хвосту там, где она у носа. Проверено прогоном: момент инерции
+	// вырастает на плече, которого не существует, плавники перестают
+	// удерживать корпус, и угол атаки уходит от семидесяти градусов на сто
+	// шесть вместо допустимых пяти (TestFlapsTakeOverFromThrustersInDenseAir).
+	//
+	// У бустера такой оговорки нет: он летит один, его топливо лежит в его
+	// же главных баках, и там новая раскладка применена целиком — см.
+	// Booster.massLayout.
+	//
+	// Чтобы сделать то же для корабля, в конфигурацию нужны положение и
+	// объём расходных баков; выдумывать их здесь было бы хуже, чем честно
+	// оставить прежнюю модель.
+	bodyMass := math.Max(0, ownDryMass+propellant+s.rcsPropellant-engineMass)
+
 	com := 0.5
 	if mass > 0 {
 		com = (bodyMass*0.5 + engineMass) / mass
@@ -902,6 +1103,7 @@ func (s *Simulation) updateAttitude(dt float64, target physics.Attitude,
 	// момент будет в сотни раз больше того, что могут дать плавники.
 	if s.inEntry() {
 		com = 0.50 // центр давления при полёте брюхом
+
 	}
 
 	// Плечо качания: от центра масс до плоскости среза сопел.
@@ -985,9 +1187,8 @@ func (s *Simulation) Attitude() VehicleAttitude {
 // integrateNoControl интегрирует вращение только под управляющим моментом.
 // Используется в тестах для проверки знаков.
 func (a *VehicleAttitude) integrateNoControl(dt float64, in AttitudeInput) {
-	a.Inertia = physics.CompositeInertia(
-		in.Mass-in.CarriedMass-in.EngineMass, in.EngineMass, in.CarriedMass,
-		in.Radius, in.Length, in.CenterOfMass)
+	a.Inertia = stageInertia(in)
+	a.CenterOfMassUsed = in.CenterOfMass
 	side := in.Thrust * in.GimbalArm
 	a.ControlTorque = physics.Vec3{
 		X: in.Thrust * math.Sin(a.GimbalRoll) * in.EngineRingRadius,
@@ -997,4 +1198,26 @@ func (a *VehicleAttitude) integrateNoControl(dt float64, in AttitudeInput) {
 	alpha := a.Inertia.AngularAcceleration(a.Omega, a.ControlTorque)
 	a.Omega = a.Omega.Add(alpha.Scale(dt))
 	a.Orientation = a.Orientation.Add(a.Orientation.Derivative(a.Omega).Scale(dt)).Normalized()
+}
+
+// stageInertia считает тензор инерции ступени по заданной раскладке масс.
+//
+// Если раскладка топлива задана (PropellantLength > 0), топливо учитывается
+// отдельным телом в своём положении — так, как оно на самом деле и лежит в
+// баках. Иначе используется прежняя модель, где топливо размазано по длине
+// вместе с конструкцией: она нужна прямым тестам VehicleAttitude, собирающим
+// вход руками, и остаётся точной для почти пустой ступени.
+func stageInertia(in AttitudeInput) physics.InertiaTensor {
+	if in.PropellantLength <= 0 || in.Length <= 0 {
+		return physics.CompositeInertia(
+			in.Mass-in.CarriedMass-in.EngineMass, in.EngineMass, in.CarriedMass,
+			in.Radius, in.Length, in.CenterOfMass)
+	}
+	structMass := in.Mass - in.CarriedMass - in.EngineMass - in.PropellantMass
+	if structMass < 0 {
+		structMass = 0
+	}
+	return physics.StageInertia(structMass, in.EngineMass, in.PropellantMass,
+		in.CarriedMass, in.PropellantX*in.Length, in.PropellantLength*in.Length,
+		in.Radius, in.Length, in.CenterOfMass*in.Length)
 }

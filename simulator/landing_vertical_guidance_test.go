@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"rocketTelemetrySim/simulator/orbit"
+	"rocketTelemetrySim/simulator/physics"
+	"rocketTelemetrySim/simulator/vehicle"
 )
 
 // -----------------------------------------------------------------------------
@@ -85,9 +87,20 @@ func TestVerticalGuidance_NearTargetNoOvershoot(t *testing.T) {
 
 // TestVerticalGuidance_HeavierNeedsMoreThrust — п.18 "Different mass": более
 // тяжёлый бустер на ТОЙ ЖЕ высоте и скорости обязан требовать БОЛЬШУЮ тягу.
+//
+// Состояние взято ВЫШЕ тормозного профиля (на 1200 м снижение 400 м/с
+// требует около четырёх километров тормозного пути) — там, где тяга
+// действительно нужна. Прежде здесь стояло 150 м/с, и проверка проходила
+// по недоразумению: на 1200 м погасить 150 м/с можно на шестистах метрах,
+// тяга не нужна ни при какой массе, — а закон всё равно возвращал
+// пропорциональную массе величину, потому что имел пол в размере веса
+// (want = g). Пол снят как запрещавший снижение (см. landingRequiredThrust),
+// и в том состоянии закон честно отвечает нулём для обеих масс. Свойство
+// «тяжелее — больше» от этого никуда не делось, но проверять его надо там,
+// где тяга запрошена.
 func TestVerticalGuidance_HeavierNeedsMoreThrust(t *testing.T) {
 	b := landingBoosterOnGroup(t, 1, boosterLandingMid)
-	const altitude, descent = 1200.0, 150.0
+	const altitude, descent = 1200.0, 400.0
 
 	b.state.FuelMass = 50000
 	light := primeRequiredThrust(b, navAt(altitude, descent))
@@ -175,5 +188,49 @@ func TestVerticalGuidance_GroupAccelEnvelopeOrdering(t *testing.T) {
 	if !(aMax13 > aMax5 && aMax5 > aMax3) {
 		t.Errorf("acceleration envelope не убывает с числом камер: aMax(13)=%.2f aMax(5)=%.2f aMax(3)=%.2f",
 			aMax13, aMax5, aMax3)
+	}
+}
+
+// TestVerticalGuidance_ExcessGroupTriggersDownselect — защита от вечного
+// висения.
+//
+// Прежде здесь стояла проверка «идя медленнее профиля, наведение обязано
+// просить МЕНЬШЕ веса»: тогда закон гнался за опорным профилем, и
+// оказаться ниже него означало «есть запас, можно падать быстрее». Закон
+// профиля больше не имеет — он считает потребное замедление прямо
+// (landingRequiredThrust), и на двух километрах при снижении в тридцать
+// м/с честно просит вес плюс две десятых процента: этого ровно хватает,
+// чтобы прийти к земле со скоростью касания. Требовать от него меньшего
+// значило бы требовать не тормозить там, где тормозить и не нужно.
+//
+// Опасность, от которой та проверка защищала, никуда не делась: если
+// потребная тяга ниже того, что группа камер может выдать на минимальном
+// газе, ступень не снижается, а зависает — и на избыточной группе висение
+// переходит в набор высоты. Защита теперь в другом месте: такое состояние
+// обязано быть признаком даунселекта. Это и проверяется.
+func TestVerticalGuidance_ExcessGroupTriggersDownselect(t *testing.T) {
+	b := landingBoosterOnGroup(t, 1, boosterLandingHigh)
+
+	// Высоко и медленно: тормозить почти нечего, потребная тяга близка к
+	// весу и заведомо ниже минимума тринадцати камер.
+	nav := navAt(2000, 30)
+	required := primeRequiredThrust(b, nav)
+
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage,
+		physics.Atmosphere(nav.Altitude).Pressure)
+	minCurrent := perEngine * float64(boosterLandingHigh) * b.minThrottle()
+	maxNext := perEngine * float64(boosterLandingMid)
+
+	if !(required < minCurrent) {
+		t.Fatalf("потребная тяга %.2f МН не ниже минимума группы из %d камер (%.2f МН) — "+
+			"проверка не о том состоянии", required/1e6, boosterLandingHigh, minCurrent/1e6)
+	}
+	if !landingGroupShouldDownselect(required, minCurrent, maxNext) {
+		t.Fatalf("группа из %d камер избыточна (нужно %.2f МН, минимум группы %.2f МН), "+
+			"а даунселект не назначен — ступень будет висеть и уйдёт вверх",
+			boosterLandingHigh, required/1e6, minCurrent/1e6)
+	}
+	if math.IsNaN(required) || required < 0 {
+		t.Fatalf("требуемая тяга не является конечной неотрицательной: %v", required)
 	}
 }
