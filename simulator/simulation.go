@@ -96,25 +96,25 @@ type Simulation struct {
 	mu sync.RWMutex
 
 	// Состояние, защищённое mu.
-	state         VehicleState
-	engines       []vehicle.Engine
-	dryMass       float64
-	rcsPropellant float64
-	area          float64
-	elapsed       float64
-	phase         orbit.FlightPhase
-	stage         int
-	gnc           *orbit.GNCSystem
-	maxQ          MaxQState
-	telemetry     Telemetry
-	fairingGone   bool
-	mecoTime      float64
-	secoTime      float64
-	circStart     float64
-	crashed       bool
-	released      bool
-	orbitReached  bool
-	throttleCmd   float64
+	*flightBody
+	firstStage   *flightBody
+	ship         *Ship
+	dryMass      float64
+	area         float64
+	elapsed      float64
+	phase        orbit.FlightPhase
+	stage        int
+	gnc          *orbit.GNCSystem
+	maxQ         MaxQState
+	telemetry    Telemetry
+	fairingGone  bool
+	mecoTime     float64
+	secoTime     float64
+	circStart    float64
+	crashed      bool
+	released     bool
+	orbitReached bool
+	throttleCmd  float64
 
 	// orbitCorrectionBurn сообщает, что двигатели сейчас работают по
 	// собственному решению автоматики поддержания орбиты (maintainOrbit),
@@ -128,30 +128,13 @@ type Simulation struct {
 	// зажгла сама автоматика, — гасить она имеет право только его.
 	orbitCorrectionBurn bool
 
-	// propulsion — двигательная установка активной ступени: баки, наддув,
-	// турбонасосы, камеры сгорания, сопла и охлаждение.
-	propulsion *PropulsionSystem
-
-	// attitude — угловое движение корпуса: моменты, качание камер, автопилот.
-	attitude VehicleAttitude
-
-	// prevAcceleration — ускорение предыдущего шага. Нужно, чтобы посчитать
-	// гидростатический напор в баках и возбуждение колебаний жидкости
-	// до того, как будет известна тяга текущего шага.
-	prevAxialAccel   float64
-	prevLateralAccel float64
-	prevAngularAccel float64
-
 	// spentStage — отработавшая первая ступень. Продолжает интегрироваться
 	// отдельным телом до входа в атмосферу или удара о поверхность.
 	// Используется, только если носитель не возвращает бустер (см. booster).
 	spentStage *env.SpentStage
 
-	// booster — первая ступень после отделения на носителях с активным
-	// возвратом (Config.BoosterReturn): свой автопилот, свои двигатели,
-	// решётчатые рули, посадочный импульс. Шагает тем же тактом, что
-	// и основная симуляция (см. step()) — второй одновременно живой
-	// аппарат без второй горутины и без гонок.
+	// booster exists from launch. While attached, firstStage drives the stack;
+	// separation enables independent return guidance on the same body.
 	booster *Booster
 
 	// tower — башня-ловушка площадки (см. catch_tower.go). Кораблю она
@@ -181,10 +164,6 @@ type Simulation struct {
 
 	// deorbitSettled — корпус пришёл к ретроградной ориентации.
 	deorbitSettled bool
-
-	// heatShield — теплозащита корабля: плитки с наветренной стороны
-	// и голая сталь с подветренной.
-	heatShield *HeatShield
 
 	// throttleFloor — нижний предел дросселирования активной ступени, доля.
 	// throttleLimited сообщает, что уставка оператора удержана на этом пределе.
@@ -445,19 +424,18 @@ func (s *Simulation) initState() {
 
 	ambient := physics.EffectiveEnvironmentTemperature(0, 0)
 
+	s.firstStage = &flightBody{}
+	s.flightBody = s.firstStage
 	s.state = VehicleState{
 		Position: position,
 		Velocity: velocity,
 	}
 	s.engines = vehicle.BuildFirstStageEngines(cfg, ambient)
 
-	// Двигательная установка первой ступени. Конструкция первой ступени везёт
-	// на себе всю вторую ступень с заправкой, нагрузку и обтекатель, поэтому
-	// они входят в её сухую массу.
+	// Hardware belongs to the first stage alone. The attached ship contributes
+	// to the stack mass through syncAttachedShip, not to booster structure mass.
 	s.propulsion = NewPropulsionSystem(StageProps{
-		StructureMass: cfg.FirstStage.DryMass + s.dispersion.DryMassDelta +
-			cfg.SecondStage.DryMass + cfg.SecondStage.FuelMass + cfg.FairingMass,
-		PayloadMass:        cfg.PayloadMass,
+		StructureMass:      cfg.FirstStage.DryMass + s.dispersion.DryMassDelta,
 		PropellantMass:     cfg.FirstStage.FuelMass * s.dispersion.FuelMassFactor,
 		MixtureRatio:       cfg.FirstStage.MixtureRatio,
 		EngineCount:        int(cfg.FirstStage.EngineCount),
@@ -528,6 +506,7 @@ func (s *Simulation) initState() {
 	}, physics.NewLocalFrame(position))
 	s.attitudeSensor = sensing.NewAttitudeSensor(sensing.DefaultAttitudeSensor())
 	s.lastValidSensedOrientation = s.attitude.Orientation
+	s.initVehicles()
 	s.telemetry = s.buildTelemetryLocked()
 }
 
@@ -687,6 +666,11 @@ func (s *Simulation) step(dt float64) {
 		return
 	}
 
+	if s.stage == 1 {
+		s.syncAttachedShip()
+		defer s.syncAttachedShip()
+	}
+
 	// 1. Навигация: полное состояние выводится из вектора состояния в ECI.
 	nav := s.navState()
 
@@ -720,8 +704,24 @@ func (s *Simulation) step(dt float64) {
 		s.lastValidSensedOrientation = m.Orientation
 	}
 
+	if s.booster != nil && s.stage == 1 {
+		s.booster.elapsed = s.elapsed
+		s.booster.updateSensors(dt)
+		s.booster.updateNavigation(dt, s.booster.apparentAccel)
+	}
+
 	// 2. Обновление фазы полёта.
+	stageBefore := s.stage
 	s.updateFlightPhase(nav)
+	if s.stage != stageBefore {
+		nav = s.navState()
+	}
+	// The ship advances once per tick: dormant while attached, or through
+	// the active propulsion update below after separation.
+	if s.stage == 1 {
+		s.updateAttachedShip(dt)
+		nav.Mass = s.dryMass + s.state.FuelMass
+	}
 	nav.Phase = s.phase
 
 	// 3. Наведение: требуемые углы и уровень газа.
@@ -926,6 +926,9 @@ func (s *Simulation) step(dt float64) {
 	// корабль и держит расходные баки под наддувом.
 	acc := fm.Evaluate(s.state)
 	apparent := acc.Total.Sub(acc.Gravity)
+	if s.booster != nil && s.stage == 1 {
+		s.booster.apparentAccel = apparent
+	}
 	forward := s.attitude.Orientation.Rotate(physics.Vec3{X: 1})
 
 	axial := apparent.Dot(forward)
@@ -954,7 +957,7 @@ func (s *Simulation) step(dt float64) {
 			s.logSpentStageOutcome()
 		}
 	}
-	if s.booster != nil {
+	if s.booster != nil && s.stage == 2 {
 		var boosterOverrides control.Overrides
 		if s.boosterBoard != nil {
 			boosterOverrides = s.boosterBoard.Advance(s.elapsed)

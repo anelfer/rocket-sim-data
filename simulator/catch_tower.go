@@ -221,6 +221,16 @@ func (t CatchTower) Target() (along, across, up float64) {
 	return t.ArmReach, 0, t.CatchHeight
 }
 
+// TargetECEF returns the centre of the catch envelope in the rotating Earth
+// frame. Terminal navigation measures the vehicle relative to this point.
+func (t CatchTower) TargetECEF() physics.Vec3 {
+	along, across, up := t.Target()
+	return t.base.
+		Add(t.along.Scale(along)).
+		Add(t.across.Scale(across)).
+		Add(t.up.Scale(up))
+}
+
 // decompose раскладывает точку (ECI на момент elapsedAt) по осям башни.
 func (t CatchTower) decompose(positionECI physics.Vec3, elapsedAt float64) (along, across, up float64) {
 	d := physics.ECIToECEF(positionECI, elapsedAt).Sub(t.base)

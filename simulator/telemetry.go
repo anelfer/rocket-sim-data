@@ -350,10 +350,10 @@ func (s *Simulation) buildTelemetryLocked() Telemetry {
 	// повторяет состояние носителя: ступень летит, просто в его составе.
 	if s.spentStage != nil {
 		t.SpentStage = s.spentStage.Telemetry(s.elapsed)
-	} else if s.booster == nil {
+	} else if s.stage == 1 {
 		t.SpentStage = s.attachedStageTelemetry(altitude, atm, vRel, mach, acc, geo)
 	}
-	t.Booster = boosterTelemetry(s.booster, s.elapsed)
+	t.Booster = boosterTelemetry(s.detachedBooster(), s.elapsed)
 
 	t.Propulsion = s.buildPropulsionTelemetry()
 
@@ -614,10 +614,11 @@ func (t Telemetry) Publish() {
 			VerticalVelocity: b.VerticalVelocity,
 			TotalVelocity:    b.TotalVelocity,
 			Pitch:            b.Pitch,
-			Yaw:              b.Yaw,
-			Roll:             b.Roll,
-			YawContinuous:    b.YawContinuous,
-			RollContinuous:   b.RollContinuous,
+			Yaw:              b.Yaw.Value(),
+			Roll:             b.Roll.Value(),
+			AxisTilt:         b.AxisTilt.Value(),
+			AttitudeError:    b.AttitudeErrorAngle.Value(),
+			RollIntegrated:   b.RollIntegrated.Value(),
 			BodyRollRate:     b.BodyRollRate,
 			BodyPitchRate:    b.BodyPitchRate,
 			BodyYawRate:      b.BodyYawRate,
@@ -639,14 +640,14 @@ func (t Telemetry) Publish() {
 			FinSaturated:       b.FinSaturated,
 
 			GfoldShadowStatus:    gfoldStatusCode(b.ShadowStatus),
-			GfoldShadowMiss:      b.ShadowMiss,
-			GfoldShadowTof:       b.ShadowTof,
+			GfoldShadowMiss:      b.ShadowMiss.Value(),
+			GfoldShadowTof:       b.ShadowTof.Value(),
 			GfoldShadowReachable: b.ShadowReachable,
 
-			PassiveMiss:        b.PassiveMiss,
-			CoastLeanDemand:    b.CoastLeanDemand,
-			CoastLeanAuthority: b.CoastLeanAuthority,
-			CoastLeanApplied:   b.CoastLeanApplied,
+			PassiveMiss:        b.PassiveMiss.Value(),
+			CoastLeanDemand:    b.CoastLeanDemand.Value(),
+			CoastLeanAuthority: b.CoastLeanAuthority.Value(),
+			CoastLeanApplied:   b.CoastLeanApplied.Value(),
 			GfoldTimeOfFlight:  b.GfoldTimeOfFlight,
 			GfoldPlannedFuel:   b.GfoldPlannedFuel,
 			GfoldSlack:         b.GfoldSlack,

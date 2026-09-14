@@ -134,7 +134,7 @@ func TestBoosterAutopilotClosesOnSensedAttitude(t *testing.T) {
 	for i := 0; i < 40000; i++ {
 		sim.mu.Lock()
 		sim.step(0.1)
-		b := sim.booster
+		b := sim.detachedBooster()
 		ready := b != nil && b.Alive() && b.elapsed > 0 && b.attitude.SensedOrientation.Norm() > 1e-9
 		dead := b != nil && !b.Alive()
 		sim.mu.Unlock()

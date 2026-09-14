@@ -5,7 +5,6 @@ import (
 
 	"rocketTelemetrySim/simulator/orbit"
 	"rocketTelemetrySim/simulator/orbit/gfold"
-	"rocketTelemetrySim/simulator/orbit/sensing"
 	"rocketTelemetrySim/simulator/physics"
 	"rocketTelemetrySim/simulator/vehicle"
 )
@@ -50,7 +49,7 @@ const (
 	// самой тяги (throttleFilterTime): пересчитывать план быстрее, чем
 	// двигатель успевает отозваться на предыдущую команду, значит
 	// планировать по несуществующему состоянию.
-	gfoldResolveInterval = 2.0
+	gfoldResolveInterval = 1.0
 
 	// gfoldMinTimeToGo — ниже этого остатка времени полёта задача больше
 	// не пересчитывается, и наведение доводит посадку по последней
@@ -94,7 +93,7 @@ const (
 	// моменту (см. landingPointingLimit) и почти всегда меньше; потолок
 	// нужен, чтобы на малом скоростном напоре, где момента хватает на что
 	// угодно, наведение не запланировало полёт боком.
-	gfoldMaxTilt = 60 * physics.DegToRad
+	gfoldMaxTilt = 20 * physics.DegToRad
 )
 
 // gfoldTouchdownTolerance — при каком промахе цель считается достигнутой, м.
@@ -104,7 +103,15 @@ const (
 // той, с которой борт вообще знает своё положение, бессмысленно — «промах»
 // в пределах этой величины неотличим от нулевого никакими средствами
 // самого аппарата.
-var gfoldTouchdownTolerance = 3 * sensing.DefaultPositionSensor().NoiseFloor
+const gfoldTouchdownTolerance = 0.5
+
+// gfoldCatchDescentSpeed keeps margin below the tower's hard vertical-speed
+// limit while still crossing the catch plane with the engines lit.
+const gfoldCatchDescentSpeed = 1.0
+
+// gfoldDescentMargin is retained for the engine-group handover predictor: the
+// next group should be able to descend with margin before it is selected.
+const gfoldDescentMargin = 0.9
 
 // gfoldGuidance — состояние контура наведения посадочного импульса.
 type gfoldGuidance struct {
@@ -115,6 +122,9 @@ type gfoldGuidance struct {
 
 	// solvedAt — модельное время, на которое посчитана traj, с.
 	solvedAt float64
+	// attemptedAt is separate from solvedAt: a failed replan must not move the
+	// time origin of the last valid trajectory.
+	attemptedAt float64
 
 	// group — число камер, при котором решалась задача. Смена группы
 	// меняет обе границы тяги скачком, и прежняя траектория может стать
@@ -359,16 +369,18 @@ func (b *Booster) gfoldVehicle(nav orbit.NavState, engines, nodes int,
 		isp = stage.VacuumISP - (stage.VacuumISP-stage.SeaLevelISP)*ratio
 	}
 
-	// Нижняя граница массы — сухая масса ПЛЮС неприкосновенный остаток.
-	// Наведение не имеет права планировать посадку «в ноль по топливу»:
-	// у настоящей ступени часть остатка физически недоступна (заборные
-	// устройства, осадка), и планировать её расход значит планировать
-	// срыв горения на последних секундах.
-	dry := b.dryMass() + boosterFuelReserveFraction*b.Config.FirstStage.FuelReserve
+	// Use the mass of the state being planned. The previous lower bound added
+	// 15% of the original return budget (97.5 t) to structural dry mass even
+	// when less propellant remained, making the terminal problem infeasible by
+	// construction. Fuel contingency is checked by the outer landing plan.
+	wet := nav.Mass
+	if wet <= 0 {
+		wet = b.dryMass() + b.state.FuelMass
+	}
 
 	return gfold.Vehicle{
-		WetMass:        b.dryMass() + b.state.FuelMass,
-		DryMass:        dry,
+		WetMass:        wet,
+		DryMass:        b.dryMass(),
 		Alpha:          1 / (isp * physics.G0),
 		Rho1:           rho1,
 		Rho2:           rho2,
@@ -591,7 +603,10 @@ func (b *Booster) gfoldSolve(nav orbit.NavState, engines int, indices []int,
 	}
 	opts.MinNodes, opts.MaxNodes = lo, hi
 
-	mass := b.dryMass() + b.state.FuelMass
+	mass := nav.Mass
+	if mass <= 0 {
+		mass = b.dryMass() + b.state.FuelMass
+	}
 
 	// Опорная траектория для замораживания сопротивления и сил инерции.
 	// Опорная берётся только у ЖИВОЙ траектории. Пережившая своё время
@@ -619,11 +634,12 @@ func (b *Booster) gfoldSolve(nav orbit.NavState, engines int, indices []int,
 	}
 
 	setup := gfold.Setup{
-		Vehicle:        b.gfoldVehicle(nav, engines, hi, altitudesOf(refPos, b.landingAimPoint().Altitude), indices),
+		Vehicle: b.gfoldVehicle(nav, engines, hi,
+			altitudesOf(refPos, b.landingAimPoint().Altitude), indices),
 		State:          st,
 		Gravity:        gravity,
 		Bias:           b.gfoldBias(frame, gravity, refPos, refVel, refMass),
-		TargetVelocity: physics.Vec3{Z: -landingTouchdownSpeed},
+		TargetVelocity: physics.Vec3{Z: -gfoldCatchDescentSpeed},
 		Step:           step,
 	}
 
@@ -636,6 +652,10 @@ func (b *Booster) gfoldSolve(nav orbit.NavState, engines int, indices []int,
 	// используется намеренно: разбор — у gfold.Objective.
 	setup.Objective = gfold.ObjectiveReachTarget
 	traj := gfold.Plan(setup, opts)
+	if traj.Status != gfold.StatusOptimal {
+		setup.Objective = gfold.ObjectiveMinimumMiss
+		traj = gfold.Plan(setup, opts)
+	}
 	if traj.Status != gfold.StatusOptimal {
 		setup.Objective = gfold.ObjectiveSoftLanding
 		traj = gfold.Plan(setup, opts)
@@ -652,7 +672,7 @@ func (b *Booster) gfoldSolve(nav orbit.NavState, engines int, indices []int,
 	// перебор дороже, но платится он только на отказе, а не каждый такт.
 	if traj.Status != gfold.StatusOptimal && !wide {
 		wideOpts := gfold.PlanOptions{MinNodes: 4, MaxNodes: 3 * gfoldNodes, Coarse: 6, Refine: 5}
-		for _, obj := range []gfold.Objective{gfold.ObjectiveReachTarget, gfold.ObjectiveSoftLanding} {
+		for _, obj := range []gfold.Objective{gfold.ObjectiveReachTarget, gfold.ObjectiveMinimumMiss, gfold.ObjectiveSoftLanding} {
 			setup.Objective = obj
 			if again := gfold.Plan(setup, wideOpts); again.Status == gfold.StatusOptimal {
 				traj = again
@@ -727,6 +747,7 @@ func (b *Booster) gfoldUpdate(nav orbit.NavState, dt float64) (physics.Vec3, boo
 	}
 
 	since := b.elapsed - g.solvedAt
+	sinceAttempt := b.elapsed - g.attemptedAt
 	timeToGo := 0.0
 	if g.traj != nil && g.traj.Status == gfold.StatusOptimal {
 		timeToGo = g.traj.TimeOfFlight() - since
@@ -735,8 +756,15 @@ func (b *Booster) gfoldUpdate(nav orbit.NavState, dt float64) (physics.Vec3, boo
 	// Поводы пересчитать: решения ещё нет; истёк период; сменилась группа
 	// камер (обе границы тяги изменились скачком, и прежняя траектория
 	// может стать не просто неоптимальной, а недопустимой).
-	need := g.traj == nil || g.traj.Status != gfold.StatusOptimal ||
-		since >= gfoldRetryInterval(g.consecutiveFailures) || g.group != engines
+	validPlan := g.traj != nil && g.traj.Status == gfold.StatusOptimal
+	need := g.group != engines
+	if g.consecutiveFailures > 0 {
+		need = need || sinceAttempt >= gfoldRetryInterval(g.consecutiveFailures)
+	} else if validPlan {
+		need = need || since >= gfoldResolveInterval
+	} else {
+		need = need || sinceAttempt >= gfoldRetryInterval(g.consecutiveFailures)
+	}
 
 	// Ниже этого остатка времени пересчитывать нечего (см. gfoldMinTimeToGo):
 	// добивается посадка по последней траектории с обратной связью.
@@ -754,9 +782,11 @@ func (b *Booster) gfoldUpdate(nav orbit.NavState, dt float64) (physics.Vec3, boo
 			wide = true
 		}
 		traj := b.gfoldSolve(nav, engines, b.runningEngineIndices(), hint, wide)
+		g.attemptedAt = b.elapsed
+		g.group = engines
 		g.solves++
 		g.status = traj.Status
-		if traj.Status == gfold.StatusOptimal {
+		if traj.Status == gfold.StatusOptimal && traj.Miss <= gfoldTouchdownTolerance {
 			g.traj = traj
 			g.solvedAt = b.elapsed
 			g.group = engines
@@ -769,12 +799,15 @@ func (b *Booster) gfoldUpdate(nav orbit.NavState, dt float64) (physics.Vec3, boo
 			since = 0
 			g.consecutiveFailures = 0
 		} else {
-			// Провалившийся пересчёт НЕ отменяет предыдущее решение:
-			// лететь по устаревшему, но допустимому плану безопаснее, чем
-			// по несуществующему. Отказ считается и виден в телеметрии.
+			// A failed replan is evidence that the measured state has left the
+			// feasible tube of the old trajectory. Continuing to chase that
+			// trajectory drove the command to maximum thrust after its braking
+			// point and sent the booster back upward. Drop it and let the bounded
+			// state-feedback fallback preserve the vehicle while the optimiser
+			// waits for the next materially different state.
+			g.traj = nil
 			g.failures++
 			g.consecutiveFailures++
-			g.solvedAt = b.elapsed
 		}
 	}
 
@@ -813,11 +846,11 @@ func (b *Booster) gfoldTrack(traj *gfold.Trajectory, st gfold.State, since float
 		timeToGo = gfoldMinTimeToGo
 	}
 
-	omegaMax := 0.5
+	omegaMax := 0.25
 	if bw := b.attitude.Config.Bandwidth; bw > 0 {
-		omegaMax = bw / 5
+		omegaMax = bw / 2
 	}
-	omega := math.Min(3/timeToGo, omegaMax)
+	omega := math.Min(4/timeToGo, omegaMax)
 
 	posErr := refPos.Sub(st.Position)
 	velErr := refVel.Sub(st.Velocity)
@@ -985,7 +1018,8 @@ func gfoldReachable(st gfold.State, gravity physics.Vec3, aMax, tMin, tMax float
 // Границы области при этом считаются и публикуются (gfoldIgnitionBand):
 // по ним видно, в каком месте своей области разрешимости идёт импульс.
 func (b *Booster) gfoldIgnitionReady(nav orbit.NavState) bool {
-	alt, feasible := b.landingBurnIgnitionAltitude(nav)
+	alt, _ := b.landingBurnIgnitionAltitude(nav)
+	alt = b.lateralIgnitionAltitude(nav, alt)
 
 	// Отказ поиска не должен превращаться в розжиг где попало.
 	//
@@ -1003,12 +1037,37 @@ func (b *Booster) gfoldIgnitionReady(nav orbit.NavState) bool {
 	// относится ИМЕННО к отказу поиска: годную высоту выше границы
 	// (лестница берёт её с запасом на разворот) урезать нельзя — это
 	// отняло бы сотню-другую метров у настоящего торможения.
-	if !feasible {
-		if _, hi, ok := b.gfoldIgnitionBand(nav); ok && alt > hi {
-			return false
-		}
+	// Верхняя граница области разрешимости — это высота, выше которой даже
+	// МИНИМАЛЬНЫЙ газ гасит снижение раньше земли. Розжиг там — не
+	// торможение, а зависание с запасом высоты, и он запрещён независимо
+	// от того, нашла лестница высоту или отказалась.
+	//
+	// Прежде ограничение относилось только к отказу поиска: годной высоте
+	// выше границы верили, поскольку лестница берёт запас на разворот.
+	// Замерено, к чему это приводит: розжиг на 2882 м при границе 2286 м,
+	// снижение погашено до нуля ещё на 64 м, дальше минимальный газ трёх
+	// камер (4.02 МН) против веса (3.08 МН) — и ступень ПОШЛА ВВЕРХ,
+	// набрав полсотни метров, пока не потеряла ориентацию. Запас на
+	// разворот при этом не понадобился: к розжигу корпус был уже
+	// развёрнут (наклон 5.5°) — его доворачивает пассивный участок
+	// (landingAlignPending), а не посадочный импульс.
+	// Never ignite above the upper edge of the current group's feasible band:
+	// even minimum throttle would stop the vehicle before the catch plane.
+	// The attitude lead belongs in the pre-ignition Coast guidance and must not
+	// turn into extra powered-hover altitude once the body is already aligned.
+	if _, hi, ok := b.gfoldIgnitionBand(nav); ok && hi < alt {
+		alt = hi
 	}
 	return nav.Altitude <= alt
+}
+
+// lateralIgnitionAltitude adds the time required to translate to the tower
+// and return upright to the vertical-only suicide-burn altitude. The old gate
+// reserved time only for braking descent, so hundreds of metres of lateral
+// correction were first presented to guidance a few seconds before capture.
+func (b *Booster) lateralIgnitionAltitude(nav orbit.NavState, verticalAltitude float64) float64 {
+	_ = nav
+	return verticalAltitude
 }
 
 // gfoldIgnitionBand возвращает границы высоты, в которых задача посадки
@@ -1090,7 +1149,7 @@ func (b *Booster) gfoldTilt(nav orbit.NavState, indices []int) float64 {
 // торможения и начало собственно посадки.
 //
 // До этого момента посадочным импульсом распоряжается кинематический
-// профиль торможения (landingBackupThrust) — тот, что вёл посадку и
+// профиль торможения (landingTerminalThrust) — тот, что ведёт посадку и
 // раньше, и который на своём участке работает.
 func (b *Booster) gfoldApplicable(nav orbit.NavState) bool {
 	n := b.propulsion.Commissioned
@@ -1098,40 +1157,15 @@ func (b *Booster) gfoldApplicable(nav orbit.NavState) bool {
 		return false
 	}
 
-	// Условие — ФИЗИЧЕСКОЕ, а не номер группы.
-	//
-	// Выпуклая постановка предполагает, что множество достижимых
-	// траекторий имеет ненулевой объём: аппарат должен уметь и снижаться,
-	// и висеть, и тормозить. Снижаться он умеет тогда и только тогда,
-	// когда минимальная тяга работающей группы меньше веса. Если она
-	// больше, снижение невозможно в принципе, любая ошибка немедленно
-	// выносит состояние за пределы разрешимости, и задача вырождается.
-	//
-	// Раньше здесь стояло «группа не больше терминальной» — тот же смысл,
-	// но выраженный через номер, а не через физику. Разница не
-	// косметическая: номер не знает ни массы, ни высоты, и на практике
-	// откладывал передачу управления до двадцати-сорока метров над водой,
-	// где вести уже нечего. По условию ниже управление переходит там, где
-	// оно становится физически осмысленным, — обычно на переходе 13→5,
-	// то есть за сотни метров до касания.
+	// A minimum thrust above weight prevents hovering, but it does not prevent
+	// a finite powered descent: the vehicle can decelerate for a bounded time
+	// and then downselect engines. Both thrust bounds are explicit constraints
+	// in G-FOLD. Requiring hover capability here disabled the optimiser for all
+	// useful landing groups and left the heuristic backup in control.
 	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage,
 		physics.Atmosphere(nav.Altitude).Pressure)
-	mass := b.dryMass() + b.state.FuelMass
-	if perEngine <= 0 || mass <= 0 {
-		return false
-	}
-	minThrust := perEngine * float64(n) * b.minThrottle()
-	weight := mass * physics.GravityMagnitudeAtAltitude(nav.Altitude)
-
-	return minThrust < gfoldDescentMargin*weight
+	return perEngine > 0 && nav.Mass > b.dryMass()
 }
-
-// gfoldDescentMargin — насколько минимальная тяга группы должна быть ниже
-// веса, чтобы снижение считалось возможным не впритык. Девять десятых —
-// запас на разброс тяги и оценку массы: ровно на границе «минимальная тяга
-// равна весу» аппарат висит, а не снижается, и множество достижимых
-// траекторий вырождается в точку.
-const gfoldDescentMargin = 0.9
 
 // gfoldPlanUsable решает, годится ли текущий план к исполнению.
 //

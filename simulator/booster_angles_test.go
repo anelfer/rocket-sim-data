@@ -93,34 +93,51 @@ func TestAttitudeErrorIgnoresAngularBoundaries(t *testing.T) {
 	}
 }
 
-// Разворачивание углов бустера накапливается ровно один раз за такт: если
-// билдер телеметрии начнёт накапливать сам, повторные вызовы за тот же
-// такт станут считать поворот по нескольку раз.
-func TestContinuousAnglesAdvanceOncePerStep(t *testing.T) {
+// Накопленный крен считается ровно один раз за такт: если билдер
+// телеметрии начнёт накапливать сам, повторные вызовы за тот же такт
+// станут считать поворот по нескольку раз.
+func TestRollIntegralAdvancesOncePerStep(t *testing.T) {
 	b, _ := boosterInCoast(t, 1)
 
-	yaw, roll := b.yawContinuous.Value(), b.rollContinuous.Value()
+	roll := b.rollIntegral
 	for i := 0; i < 5; i++ {
 		boosterTelemetry(b, b.elapsed)
 	}
-	if got := b.yawContinuous.Value(); got != yaw {
-		t.Fatalf("сборка телеметрии сдвинула рыскание: %.6f → %.6f", yaw, got)
-	}
-	if got := b.rollContinuous.Value(); got != roll {
-		t.Fatalf("сборка телеметрии сдвинула крен: %.6f → %.6f", roll, got)
+	if got := b.rollIntegral; got != roll {
+		t.Fatalf("сборка телеметрии сдвинула накопленный крен: %.6f → %.6f", roll, got)
 	}
 }
 
-// Развёрнутые углы согласованы с сырыми: их кратчайшая разность нулевая.
-func TestContinuousAnglesAgreeWithRaw(t *testing.T) {
-	b, _ := boosterInCoast(t, 1)
-	frame := physics.NewLocalFrame(b.state.Position)
-	att := b.attitude.AttitudeIn(frame)
+// Накопленный крен — это интеграл проекции угловой скорости на продольную
+// ось, и ничего кроме: за такт он обязан прирасти ровно на ω_x·dt.
+func TestRollIntegralFollowsBodyRate(t *testing.T) {
+	b, sim := boosterInCoast(t, 1)
 
-	if off := math.Abs(physics.ShortestAngle(b.yawContinuous.Value() - att.Yaw)); off > 1e-6 {
-		t.Fatalf("непрерывное рыскание разошлось с сырым на %.4g°", off)
+	before := b.rollIntegral
+	rate := b.attitude.Omega.X * physics.RadToDeg
+	const dt = 0.1
+	b.updateContinuousAngles(dt)
+	_ = sim
+
+	if got, want := b.rollIntegral-before, rate*dt; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("прирост крена %.6g° против ожидаемого %.6g°", got, want)
 	}
-	if off := math.Abs(physics.ShortestAngle(b.rollContinuous.Value() - att.Roll)); off > 1e-6 {
-		t.Fatalf("непрерывный крен разошёлся с сырым на %.4g°", off)
+}
+
+// У вертикально стоящего корпуса азимут и крен не определены: там они
+// описывают один и тот же поворот и распределяются между собой
+// произвольно. Телеметрия обязана отдавать «нет значения», а не число.
+//
+// Наклон оси при этом определён всегда — ради него всё и затевалось.
+func TestEulerAnglesUndefinedNearVertical(t *testing.T) {
+	for _, tilt := range []float64{0, 3, 9.9, 170.1, 177, 180} {
+		if v := azimuthWhenDefined(123, tilt); !math.IsNaN(v) {
+			t.Errorf("при наклоне оси %.1f° азимут отдан как %.1f°, ожидался NaN", tilt, v)
+		}
+	}
+	for _, tilt := range []float64{10.1, 45, 90, 135, 169.9} {
+		if v := azimuthWhenDefined(123, tilt); math.IsNaN(v) {
+			t.Errorf("при наклоне оси %.1f° азимут потерян, а он определён", tilt)
+		}
 	}
 }

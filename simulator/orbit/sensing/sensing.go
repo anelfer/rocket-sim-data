@@ -30,6 +30,51 @@ func NewScalarSensor(cfg ScalarSensorConfig) *ScalarSensor {
 	return propulsion.NewSensor(cfg)
 }
 
+// TowerLinkPositionSensor и TowerLinkVelocitySensor — навигационный канал
+// на лазерной связи с башней.
+//
+// На подходе к площадке ступень перестаёт полагаться только на бортовое
+// счисление: башня видит её собственными датчиками и передаёт решение по
+// лазерному каналу. Это другой прибор и другая физика измерения — не
+// «тот же приёмник, которому стало лучше», поэтому и характеристики
+// заданы отдельно, а не множителем к DefaultPositionSensor.
+//
+// Порядок величин: сантиметры по координате и сантиметры в секунду по
+// скорости — столько даёт оптическая дальнометрия на дистанции в единицы
+// километров. Выбросы и пропадания связи на порядок реже бортового
+// канала: линия короткая и прямая, а не через полнеба.
+//
+// Канал доступен не всегда: нужна прямая видимость и небольшая дальность
+// (см. simulator.towerLinkRange/towerLinkAltitude). Выше и дальше
+// навигация идёт по обычным приборам.
+func TowerLinkPositionSensor() ScalarSensorConfig {
+	return ScalarSensorConfig{
+		NoiseFloor:      0.02,
+		DriftRate:       1e-9,
+		FullScale:       physics.EarthRadius,
+		TimeConstant:    0.05,
+		UpdateInterval:  0.02,
+		OutlierRate:     0.00005,
+		OutlierScale:    4,
+		DropoutRate:     0.00005,
+		DropoutDuration: 0.2,
+	}
+}
+
+func TowerLinkVelocitySensor() ScalarSensorConfig {
+	return ScalarSensorConfig{
+		NoiseFloor:      0.02,
+		DriftRate:       2e-9,
+		FullScale:       8000,
+		TimeConstant:    0.05,
+		UpdateInterval:  0.02,
+		OutlierRate:     0.00005,
+		OutlierScale:    4,
+		DropoutRate:     0.00005,
+		DropoutDuration: 0.2,
+	}
+}
+
 // NewScalarSensorAt создаёт датчик, уже показывающий заданное значение —
 // нужен там, где истинная величина при старте симуляции не близка к нулю
 // (см. propulsion.NewSensorAt: без прайминга датчик первые секунды отражал

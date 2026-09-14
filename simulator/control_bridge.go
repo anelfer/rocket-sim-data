@@ -250,7 +250,7 @@ func (s *Simulation) calibrateBoosterBoard() {
 // Nil-снимок, если бустера сейчас нет: относительные команды к нему в этот
 // момент адресовать уже некому.
 func (s *Simulation) BoosterControlSample() control.Sample {
-	if s.booster == nil {
+	if s.detachedBooster() == nil {
 		return nil
 	}
 	b := s.booster

@@ -79,6 +79,12 @@ const landingPlanTerminalFailures = 5
 // потребный по плану, чтобы курс на башню считался обеспеченным.
 const landingPlanFuelMargin = 1.3
 
+// landingLateralAuthorityMargin is the fraction of the ideal 13-engine,
+// maximum-tilt lateral acceleration credited by the coast planner. The rest is
+// reserved for engine run-up, attitude tracking, vertical braking and the
+// mandatory upright transition before entering the catch plane.
+const landingLateralAuthorityMargin = 0.90
+
 // landingPlan — непрерывно обновляемый план возврата.
 type landingPlan struct {
 	Valid     bool
@@ -119,6 +125,11 @@ type landingPlan struct {
 	// значит просить не то ускорение, а ошибка входит в квадрате.
 	MissTime float64
 
+	// ApproachLead is the upstream bias of the open-loop impact aim point.
+	// It reserves the horizontal distance travelled while the landing engines
+	// build thrust and then brake the predicted arrival velocity.
+	ApproachLead float64
+
 	Decision landingDecision
 	Reason   landingAbortReason
 
@@ -156,6 +167,7 @@ func (b *Booster) updateLandingPlan(nav orbit.NavState) {
 	b.plan.StoppingMargin = p.MinMargin
 	b.plan.Schedule = p.Schedule
 	b.plan.RequiredDeltaV = b.planDeltaV(p)
+	b.plan.ApproachLead = b.poweredApproachLead(p)
 	b.plan.MissEast, b.plan.MissNorth, b.plan.PredictedMiss, b.plan.MissTime = b.planMissVector(nav)
 
 	// --- 2. Терминальный участок: существует ли мягкая посадка -------------
@@ -206,6 +218,29 @@ func (b *Booster) planDeltaV(p landingPrediction) float64 {
 	return b.Config.FirstStage.VacuumISP * physics.G0 * math.Log(p.ArrivalMass/final)
 }
 
+// poweredApproachLead converts the landing-burn arrival prediction into the
+// upstream aim bias required before ignition. During half of the four-second
+// linear run-up there is, on average, no usable lateral thrust. Afterwards the
+// predicted horizontal velocity needs v²/(2a) to stop. The no-thrust impact
+// already includes approximately v*h/vz of travel, so only the difference is
+// added to the passive-flight target.
+func (b *Booster) poweredApproachLead(p landingPrediction) float64 {
+	if p.ArrivalHorizontal <= 0 || p.ArrivalVertical <= 0 || p.ArrivalMass <= 0 {
+		return 0
+	}
+	perEngine := vehicle.ThrustAtAltitude(b.Config.FirstStage,
+		physics.Atmosphere(p.ArrivalAltitude).Pressure)
+	aHorizontal := perEngine * float64(boosterLandingHigh) / p.ArrivalMass *
+		math.Sin(landingPoweredMaxTilt) * landingLateralAuthorityMargin
+	if aHorizontal <= 0 {
+		return 0
+	}
+	v := p.ArrivalHorizontal
+	ballisticTime := p.ArrivalAltitude / p.ArrivalVertical
+	lead := 0.5*boosterIgnitionLeadTime*v + v*v/(2*aHorizontal) - v*ballisticTime
+	return physics.Clamp(lead, 0, towerLinkRange)
+}
+
 // planMissVector — промах баллистического прогноза падения относительно
 // точки прицеливания: составляющие на восток и север в местных осях текущей
 // позиции и его длина, м.
@@ -233,6 +268,15 @@ func (b *Booster) planMissVector(nav orbit.NavState) (east, north, miss, flightT
 		return nan, nan, nan, nan
 	}
 	target := physics.GeodeticToECEF(b.landingGroundAimPoint())
+	if b.phase == BoosterCoast && b.plan.ApproachLead > 0 {
+		horizontal := nav.GroundRelativeVelocity.Sub(nav.Frame.Up.Scale(nav.RadialVelocity))
+		if horizontal.Norm() > 1e-6 {
+			// Current velocity points toward the pad; the handover point lies
+			// upstream, in the opposite direction.
+			dirECEF := physics.ECIToECEF(horizontal.Unit(), b.elapsed)
+			target = target.Sub(dirECEF.Scale(b.plan.ApproachLead))
+		}
+	}
 	d := physics.ECIToECEF(impact, b.elapsed+ft).Sub(target)
 
 	// Раскладка — в местных осях ТЕКУЩЕЙ позиции (там же, где потом
@@ -371,7 +415,11 @@ const landingPlanCommitHorizon = 45.0
 func (b *Booster) planAbortReason(nav orbit.NavState, p landingPrediction, reachable bool) landingAbortReason {
 	// Камеры: терминальную группу собрать нечем.
 	terminal := landingEngineSequence[len(landingEngineSequence)-1]
-	if b.phase == BoosterLandingBurn {
+
+	// Пауза удержания высоты — не потеря камер: они погашены по команде
+	// (updateHoverPulse) и зажгутся снова, как только ступень просядет.
+	// Та же оговорка, что и в landingAbortReason, и по той же причине.
+	if b.phase == BoosterLandingBurn && !b.hoverPaused {
 		if live := b.propulsion.Commissioned - b.propulsion.EnginesOut; live < terminal {
 			return landingAbortEngines
 		}

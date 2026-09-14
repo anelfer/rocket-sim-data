@@ -103,7 +103,7 @@ func (s *Simulation) observeLive() {
 		s.phase.String(), target)
 	l.ship.observe(t, shipPoint, liveTrajectorySample, sink, "Корабль")
 
-	if b := s.booster; b != nil {
+	if b := s.detachedBooster(); b != nil {
 		bp := trajectoryPointOf(t, b.state.Position, b.state.Velocity,
 			b.phase.String(), target)
 		first := len(l.booster.points) == 0

@@ -256,7 +256,7 @@ func (s *Simulation) ControlSnapshot() ControlSnapshot {
 	// живёт в том же такте (Simulation.step), что и корабль, и его список
 	// двигателей может смениться (setEngineGroup) между этим RLock и тем
 	// моментом, когда снимок дойдёт до интерфейса.
-	booster := s.booster
+	booster := s.detachedBooster()
 	boosterBoard := s.boosterBoard
 	var boosterEngine *propulsion.Engine
 	var boosterAll []*propulsion.Engine

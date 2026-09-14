@@ -1,6 +1,8 @@
 package simulator
 
 import (
+	"log"
+	"math"
 	"math/rand"
 
 	"rocketTelemetrySim/control"
@@ -39,7 +41,7 @@ import (
 // менялось: от него зависит воспроизводимость прогонов.
 const boosterSensorStreamSalt = 0x9E3779B97F4A7C15
 
-// initSensors создаёт измерительные каналы бустера в момент отделения.
+// initSensors создаёт измерительные каналы вместе с бустером, до начала полёта.
 func (b *Booster) initSensors(seed int64, position, velocity physics.Vec3,
 	orientation physics.Quaternion) {
 
@@ -93,6 +95,12 @@ func (b *Booster) updateSensors(dt float64) {
 	}
 	none := control.SensorOverrides{}
 
+	// Перед самими отсчётами — какой канал сейчас работает: бортовой или
+	// лазерная связь с башней.
+	if b.phase != BoosterAttached {
+		b.updateTowerLink()
+	}
+
 	if v, valid := b.fuelSensor.UpdateWith(b.propulsion.PropellantMass(), dt, b.sensorRng, none); valid {
 		b.sensedFuelMass = v
 	}
@@ -101,6 +109,9 @@ func (b *Booster) updateSensors(dt float64) {
 	}
 	if m := b.velocitySensor.UpdateWith(b.state.Velocity, dt, b.sensorRng, none); m.Valid {
 		b.sensedVelocity = m.Value
+	}
+	if b.towerLink {
+		b.updateTowerMeasurements(dt, none)
 	}
 	if m := b.attitudeSensor.UpdateWith(b.attitude.Orientation, dt, b.sensorRng, none); m.Valid {
 		b.sensedOrientation = m.Orientation
@@ -213,6 +224,14 @@ func (b *Booster) updateNavigation(dt float64, specificForce physics.Vec3) {
 	if b.sensorRng == nil || dt <= 0 {
 		return
 	}
+	if b.towerLink {
+		// The terminal channel already supplies filtered relative position and
+		// velocity at the current epoch. A second pass through the slow cruise
+		// filter would recreate the phase lag that the local sensor removes.
+		b.navPosition = b.sensedPosition
+		b.navVelocity = b.sensedVelocity
+		return
+	}
 
 	// Счисление: известное ускорение плюс притяжение в оценённой точке.
 	accel := specificForce.Add(physics.GravityAcceleration(b.navPosition))
@@ -246,4 +265,103 @@ func (b *Booster) updateNavigation(dt float64, specificForce physics.Vec3) {
 		// нечислам.
 		b.navPosition, b.navVelocity = b.sensedPosition, b.sensedVelocity
 	}
+}
+
+// Лазерная связь с башней.
+//
+// towerLinkAltitude, towerLinkRange — условия видимости: башня берёт
+// ступень на сопровождение, когда та уже близко и по высоте, и по
+// горизонтали. Пять километров высоты и десять по горизонтали — это
+// последние полминуты полёта, где точность и нужна: выше и дальше линия
+// идёт сквозь слишком много атмосферы под слишком малым углом.
+//
+// towerLinkHysteresis — запас на возврат: без него канал моргал бы на
+// границе, а каждое переключение — это скачок характеристик навигации.
+const (
+	towerLinkAltitude   = 5000.0
+	towerLinkRange      = 10000.0
+	towerLinkHysteresis = 1.15
+)
+
+// updateTowerMeasurements forms an Earth-fixed relative observation and then
+// reconstructs the equivalent ECI state at the observation epoch. The sensor
+// therefore sees distance and closing speed to the catch point, not a
+// six-megametre coordinate moving through ECI with Earth rotation.
+func (b *Booster) updateTowerMeasurements(dt float64, overrides control.SensorOverrides) {
+	if b.towerPositionSensor == nil || b.towerVelocitySensor == nil {
+		return
+	}
+	target := b.tower.TargetECEF()
+	positionECEF := physics.ECIToECEF(b.state.Position, b.elapsed)
+	relativePosition := positionECEF.Sub(target)
+
+	groundECI := b.state.Velocity.Sub(physics.CorotatingVelocity(b.state.Position))
+	relativeVelocity := physics.ECIToECEF(groundECI, b.elapsed)
+
+	pm := b.towerPositionSensor.UpdateWith(relativePosition, dt, b.sensorRng, overrides)
+	vm := b.towerVelocitySensor.UpdateWith(relativeVelocity, dt, b.sensorRng, overrides)
+	if !pm.Valid || !vm.Valid {
+		return
+	}
+
+	// The discrete first-order channel lags a constant-velocity ramp by
+	// d*dt/(1-d), where d=exp(-dt/tau). Using the continuous approximation
+	// tau here over-predicted the vehicle by about 20 m at the simulator's
+	// dt=tau=50 ms. Propagate the observation by the exact sampled-data lag.
+	tau := b.towerPositionSensor.X.Config.TimeConstant
+	lag := 0.0
+	if tau > 0 {
+		d := math.Exp(-dt / tau)
+		if d < 1 {
+			lag = d * dt / (1 - d)
+		}
+	}
+	relativeNow := pm.Value.Add(vm.Value.Scale(lag))
+	position := physics.ECEFToECI(target.Add(relativeNow), b.elapsed)
+	ground := physics.ECEFToECI(vm.Value, b.elapsed)
+	b.sensedPosition = position
+	b.sensedVelocity = ground.Add(physics.CorotatingVelocity(position))
+}
+
+// updateTowerLink подключает и отключает отдельный канал относительной
+// навигации. Бортовой GNSS/INS продолжает работать в фоне, поэтому при
+// пропадании линии визирования возврат к нему не требует разогрева датчика.
+func (b *Booster) updateTowerLink() {
+	if b.positionSensor == nil || b.velocitySensor == nil {
+		return
+	}
+
+	alt := b.state.Altitude()
+	miss, _, _ := b.landingMiss(b.state.Position, b.elapsed)
+
+	altLimit, rangeLimit := towerLinkAltitude, towerLinkRange
+	if b.towerLink {
+		altLimit *= towerLinkHysteresis
+		rangeLimit *= towerLinkHysteresis
+	}
+
+	linked := alt >= 0 && alt <= altLimit && miss <= rangeLimit
+	if linked == b.towerLink {
+		return
+	}
+	b.towerLink = linked
+
+	if linked {
+		target := b.tower.TargetECEF()
+		positionECEF := physics.ECIToECEF(b.state.Position, b.elapsed)
+		groundECI := b.state.Velocity.Sub(physics.CorotatingVelocity(b.state.Position))
+		groundECEF := physics.ECIToECEF(groundECI, b.elapsed)
+		b.towerPositionSensor = sensing.NewVectorSensorAt(
+			sensing.TowerLinkPositionSensor(), positionECEF.Sub(target))
+		b.towerVelocitySensor = sensing.NewVectorSensorAt(
+			sensing.TowerLinkVelocitySensor(), groundECEF)
+		log.Printf("📡 Бустер взят на сопровождение башней на T+%.1f с: "+
+			"высота %.0f м, до площадки %.0f м — навигация по лазерному каналу",
+			b.elapsed, alt, miss)
+		return
+	}
+
+	b.towerPositionSensor = nil
+	b.towerVelocitySensor = nil
+	log.Printf("📡 Бустер потерял сопровождение башней на T+%.1f с", b.elapsed)
 }

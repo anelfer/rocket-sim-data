@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -86,12 +87,49 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Запись из двух горутин недопустима, поэтому все отправки идут
 	// через один мьютекс.
+	//
+	// Сборка JSON отделена от записи в сокет намеренно, и это не
+	// стилистическая правка. Прежде отправка шла через conn.WriteJSON, а он
+	// не различает две совершенно разные беды: обрыв связи и несобираемое
+	// сообщение. Стоило одному полю приехать неопределённым (NaN в обычном
+	// float64 — encoding/json на таком возвращает ошибку и роняет ВЕСЬ
+	// снимок), и поток телеметрии считал это обрывом и выходил — сокет при
+	// этом оставался открытым, браузер разрыва не видел и просто замолкал
+	// до конца прогона. Одно плохое число гасило пульт целиком.
+	//
+	// Теперь несобранное сообщение пропускается: канал живёт дальше,
+	// следующий такт приносит новое состояние, а о причине говорит журнал.
+	// Ошибкой отправки считается только та, что пришла от самого сокета.
 	var writeMu sync.Mutex
+	var lastMarshalLog time.Time
 	send := func(msg serverMessage) error {
 		msg.ServerAt = time.Now().UnixMilli()
+
+		data, err := json.Marshal(msg)
+		if err != nil {
+			// Причина обычно держится десятки секунд — весь участок полёта,
+			// на котором величина не определена. Сообщать о ней десять раз
+			// в секунду значит утопить журнал в одной и той же строке.
+			//
+			// Отметка времени лежит под тем же мьютексом, что и запись:
+			// send вызывается и из потока телеметрии, и из приёма команд.
+			writeMu.Lock()
+			report := time.Since(lastMarshalLog) > 5*time.Second
+			if report {
+				lastMarshalLog = time.Now()
+			}
+			writeMu.Unlock()
+
+			if report {
+				log.Printf("websocket: сообщение %q не собралось в JSON: %v",
+					msg.Type, err)
+			}
+			return nil
+		}
+
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return conn.WriteJSON(msg)
+		return conn.WriteMessage(websocket.TextMessage, data)
 	}
 
 	done := make(chan struct{})

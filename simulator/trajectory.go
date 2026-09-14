@@ -218,7 +218,7 @@ func RecordTrajectory(cfg vehicle.Config, seed int64, opt TrajectoryOptions) *Tr
 			nav.Phase.String(), landing)
 		ship.observe(t, shipPoint, opt.Sample, run, "Корабль")
 
-		if b := sim.booster; b != nil {
+		if b := sim.detachedBooster(); b != nil {
 			bp := trajectoryPointOf(t, b.state.Position, b.state.Velocity,
 				b.phase.String(), landing)
 			first := len(booster.points) == 0
@@ -239,7 +239,7 @@ func RecordTrajectory(cfg vehicle.Config, seed int64, opt TrajectoryOptions) *Tr
 		}
 
 		shipDone := sim.crashed || sim.phase == orbit.PhaseLanded
-		hasBooster := sim.booster != nil
+		hasBooster := sim.detachedBooster() != nil
 		boosterDone := hasBooster && (sim.booster.phase == BoosterSplashdown ||
 			sim.booster.phase == BoosterDestroyed ||
 			sim.booster.phase == BoosterCaught)

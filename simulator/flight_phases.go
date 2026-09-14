@@ -84,8 +84,6 @@ func (s *Simulation) updateFlightPhase(nav orbit.NavState) {
 
 // shouldMECO проверяет условия выключения двигателей первой ступени.
 func (s *Simulation) shouldMECO(nav orbit.NavState) bool {
-	stage := s.Config.FirstStage
-
 	// Топливо израсходовано до резерва, оставленного на возврат ступени.
 	//
 	// Порог по остатку — это ровно то решение, которое в реальности
@@ -93,7 +91,7 @@ func (s *Simulation) shouldMECO(nav orbit.NavState) bool {
 	// прямого измерения массы не существует физически (см.
 	// DefaultPropellantSensor), и борт не может знать остаток точнее,
 	// чем говорит его собственная оценка.
-	if s.sensedFuelMass <= stage.FuelReserve {
+	if s.sensedFuelMass <= s.mecoReserveThreshold() {
 		return true
 	}
 
@@ -111,6 +109,38 @@ func (s *Simulation) shouldMECO(nav orbit.NavState) bool {
 	// Достигнуты целевые скорость и высота разделения.
 	return nav.TransverseVelocity >= s.Config.MECOVelocity &&
 		nav.Altitude >= s.Config.MECOMinAltitude
+}
+
+// mecoReserveThreshold converts the required propellant at physical stage
+// separation into the earlier threshold seen by the guidance computer. Two
+// predictable expenditures occur after a raw level estimate reaches a value:
+// the estimator's first-order lag while the main engines keep flowing and the
+// propellant used by the booster engines during hot staging. Ignoring both
+// used to leave about 589 t at separation for a configured 650 t return plan.
+func (s *Simulation) mecoReserveThreshold() float64 {
+	reserve := s.Config.FirstStage.FuelReserve
+	if !s.Config.BoosterReturn || reserve <= 0 || s.propulsion == nil {
+		return reserve
+	}
+
+	flow := s.propulsion.TotalFuelFlow + s.propulsion.TotalOxFlow
+	if flow <= 0 {
+		return reserve
+	}
+
+	lag := 0.0
+	if s.fuelSensor != nil {
+		lag = s.fuelSensor.Config.TimeConstant + 0.5*s.fuelSensor.Config.UpdateInterval
+	}
+
+	running := s.propulsion.RunningEngines()
+	hotStage := 0.0
+	if running > 0 {
+		// Conservative shutdown-tail estimate: the five retained chambers may
+		// continue near their pre-MECO flow while turbopumps and valves settle.
+		hotStage = s.Config.StageSeparationDelay * float64(hotStageEngines) / float64(running)
+	}
+	return reserve + flow*(lag+hotStage)
 }
 
 // hotStageThrottle — уровень тяги центральных камер на горячем разделении.
@@ -187,6 +217,9 @@ func (s *Simulation) setRunningEngines(count int) {
 
 // performStageSeparation отделяет первую ступень и запускает вторую.
 func (s *Simulation) performStageSeparation() {
+	if s.stage != 1 {
+		return
+	}
 	cfg := s.Config
 
 	// Отработавшая ступень отделяется с текущим вектором состояния и дальше
@@ -205,77 +238,17 @@ func (s *Simulation) performStageSeparation() {
 		physics.EffectiveEnvironmentTemperature(
 			s.state.Altitude(), s.state.AirRelativeVelocity().Norm()))
 
-	// Носители с активным возвратом (решётчатые рули, посадочный импульс,
-	// приводнение в заливе) получают полноценный второй аппарат вместо
-	// пассивной баллистики — см. booster.go. Остальные (например Falcon 9
-	// в этой модели) ведут себя как прежде.
+	// Release the existing booster; non-returning vehicles retain their
+	// existing passive spent-stage model.
+	s.syncAttachedShip()
 	if cfg.BoosterReturn {
-		s.booster = NewBooster(cfg, s.state.Position, s.state.Velocity,
-			s.elapsed, s.rng, s.sensorRng, s.seed, stageStartTemperature(cfg), s.attitude.Orientation)
+		s.booster.detach(s.elapsed)
 		s.calibrateBoosterBoard()
 	} else {
 		s.spentStage = env.NewSpentStage(
-			cfg.FirstStage.Name,
-			s.state.Position, s.state.Velocity,
-			cfg.FirstStage.DryMass+cfg.FirstStage.FuelReserve,
-			cfg.FirstStageLength, cfg.Diameter/2,
-			stageSkinTemp,
-			s.elapsed,
-			env.RandomTipOff(s.rng),
-			s.wind,
-		)
-	}
-
-	s.stage = 2
-
-	// Двигательная установка пересобирается под вторую ступень: свои баки,
-	// свой запас наддува, свой двигатель с вакуумным соплом. Перенос состояния
-	// с первой ступени был бы неверен — это другие агрегаты.
-	structure := cfg.SecondStage.DryMass
-	if !s.fairingGone {
-		structure += cfg.FairingMass
-	}
-
-	// Температура, с которой начинает жизнь железо второй ступени.
-	//
-	// Брать здесь температуру набегающего потока нельзя: на шестидесяти
-	// километрах при полутора тысячах метров в секунду она равна полутора
-	// тысячам градусов — это температура торможения воздуха, а не металла.
-	// Двигатель до запуска стоял под обтекателем рядом с криогенными баками
-	// и холоден. Прежде из-за этого камера второй ступени «рождалась»
-	// раскалённой до 1446 К, а подшипники — до 1450 К, и первые полторы
-	// минуты работы пульт показывал перегрев, которого не было.
-	ambientTemp := stageStartTemperature(cfg)
-
-	s.propulsion = NewPropulsionSystem(StageProps{
-		StructureMass:      structure,
-		PayloadMass:        cfg.PayloadMass,
-		PropellantMass:     cfg.SecondStage.FuelMass,
-		MixtureRatio:       cfg.SecondStage.MixtureRatio,
-		EngineCount:        vehicle.SecondStagePrimaryCount(cfg),
-		EngineGroups:       vehicle.SecondStageGroups(cfg),
-		StagePrefix:        "S2",
-		EngineConfig:       vehicle.SecondStagePrimaryConfig(cfg),
-		FuelTankHeight:     cfg.SecondStage.FuelTankHeight,
-		OxTankHeight:       cfg.SecondStage.OxTankHeight,
-		FuelTankPressure:   cfg.SecondStage.FuelTankPressure,
-		OxTankPressure:     cfg.SecondStage.OxTankPressure,
-		FuelPressurantMass: cfg.SecondStage.FuelPressurantMass,
-		OxPressurantMass:   cfg.SecondStage.OxPressurantMass,
-	}, s.rng, s.sensorRng, ambientTemp)
-
-	s.dryMass = s.propulsion.DryMass()
-	s.rcsPropellant = cfg.RCSPropellantMass
-	s.state.FuelMass = s.propulsion.PropellantMass()
-	s.propulsion.StartAll()
-
-	// Корабль, рассчитанный на возвращение, несёт плавники. Пока он идёт
-	// на выведение, они прижаты к борту: раскрытые, на активном участке они
-	// дали бы неуправляемый момент.
-	if cfg.Flaps {
-		length := secondStageLength(cfg)
-		s.attitude.Surfaces = NewSurfaceSet(vehicle.ShipFlaps(length, cfg.Diameter/2))
-		s.heatShield = NewHeatShield(length, cfg.Diameter, stageStartTemperature(cfg))
+			cfg.FirstStage.Name, s.state.Position, s.state.Velocity,
+			s.propulsion.TotalMass(), cfg.FirstStageLength, cfg.Diameter/2,
+			stageSkinTemp, s.elapsed, env.RandomTipOff(s.rng), s.wind)
 	}
 
 	// Двигатели первой ступени улетают вместе с ней. Их наборы меток нужно
@@ -288,12 +261,15 @@ func (s *Simulation) performStageSeparation() {
 	}
 	metrics.RetireEngines(retired)
 
-	// Двигатель второй ступени создаётся заново: перенос теплового состояния
-	// с двигателей первой ступени физически неверен, это другое изделие.
-	ambient := physics.EffectiveEnvironmentTemperature(
-		s.state.Altitude(), s.state.AirRelativeVelocity().Norm(),
-	)
-	s.engines = vehicle.BuildSecondStageEngine(cfg, ambient)
+	// Select the ship created at launch; no tank or engine is rebuilt here.
+	s.stage = 2
+	s.flightBody = s.ship.flightBody
+	s.dryMass = s.propulsion.DryMass()
+	s.state.FuelMass = s.propulsion.PropellantMass()
+	s.propulsion.StartAll()
+	for i := range s.engines {
+		s.engines[i].Running = true
+	}
 	s.gnc.Config.MinThrottle = cfg.SecondStage.MinThrottle
 
 	// Номинальные значения второй ступени отличаются от первой: другой

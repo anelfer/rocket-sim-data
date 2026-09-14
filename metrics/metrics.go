@@ -173,8 +173,17 @@ var (
 	boosterCatchCrossed    = gauge("rocket_booster_catch_crossed", "Плоскость захвата пройдена сверху вниз: 1 — да, 0 — нет")
 	boosterCatchSuccess    = gauge("rocket_booster_catch_success", "Захват состоялся: 1 — да, 0 — нет")
 
-	boosterYawCont  = gauge("rocket_booster_yaw_continuous_deg", "Рыскание бустера, непрерывное: 359° → 361° вместо 359° → 1°")
-	boosterRollCont = gauge("rocket_booster_roll_continuous_deg", "Крен бустера, непрерывный: 179° → 181° вместо 179° → −179°")
+	// Величины, не зависящие от карты углов Эйлера. Прежние
+	// rocket_booster_{yaw,roll}_continuous_deg отсюда убраны: разворачивание
+	// циклических углов накапливало 180-градусные скачки вырождения у
+	// вертикали и показывало обороты, которых корпус не делал (см.
+	// simulator.Booster.rollIntegral).
+	boosterAxisTilt = gauge("rocket_booster_axis_tilt_deg",
+		"Наклон продольной оси бустера от местной вертикали: 0° — носом вверх, 180° — носом вниз")
+	boosterAttErr = gauge("rocket_booster_attitude_error_deg",
+		"Ошибка ориентации бустера: модуль вектора поворота от текущей ориентации к целевой")
+	boosterRollInt = gauge("rocket_booster_roll_integrated_deg",
+		"Накопленный крен бустера вокруг продольной оси: интеграл проекции угловой скорости")
 
 	// Собственные угловые скорости в СВЯЗАННЫХ осях. Особых точек у них нет
 	// вовсе: это не координаты ориентации, а сама угловая скорость корпуса.
@@ -313,7 +322,7 @@ func collectors() []prometheus.Collector {
 		engineNozzleGauge, engineWallGauge, engineTurbineGauge,
 		boosterAltitude, boosterLatitude, boosterLongitude,
 		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
-		boosterYawCont, boosterRollCont,
+		boosterAxisTilt, boosterAttErr, boosterRollInt,
 		boosterRateRoll, boosterRatePitch, boosterRateYaw,
 		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
 		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
@@ -363,7 +372,7 @@ func undefinedOnStart() []prometheus.Gauge {
 		// ступени выше.
 		boosterAltitude, boosterLatitude, boosterLongitude,
 		boosterVVel, boosterTVel, boosterPitch, boosterYaw, boosterRoll,
-		boosterYawCont, boosterRollCont,
+		boosterAxisTilt, boosterAttErr, boosterRollInt,
 		boosterRateRoll, boosterRatePitch, boosterRateYaw,
 		boosterFuelMass, boosterThrottle, boosterEngines, boosterPhase,
 		boosterVentGas, boosterTilt, boosterSplashV, boosterSplashdown, boosterDestroyed,
@@ -571,9 +580,11 @@ type BoosterSample struct {
 
 	Pitch, Yaw, Roll float64
 
-	// YawContinuous, RollContinuous — развёрнутые углы (см. метрики
-	// rocket_booster_*_continuous_deg).
-	YawContinuous, RollContinuous float64
+	// AxisTilt — наклон продольной оси от вертикали, AttitudeError — модуль
+	// ошибки ориентации, RollIntegrated — накопленный физический крен. Все
+	// три определены независимо от карты углов Эйлера; Yaw и Roll выше
+	// приходят как NaN там, где вырождаются (см. azimuthWhenDefined).
+	AxisTilt, AttitudeError, RollIntegrated float64
 
 	// BodyRollRate, BodyPitchRate, BodyYawRate — угловая скорость в
 	// связанных осях, град/с.
@@ -653,8 +664,9 @@ func SetBooster(s BoosterSample) {
 	boosterPitch.Set(s.Pitch)
 	boosterYaw.Set(s.Yaw)
 	boosterRoll.Set(s.Roll)
-	boosterYawCont.Set(s.YawContinuous)
-	boosterRollCont.Set(s.RollContinuous)
+	boosterAxisTilt.Set(s.AxisTilt)
+	boosterAttErr.Set(s.AttitudeError)
+	boosterRollInt.Set(s.RollIntegrated)
 	boosterRateRoll.Set(s.BodyRollRate)
 	boosterRatePitch.Set(s.BodyPitchRate)
 	boosterRateYaw.Set(s.BodyYawRate)

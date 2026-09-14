@@ -203,7 +203,16 @@ func (b *Booster) landingAbortReason(nav orbit.NavState) landingAbortReason {
 	// последовательности; если живых камер меньше, гасить снижение у самой
 	// воды будет нечем.
 	terminal := landingEngineSequence[len(landingEngineSequence)-1]
-	if b.phase == BoosterLandingBurn {
+
+	// Пауза удержания высоты — не потеря камер. В режиме импульсного
+	// зависания (updateHoverPulse) камеры гасятся ПО КОМАНДЕ, потому что их
+	// минимальная тяга больше веса, и через секунду-другую зажигаются
+	// снова. Счёт живых камер в этот момент равен нулю, и без этой оговорки
+	// увод объявлялся на первой же паузе: замерено на живом прогоне —
+	// «не собрать терминальную группу камер» на высоте 75 м при снижении
+	// 0 м/с и остатке 37.8 т, то есть у полностью исправной ступени,
+	// висящей ровно так, как задумано.
+	if b.phase == BoosterLandingBurn && !b.hoverPaused {
 		if live := b.propulsion.Commissioned - b.propulsion.EnginesOut; live < terminal {
 			return landingAbortEngines
 		}
